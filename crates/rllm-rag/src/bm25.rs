@@ -1,16 +1,28 @@
+//! BM25 Okapi lexical sparse inverted index.
+//!
+//! Provides tokenization, inverted postings, document frequency weighting,
+//! and BM25 scoring for exact keyword and term frequency matching.
+
 use crate::chunker::DocumentChunk;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A matched document chunk returned from BM25 lexical search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bm25Match {
+    /// Internal index of the matched document chunk.
     pub chunk_idx: usize,
+    /// BM25 Okapi relevance score.
     pub score: f32,
+    /// Document chunk contents and metadata.
     pub chunk: DocumentChunk,
 }
 
+/// Inverted index implementing BM25 Okapi lexical information retrieval.
 pub struct Bm25Index {
+    /// Term frequency saturation parameter ($k_1 \approx 1.2\text{--}2.0$).
     pub k1: f32,
+    /// Document length normalization parameter ($b \approx 0.75$).
     pub b: f32,
     chunks: Vec<DocumentChunk>,
     // term -> list of (doc_idx, term_frequency)
@@ -20,6 +32,7 @@ pub struct Bm25Index {
 }
 
 impl Bm25Index {
+    /// Constructs a new [`Bm25Index`] with the given $k_1$ and $b$ tuning hyperparameters.
     pub fn new(k1: f32, b: f32) -> Self {
         Self {
             k1,
@@ -31,14 +44,17 @@ impl Bm25Index {
         }
     }
 
+    /// Number of document passages indexed.
     pub fn len(&self) -> usize {
         self.chunks.len()
     }
 
+    /// True if no documents have been added to the index.
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
 
+    /// Lowercases and splits text on non-alphanumeric character boundaries.
     pub fn tokenize(text: &str) -> Vec<String> {
         text.to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
@@ -47,6 +63,7 @@ impl Bm25Index {
             .collect()
     }
 
+    /// Inserts a [`DocumentChunk`] into the inverted index.
     pub fn insert(&mut self, chunk: DocumentChunk) {
         let doc_idx = self.chunks.len();
         let tokens = Self::tokenize(&chunk.text);
@@ -69,6 +86,7 @@ impl Bm25Index {
         self.chunks.push(chunk);
     }
 
+    /// Searches the index using BM25 scoring for terms present in the query string.
     pub fn search(&self, query: &str, top_k: usize) -> Vec<Bm25Match> {
         let query_tokens = Self::tokenize(query);
         if query_tokens.is_empty() || self.chunks.is_empty() {
@@ -109,4 +127,3 @@ impl Bm25Index {
             .collect()
     }
 }
-

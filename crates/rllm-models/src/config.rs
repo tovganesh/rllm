@@ -1,21 +1,39 @@
+//! Model architecture configurations for autoregressive transformers and embedding models.
+//!
+//! Provides configuration structs, dimension calculations, memory footprint estimation,
+//! and standard configurations (such as standard Llama, edge-4gb, Llama 3.2 1B, and BERT).
+
 use serde::{Deserialize, Serialize};
 
+/// Configuration parameters for LLaMA-style decoder architectures.
+///
+/// Encapsulates model dimensions, attention head counts, RMSNorm epsilon,
+/// RoPE rotary base theta, and maximum context lengths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlamaConfig {
+    /// Hidden dimension ($d_{model}$) of token representations.
     pub hidden_size: usize,
+    /// Intermediate dimension of the SwiGLU MLP feed-forward network.
     pub intermediate_size: usize,
+    /// Number of query attention heads.
     pub num_attention_heads: usize,
+    /// Number of key-value attention heads for Grouped Query Attention (GQA).
     pub num_key_value_heads: usize,
+    /// Total number of transformer decoder layers.
     pub num_hidden_layers: usize,
+    /// Size of the token vocabulary.
     pub vocab_size: usize,
+    /// Epsilon value added to variance for numerical stability in RMSNorm.
     pub rms_norm_eps: f32,
+    /// Base frequency ($\theta$) for Rotary Position Embeddings (RoPE).
     pub rope_theta: f32,
+    /// Maximum context position index supported by the model.
     pub max_position_embeddings: usize,
 }
 
 impl Default for LlamaConfig {
+    /// Default to Llama-3-8B configuration.
     fn default() -> Self {
-        // Default to Llama-3-8B configuration
         Self {
             hidden_size: 4096,
             intermediate_size: 14336,
@@ -31,7 +49,7 @@ impl Default for LlamaConfig {
 }
 
 impl LlamaConfig {
-    /// Tiny configuration useful for fast unit tests, smartphone edge testing, and CI
+    /// Tiny configuration useful for fast unit tests, smartphone edge testing, and CI.
     pub fn tiny_test_config() -> Self {
         Self {
             hidden_size: 64,
@@ -46,11 +64,13 @@ impl LlamaConfig {
         }
     }
 
+    /// Dimension of each individual attention head ($d_{head} = \frac{d_{model}}{n_{heads}}$).
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
 
     /// Model architecture designed specifically to fit comfortably in a 4GB machine (iOS, Android, Raspberry Pi, Laptop).
+    ///
     /// Total parameters: ~400M.
     /// Memory footprint in FP32: ~1.6 GB. In FP16: ~800 MB. In Q4_0: ~225 MB.
     /// Leaves ample headroom (>2GB) for the operating system, KV-cache, and user apps.
@@ -102,7 +122,7 @@ impl LlamaConfig {
         embedding_params + layer_params + final_norm + lm_head
     }
 
-    /// Estimated memory footprint in Megabytes: (weights_mb, kv_cache_mb, total_mb)
+    /// Estimated memory footprint in Megabytes: `(weights_mb, kv_cache_mb, total_mb)`.
     pub fn estimated_memory_mb(
         &self,
         dtype: rllm_core::dtype::DType,
@@ -124,20 +144,28 @@ impl LlamaConfig {
     }
 }
 
+/// Configuration parameters for BERT-style encoder architectures used for embeddings and reranking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BertConfig {
+    /// Hidden dimension of token representations.
     pub hidden_size: usize,
+    /// Intermediate dimension of the position-wise feed-forward network.
     pub intermediate_size: usize,
+    /// Number of attention heads.
     pub num_attention_heads: usize,
+    /// Number of encoder layers.
     pub num_hidden_layers: usize,
+    /// Size of the vocabulary.
     pub vocab_size: usize,
+    /// Epsilon value for LayerNorm.
     pub layer_norm_eps: f32,
+    /// Maximum position embeddings supported.
     pub max_position_embeddings: usize,
 }
 
 impl Default for BertConfig {
+    /// Standard BGE / MiniLM embedding model configuration.
     fn default() -> Self {
-        // Standard BGE / MiniLM embedding model config
         Self {
             hidden_size: 384,
             intermediate_size: 1536,
@@ -151,6 +179,7 @@ impl Default for BertConfig {
 }
 
 impl BertConfig {
+    /// Tiny configuration useful for fast unit tests.
     pub fn tiny_test_config() -> Self {
         Self {
             hidden_size: 64,
@@ -163,8 +192,8 @@ impl BertConfig {
         }
     }
 
+    /// Attention head dimension ($d_{head} = \frac{d_{model}}{n_{heads}}$).
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
 }
-

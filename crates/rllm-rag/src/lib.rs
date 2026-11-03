@@ -1,3 +1,13 @@
+//! High-performance Retrieval-Augmented Generation (RAG) engine built directly on `rllm`.
+//!
+//! Provides:
+//! - Sliding window text chunking with configurable overlap ([`chunker`]).
+//! - HNSW vector index with SIMD-accelerated cosine similarity ([`hnsw`]).
+//! - Inverted index BM25 lexical search with Okapi TF-IDF scoring ([`bm25`]).
+//! - Reciprocal Rank Fusion (RRF) hybrid search combining dense & sparse scores ([`hybrid`]).
+//! - Cross-encoder semantic reranker ([`reranker`]).
+//! - End-to-end RAG pipeline with prefix-aware prompt assembly and continuous batching ([`pipeline`]).
+
 pub mod bm25;
 pub mod chunker;
 pub mod hnsw;

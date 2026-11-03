@@ -1,3 +1,13 @@
+//! # `rllm-models`
+//!
+//! Model architecture implementations and weight loaders for `rllm`.
+//!
+//! Includes:
+//! - Grouped-Query Attention (GQA) LLaMA 3.x / Mistral / Qwen 2.5 with RoPE and PagedAttention decoding.
+//! - BERT / ModernBERT embedding model with mean pooling and L2 normalization for dense RAG retrieval.
+//! - Binary GGUF format parser for edge block-quantized weights.
+//! - Named weight storage and mapping dictionary.
+
 pub mod config;
 pub mod embedding;
 pub mod gguf;
@@ -34,7 +44,6 @@ mod tests {
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim();
 
-        // Allocate KV cache for 2 layers
         let mut k_caches = vec![
             Tensor::zeros(
                 Shape::new(vec![num_blocks, num_kv_heads, block_size, head_dim]),
@@ -94,7 +103,6 @@ mod tests {
         let emb = model.embed(&token_ids).unwrap();
 
         assert_eq!(emb.len(), config.hidden_size);
-        // Verify L2 normalized
         let norm_sq: f32 = emb.iter().map(|&v| v * v).sum();
         assert!((norm_sq - 1.0).abs() < 1e-4);
     }

@@ -1,30 +1,38 @@
+//! Multi-dimensional tensor shapes, strides, and broadcasting algebra.
+
 use crate::error::{Result, RllmError};
 use serde::{Deserialize, Serialize};
 
+/// Represents the dimension vector of a multi-dimensional tensor.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Shape {
     dims: Vec<usize>,
 }
 
 impl Shape {
+    /// Creates a new Shape from a vector of dimension sizes.
     pub fn new(dims: Vec<usize>) -> Self {
         Self { dims }
     }
 
+    /// Creates a Shape from a slice of dimension sizes.
     pub fn from_slice(dims: &[usize]) -> Self {
         Self {
             dims: dims.to_vec(),
         }
     }
 
+    /// Returns a slice over the dimensions.
     pub fn dims(&self) -> &[usize] {
         &self.dims
     }
 
+    /// Number of dimensions (rank) of the shape.
     pub fn rank(&self) -> usize {
         self.dims.len()
     }
 
+    /// Total number of scalar elements (product of all dimensions).
     pub fn numel(&self) -> usize {
         if self.dims.is_empty() {
             0
@@ -33,6 +41,7 @@ impl Shape {
         }
     }
 
+    /// Returns the size of a specific dimension by index.
     pub fn dim(&self, index: usize) -> Result<usize> {
         self.dims.get(index).copied().ok_or_else(|| RllmError::DimOutOfRange {
             dim: index,
@@ -40,7 +49,7 @@ impl Shape {
         })
     }
 
-    /// Computes default contiguous row-major strides.
+    /// Computes default contiguous row-major strides for this shape.
     pub fn default_strides(&self) -> Vec<usize> {
         let mut strides = vec![1; self.dims.len()];
         if self.dims.is_empty() {
@@ -52,7 +61,7 @@ impl Shape {
         strides
     }
 
-    /// Broadcast two shapes together following standard NumPy/PyTorch rules.
+    /// Computes the broadcasted shape between `lhs` and `rhs` following standard NumPy/PyTorch rules.
     pub fn broadcast(lhs: &Shape, rhs: &Shape) -> Result<Shape> {
         let max_rank = lhs.rank().max(rhs.rank());
         let mut out_dims = vec![0; max_rank];
@@ -116,4 +125,3 @@ impl From<Vec<usize>> for Shape {
         Shape::new(v)
     }
 }
-

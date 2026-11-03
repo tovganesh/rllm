@@ -1,3 +1,9 @@
+//! End-to-end Retrieval-Augmented Generation (RAG) execution pipeline.
+//!
+//! Integrates document ingestion, BERT dense embeddings, hybrid index querying,
+//! cross-encoder reranking, prefix-preserving prompt assembly, and token generation
+//! via the [`ContinuousBatchScheduler`].
+
 use crate::chunker::{DocumentChunk, TextChunker};
 use crate::hybrid::HybridIndex;
 use crate::reranker::CrossEncoderReranker;
@@ -11,32 +17,49 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
+/// Source citation attributing answer content to an ingested document passage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Citation {
+    /// Document identifier.
     pub doc_id: String,
+    /// Chunk index within document.
     pub chunk_id: usize,
+    /// Passage text used in prompt context.
     pub text: String,
+    /// Calculated relevance score from retrieval and reranking.
     pub relevance: f32,
+    /// Associated metadata key-value pairs.
     pub metadata: HashMap<String, String>,
 }
 
+/// Final answer synthesized by the RAG engine along with source citations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagResponse {
+    /// Original user query string.
     pub query: String,
+    /// Generated answer text.
     pub answer: String,
+    /// List of source passages cited in the synthesized response.
     pub citations: Vec<Citation>,
+    /// Number of output tokens generated.
     pub generated_tokens: usize,
 }
 
+/// Unified RAG engine coordinating embedding models, hybrid indexes, and continuous batch schedulers.
 pub struct RagEngine<B: Backend> {
+    /// Local embedding model used for dense semantic retrieval.
     pub embedding_model: Arc<BertEmbeddingModel<B>>,
+    /// Hybrid index containing vectors and inverted BM25 index.
     pub hybrid_index: Mutex<HybridIndex>,
+    /// Configured text chunker for passage splitting.
     pub chunker: TextChunker,
+    /// Continuous batching scheduler executing the autoregressive LLM.
     pub scheduler: Arc<ContinuousBatchScheduler<B>>,
     seq_counter: Mutex<u64>,
 }
 
 impl<B: Backend> RagEngine<B> {
+    /// Constructs a new [`RagEngine`] with embedding and LLM generation backends.
     pub fn new(
         embedding_model: Arc<BertEmbeddingModel<B>>,
         scheduler: Arc<ContinuousBatchScheduler<B>>,
@@ -192,4 +215,3 @@ impl<B: Backend> RagEngine<B> {
         })
     }
 }
-

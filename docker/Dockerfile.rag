@@ -1,0 +1,39 @@
+# ─── BUILD STAGE ───────────────────────────────────────────────────────────
+FROM rust:1.80-slim-bookworm AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace manifests
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY docs ./docs
+
+# Build release binary for the CLI and Server
+RUN cargo build --release -p rllm-cli
+
+# ─── RUNNER STAGE ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runner
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/rllm /usr/local/bin/rllm
+
+# Expose dedicated RAG service port
+EXPOSE 8080
+
+ENV RUST_LOG=info
+ENV INFERENCE_URL=http://inference:8000
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["rllm", "serve", "--service", "rag", "--addr", "0.0.0.0:8080"]

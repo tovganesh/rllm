@@ -1,3 +1,8 @@
+//! GGUF binary format parser and deserializer.
+//!
+//! Implements a zero-copy friendly reader for GGUF model files (v2/v3), parsing header
+//! magic, metadata key-value pairs, tensor information, and tensor offsets.
+
 use byteorder::{LittleEndian, ReadBytesExt};
 use rllm_core::{
     dtype::DType,
@@ -6,25 +11,45 @@ use rllm_core::{
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek};
 
-pub const GGUF_MAGIC: u32 = 0x46554747; // 'GGUF' in LE
+/// Magic header constant for GGUF files (`"GGUF"` in little-endian ASCII: `0x46554747`).
+pub const GGUF_MAGIC: u32 = 0x46554747;
 
+/// Metadata and dimension descriptor for an individual tensor within a GGUF file.
 #[derive(Debug, Clone)]
 pub struct GgufTensorInfo {
+    /// Name of the tensor in GGUF naming convention (e.g., `blk.0.attn_q.weight`).
     pub name: String,
+    /// Shape of the tensor in row-major order.
     pub shape: Vec<usize>,
+    /// Quantized or floating point data type.
     pub dtype: DType,
+    /// Byte offset relative to the file's data segment.
     pub offset: u64,
 }
 
+/// Parsed representation of a GGUF binary file.
 #[derive(Debug, Clone)]
 pub struct GgufFile {
+    /// GGUF specification format version (usually 2 or 3).
     pub version: u32,
+    /// Extracted metadata key-value pairs (e.g., architecture, context length).
     pub metadata: HashMap<String, String>,
+    /// Map of tensor name to tensor metadata descriptor.
     pub tensors: HashMap<String, GgufTensorInfo>,
+    /// Byte offset within the file where raw tensor payload buffers begin.
     pub data_offset: u64,
 }
 
 impl GgufFile {
+    /// Parses a GGUF file from an in-memory byte slice.
+    ///
+    /// Validates the magic constant, parses version, metadata key-value attributes,
+    /// and tensor descriptors, and aligns the data offset to 32 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RllmError::ModelError`] if magic mismatch or corrupted structure,
+    /// or [`RllmError::QuantizationError`] if an unsupported quantization type is encountered.
     pub fn read_from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut reader = Cursor::new(bytes);
 

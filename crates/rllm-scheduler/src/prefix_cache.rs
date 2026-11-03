@@ -1,13 +1,23 @@
+//! Radix tree prefix caching for prompt KV-cache sharing.
+//!
+//! Stores token hierarchies mapped to physical block IDs. When multiple queries share common
+//! system prompts, few-shot examples, or documents, matching blocks are reused with zero recomputation.
+
 use std::collections::HashMap;
 
+/// A node in the Radix prefix tree.
 #[derive(Debug)]
 pub struct RadixNode {
+    /// Token ID associated with this edge/node.
     pub token: u32,
+    /// Physical block ID associated with this boundary if this node aligns with a block boundary.
     pub block_id: Option<usize>,
+    /// Child branches mapped by subsequent token IDs.
     pub children: HashMap<u32, RadixNode>,
 }
 
 impl RadixNode {
+    /// Constructs a new empty node for a given token.
     pub fn new(token: u32) -> Self {
         Self {
             token,
@@ -17,13 +27,16 @@ impl RadixNode {
     }
 }
 
+/// Radix tree prefix cache for prompt key-value block reuse.
 #[derive(Debug)]
 pub struct PrefixCache {
+    /// Block size in tokens for physical block alignment.
     pub block_size: usize,
     root: RadixNode,
 }
 
 impl PrefixCache {
+    /// Constructs a new [`PrefixCache`] with the specified block size.
     pub fn new(block_size: usize) -> Self {
         Self {
             block_size,
@@ -32,7 +45,8 @@ impl PrefixCache {
     }
 
     /// Finds the longest matching prefix of cached blocks for a token sequence.
-    /// Returns: (number of tokens cached, list of physical block IDs).
+    ///
+    /// Returns: `(number of tokens cached, list of physical block IDs)`.
     pub fn match_prefix(&self, tokens: &[u32]) -> (usize, Vec<usize>) {
         let mut curr = &self.root;
         let mut matched_blocks = Vec::new();
@@ -83,4 +97,3 @@ impl PrefixCache {
         }
     }
 }
-

@@ -1,3 +1,5 @@
+//! Route handlers for OpenAI-compatible REST and RAG endpoints.
+
 use crate::api_types::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, EmbeddingData,
     EmbeddingRequest, EmbeddingResponse, RagIndexRequest, RagIndexResponse, RagQueryRequest,
@@ -11,31 +13,66 @@ use axum::{
 use rllm_backend_cpu::CpuBackend;
 use rllm_rag::RagEngine;
 use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, Sequence};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::{error, info};
 
-pub struct AppState {
-    pub scheduler: Arc<ContinuousBatchScheduler<CpuBackend>>,
-    pub rag_engine: Arc<RagEngine<CpuBackend>>,
-    pub model_name: String,
+/// Operating service mode for containerized or standalone deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceMode {
+    /// Host both inference and RAG services in a single unified process.
+    All,
+    /// Host only the LLM inference engine (continuous batching, PagedAttention, completions).
+    Inference,
+    /// Host only the RAG service (vector store, chunking, hybrid search, reranker).
+    Rag,
 }
 
+/// Global shared application state across HTTP request handlers.
+pub struct AppState {
+    /// Optional local scheduler for in-process LLM generation.
+    pub scheduler: Option<Arc<ContinuousBatchScheduler<CpuBackend>>>,
+    /// Optional local RAG engine for hybrid retrieval and document indexing.
+    pub rag_engine: Option<Arc<RagEngine<CpuBackend>>>,
+    /// Optional remote inference URL (e.g., `http://rllm-inference:8000`) for decoupled RAG.
+    pub inference_url: Option<String>,
+    /// Model name identifier reported in API responses.
+    pub model_name: String,
+    /// Active service operating mode.
+    pub mode: ServiceMode,
+}
+
+/// Health and cluster status handler (`GET /health`).
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let running = state.scheduler.num_running();
-    let waiting = state.scheduler.num_waiting();
+    let running = state.scheduler.as_ref().map(|s| s.num_running()).unwrap_or(0);
+    let waiting = state.scheduler.as_ref().map(|s| s.num_waiting()).unwrap_or(0);
+
     Json(serde_json::json!({
         "status": "healthy",
         "engine": "rllm",
+        "service_mode": match state.mode {
+            ServiceMode::All => "all",
+            ServiceMode::Inference => "inference",
+            ServiceMode::Rag => "rag",
+        },
         "model": state.model_name,
         "running_sequences": running,
         "waiting_sequences": waiting,
+        "remote_inference_url": state.inference_url,
     }))
 }
 
+/// OpenAI-compatible chat completion handler (`POST /v1/chat/completions`).
 pub async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let scheduler = state.scheduler.as_ref().ok_or_else(|| {
+        error!("Chat completions requested but inference scheduler is not enabled in this container");
+        StatusCode::NOT_IMPLEMENTED
+    })?;
+
     let mut prompt = String::new();
     for msg in &req.messages {
         prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
@@ -67,12 +104,11 @@ pub async fn chat_completions_handler(
         seq_id,
         prompt_tokens,
         sampling,
-        state.scheduler.config.block_size,
+        scheduler.config.block_size,
         Some(tx),
     );
 
-    state
-        .scheduler
+    scheduler
         .submit_sequence(seq)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -80,8 +116,7 @@ pub async fn chat_completions_handler(
 
     // Drive generation step loop
     loop {
-        state
-            .scheduler
+        scheduler
             .step()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -89,7 +124,7 @@ pub async fn chat_completions_handler(
             generated_tokens.push(token);
         }
 
-        if state.scheduler.num_running() == 0 && state.scheduler.num_waiting() == 0 {
+        if scheduler.num_running() == 0 && scheduler.num_waiting() == 0 {
             break;
         }
     }
@@ -125,10 +160,16 @@ pub async fn chat_completions_handler(
     Ok(Json(resp))
 }
 
+/// OpenAI-compatible dense vector embeddings handler (`POST /v1/embeddings`).
 pub async fn embeddings_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let rag_engine = state.rag_engine.as_ref().ok_or_else(|| {
+        error!("Embeddings requested but embedding model is not enabled in this container");
+        StatusCode::NOT_IMPLEMENTED
+    })?;
+
     let mut data = Vec::new();
     for (idx, text) in req.input.iter().enumerate() {
         let tokens: Vec<u32> = text
@@ -137,8 +178,7 @@ pub async fn embeddings_handler(
             .map(|(i, _)| ((i % 500) + 1) as u32)
             .collect();
 
-        let emb = state
-            .rag_engine
+        let emb = rag_engine
             .embedding_model
             .embed(&tokens)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -156,13 +196,18 @@ pub async fn embeddings_handler(
     }))
 }
 
+/// Document ingestion handler for the RAG hybrid vector store (`POST /v1/rag/index`).
 pub async fn rag_index_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RagIndexRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let rag_engine = state.rag_engine.as_ref().ok_or_else(|| {
+        error!("RAG indexing requested but RAG engine is not enabled in this container");
+        StatusCode::NOT_IMPLEMENTED
+    })?;
+
     let meta = req.metadata.unwrap_or_default();
-    let count = state
-        .rag_engine
+    let count = rag_engine
         .ingest_document(&req.doc_id, &req.text, meta)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -173,18 +218,114 @@ pub async fn rag_index_handler(
     }))
 }
 
+/// End-to-end RAG query handler (`POST /v1/rag/query`).
+/// If a remote inference URL is configured, calls the remote container for generation.
 pub async fn rag_query_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RagQueryRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let rag_engine = state.rag_engine.as_ref().ok_or_else(|| {
+        error!("RAG query requested but RAG engine is not enabled in this container");
+        StatusCode::NOT_IMPLEMENTED
+    })?;
+
     let top_k = req.top_k.unwrap_or(3);
     let mut sampling = SamplingParams::default();
     if let Some(m) = req.max_tokens {
         sampling.max_tokens = m;
     }
 
-    let response = state
-        .rag_engine
+    // Check if remote inference engine container is configured
+    if let Some(ref remote_url) = state.inference_url {
+        info!("Executing RAG query with remote inference container at {}", remote_url);
+
+        // 1. Local hybrid dense + sparse retrieval using local RAG index
+        let q_token_ids: Vec<u32> = req.query
+            .split_whitespace()
+            .enumerate()
+            .map(|(i, _)| ((i % 500) + 1) as u32)
+            .collect();
+        let q_emb = rag_engine
+            .embedding_model
+            .embed(&q_token_ids)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let raw_matches = {
+            let index = rag_engine.hybrid_index.lock();
+            index.search(&req.query, &q_emb, top_k * 2)
+        };
+
+        let candidate_chunks: Vec<_> = raw_matches.into_iter().map(|m| m.chunk).collect();
+        let reranked = rllm_rag::CrossEncoderReranker::rerank(&req.query, candidate_chunks, top_k);
+
+        let citations: Vec<rllm_rag::Citation> = reranked
+            .iter()
+            .map(|r| rllm_rag::Citation {
+                doc_id: r.chunk.doc_id.clone(),
+                chunk_id: r.chunk.chunk_id,
+                text: r.chunk.text.clone(),
+                relevance: r.relevance_score,
+                metadata: r.chunk.metadata.clone(),
+            })
+            .collect();
+
+        // 2. Assemble prompt
+        let mut context_str = String::new();
+        for (i, cit) in citations.iter().enumerate() {
+            context_str.push_str(&format!("\n[{}] {}\n", i + 1, cit.text));
+        }
+
+        let client = reqwest::Client::new();
+        let chat_req = ChatCompletionRequest {
+            model: Some(state.model_name.clone()),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("You are an enterprise AI. Answer using the context:\n{}", context_str),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: req.query.clone(),
+                },
+            ],
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_tokens: req.max_tokens,
+            stream: Some(false),
+        };
+
+        let chat_endpoint = format!("{}/v1/chat/completions", remote_url.trim_end_matches('/'));
+        let response = client
+            .post(&chat_endpoint)
+            .json(&chat_req)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to contact remote inference container: {}", e);
+                StatusCode::BAD_GATEWAY
+            })?;
+
+        let chat_resp: ChatCompletionResponse = response.json().await.map_err(|e| {
+            error!("Failed to parse response from remote inference container: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+        let answer = chat_resp
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_else(|| "No completion generated by remote engine".to_string());
+
+        return Ok(Json(rllm_rag::RagResponse {
+            query: req.query,
+            answer,
+            citations,
+            generated_tokens: chat_resp.usage.completion_tokens,
+        }));
+    }
+
+    // Default to in-process local scheduler
+    let response = rag_engine
         .query(&req.query, top_k, sampling)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

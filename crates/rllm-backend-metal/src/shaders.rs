@@ -1,3 +1,9 @@
+//! Metal Shading Language (MSL) GPU kernel sources for Apple Silicon hardware acceleration.
+//!
+//! Includes threadgroup-parallelized kernels for RMSNorm, Rotary Position Embedding (RoPE),
+//! and matrix-vector multiplication (GEMV).
+
+/// Embedded MSL shader source code compiled at runtime via `device.new_library_with_source`.
 pub const SHADERS_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -88,4 +94,3 @@ kernel void gemv_f32(
     out[row] = sum;
 }
 "#;
-

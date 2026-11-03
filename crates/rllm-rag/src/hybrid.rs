@@ -1,27 +1,45 @@
+//! Hybrid retrieval combining dense vector search and sparse BM25.
+//!
+//! Uses Reciprocal Rank Fusion (RRF) to merge candidate rankings from dense HNSW
+//! vector similarity and sparse BM25 keyword matching into a single unified result.
+
 use crate::bm25::Bm25Index;
 use crate::chunker::DocumentChunk;
 use crate::hnsw::HnswIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A matched passage produced by hybrid dense-sparse search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridMatch {
+    /// Internal chunk index.
     pub chunk_idx: usize,
+    /// Fused Reciprocal Rank Fusion (RRF) score.
     pub rrf_score: f32,
+    /// Dense vector cosine similarity score if matched in HNSW.
     pub dense_score: Option<f32>,
+    /// Sparse BM25 score if matched in inverted index.
     pub bm25_score: Option<f32>,
+    /// Associated document chunk.
     pub chunk: DocumentChunk,
 }
 
+/// Unified index combining [`HnswIndex`] and [`Bm25Index`] via Reciprocal Rank Fusion.
 pub struct HybridIndex {
+    /// Dense vector approximate nearest neighbor index.
     pub hnsw: HnswIndex,
+    /// Sparse BM25 inverted lexical index.
     pub bm25: Bm25Index,
+    /// Scaling weight applied to dense vector RRF scores.
     pub dense_weight: f32,
+    /// Scaling weight applied to sparse BM25 RRF scores.
     pub bm25_weight: f32,
+    /// Smoothing constant $k$ in RRF formula ($RRF(d) = \sum \frac{w}{k + r_i}$).
     pub rrf_k: f32,
 }
 
 impl HybridIndex {
+    /// Constructs a new [`HybridIndex`].
     pub fn new(dim: usize, m: usize, ef_construction: usize, ef_search: usize) -> Self {
         Self {
             hnsw: HnswIndex::new(dim, m, ef_construction, ef_search),
@@ -32,19 +50,23 @@ impl HybridIndex {
         }
     }
 
+    /// Inserts a chunk and its corresponding embedding into both indices.
     pub fn insert(&mut self, vector: Vec<f32>, chunk: DocumentChunk) {
         self.bm25.insert(chunk.clone());
         self.hnsw.insert(vector, chunk);
     }
 
+    /// Number of passages indexed.
     pub fn len(&self) -> usize {
         self.hnsw.len()
     }
 
+    /// True if the index contains no passages.
     pub fn is_empty(&self) -> bool {
         self.hnsw.is_empty()
     }
 
+    /// Performs hybrid search over dense vector embeddings and lexical text, fusing ranks via RRF.
     pub fn search(
         &self,
         query_text: &str,
@@ -91,4 +113,3 @@ impl HybridIndex {
             .collect()
     }
 }
-

@@ -1,3 +1,5 @@
+//! Metal compute backend driver for Apple Silicon and iOS devices.
+
 use crate::shaders::SHADERS_MSL;
 use rllm_core::{
     backend::{Backend, BlockTable},
@@ -7,13 +9,17 @@ use rllm_core::{
 };
 use tracing::info;
 
+/// Apple Silicon Metal execution backend.
 #[derive(Debug, Clone)]
 pub struct MetalBackend {
+    /// Device identifier for multi-GPU Apple systems.
     pub device_id: usize,
+    /// Availability flag on host OS (true on macOS and iOS).
     pub is_available: bool,
 }
 
 impl MetalBackend {
+    /// Initializes the Metal backend for the specified GPU device index.
     pub fn new(device_id: usize) -> Self {
         #[cfg(target_os = "macos")]
         let available = true;
@@ -30,6 +36,7 @@ impl MetalBackend {
         }
     }
 
+    /// Returns embedded MSL shader source strings.
     pub fn msl_source(&self) -> &'static str {
         SHADERS_MSL
     }
@@ -41,8 +48,6 @@ impl Backend for MetalBackend {
     }
 
     fn matmul(&self, _a: &Tensor, _b: &Tensor) -> Result<Tensor> {
-        // High-level Metal dispatch interface
-        // When running on Apple Silicon unified memory, buffers are accessible to both CPU and GPU
         Err(RllmError::BackendError(
             "Direct Metal GPU pipeline dispatch requires compiled metal pipeline state".to_string(),
         ))

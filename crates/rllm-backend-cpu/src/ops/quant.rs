@@ -1,24 +1,33 @@
+//! Direct quantized matrix-vector kernels (Q4_0, Q8_0) for edge and mobile execution.
+
 use half::f16;
 use rayon::prelude::*;
 
+/// Number of values grouped into a single Q4_0 block.
 pub const QK4_0: usize = 32;
+
+/// Number of values grouped into a single Q8_0 block.
 pub const QK8_0: usize = 32;
 
-/// Q4_0 block: 16-bit f16 scale + 16 bytes (32 4-bit nibbles) = 18 bytes
+/// Memory layout of a 32-element Q4_0 block (18 bytes).
 #[repr(C)]
 pub struct BlockQ4_0 {
+    /// 16-bit half-precision delta scaling factor.
     pub d: f16,
+    /// 16 bytes storing 32 packed 4-bit nibbles.
     pub qs: [u8; 16],
 }
 
-/// Q8_0 block: 16-bit f16 scale + 32 bytes (32 signed i8) = 34 bytes
+/// Memory layout of a 32-element Q8_0 block (34 bytes).
 #[repr(C)]
 pub struct BlockQ8_0 {
+    /// 16-bit half-precision delta scaling factor.
     pub d: f16,
+    /// 32 bytes storing 32 8-bit signed integers.
     pub qs: [i8; 32],
 }
 
-/// Dot product of a Q4_0 quantized weight row with an F32 activation vector.
+/// Computes the dot product of a Q4_0 quantized weight row with an F32 activation vector.
 #[inline]
 pub fn dot_q4_0_f32(q4_bytes: &[u8], f32_vec: &[f32]) -> f32 {
     let k = f32_vec.len();
@@ -45,7 +54,7 @@ pub fn dot_q4_0_f32(q4_bytes: &[u8], f32_vec: &[f32]) -> f32 {
     sum
 }
 
-/// Dot product of a Q8_0 quantized weight row with an F32 activation vector.
+/// Computes the dot product of a Q8_0 quantized weight row with an F32 activation vector.
 #[inline]
 pub fn dot_q8_0_f32(q8_bytes: &[u8], f32_vec: &[f32]) -> f32 {
     let k = f32_vec.len();
@@ -70,7 +79,8 @@ pub fn dot_q8_0_f32(q8_bytes: &[u8], f32_vec: &[f32]) -> f32 {
     sum
 }
 
-/// Quantized GEMV for Q4_0: Matrix [N, K] (stored as Q4_0) * Vector [K] (F32) -> Output [N] (F32)
+/// Multiplies a matrix `[N, K]` stored in `Q4_0` by vector `[K]` into `out [N]` in F32.
+/// Eliminates intermediate full-matrix dequantization memory allocations.
 pub fn gemv_q4_0_f32(
     weight_bytes: &[u8],
     act: &[f32],
@@ -95,7 +105,7 @@ pub fn gemv_q4_0_f32(
         });
 }
 
-/// Quantized GEMV for Q8_0: Matrix [N, K] (stored as Q8_0) * Vector [K] (F32) -> Output [N] (F32)
+/// Multiplies a matrix `[N, K]` stored in `Q8_0` by vector `[K]` into `out [N]` in F32.
 pub fn gemv_q8_0_f32(
     weight_bytes: &[u8],
     act: &[f32],
@@ -120,7 +130,7 @@ pub fn gemv_q8_0_f32(
         });
 }
 
-/// Quantize an F32 slice into Q4_0 format.
+/// Quantizes an uncompressed F32 slice into `Q4_0` format blocks.
 pub fn quantize_f32_to_q4_0(src: &[f32], dst: &mut [u8]) {
     let k = src.len();
     assert_eq!(k % QK4_0, 0);
@@ -151,4 +161,3 @@ pub fn quantize_f32_to_q4_0(src: &[f32], dst: &mut [u8]) {
         }
     }
 }
-

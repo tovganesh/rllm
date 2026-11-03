@@ -1,3 +1,10 @@
+//! # `rllm-backend-cpu`
+//!
+//! High-performance CPU compute backend for ARM NEON and x86 AVX2/AVX-512 SIMD vector architectures.
+//!
+//! Provides cache-tiled matrix multiplication, PagedAttention multi-head decoding,
+//! vector RMSNorm, Rotary Position Embeddings (RoPE), and direct 4-bit/8-bit quantized GEMV.
+
 pub mod backend;
 pub mod ops;
 
@@ -19,7 +26,6 @@ mod tests {
     #[test]
     fn test_cpu_matmul() {
         let backend = CpuBackend;
-        // A: 2x3, B: 3x2
         let a = Tensor::from_f32(
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             Shape::new(vec![2, 3]),
@@ -36,8 +42,6 @@ mod tests {
         let c = backend.matmul(&a, &b).unwrap();
         assert_eq!(c.dims(), &[2, 2]);
         let data: Vec<f32> = c.to_vec().unwrap();
-        // [1*7+2*9+3*2, 1*8+2*1+3*3] = [7+18+6, 8+2+9] = [31, 19]
-        // [4*7+5*9+6*2, 4*8+5*1+6*3] = [28+45+12, 32+5+18] = [85, 55]
         assert_eq!(data, vec![31.0, 19.0, 85.0, 55.0]);
     }
 
@@ -59,8 +63,6 @@ mod tests {
 
         let y = backend.rms_norm(&x, &weight, 1e-6).unwrap();
         let data: Vec<f32> = y.to_vec().unwrap();
-        // rms = sqrt(mean(4, 4, 4, 4)) = 2.0
-        // y = [1.0, -1.0, 1.0, -1.0]
         for (a, b) in data.iter().zip(&[1.0f32, -1.0, 1.0, -1.0]) {
             assert!((a - b).abs() < 1e-4);
         }
@@ -88,7 +90,6 @@ mod tests {
         let res = backend.gemv_quantized(&weight_tensor, &act).unwrap();
         let data: Vec<f32> = res.to_vec().unwrap();
 
-        // 32 ones * 1.0 ~ 32.0 (with slight quantization error)
         for &val in &data {
             assert!((val - 32.0).abs() < 1.0);
         }
@@ -110,7 +111,6 @@ mod tests {
         )
         .unwrap();
 
-        // 1 block, 1 kv head, 2 tokens, 4 head_dim
         let k_cache = Tensor::from_f32(
             &vec![1.0f32; 1 * num_heads_kv * block_size * head_dim],
             Shape::new(vec![1, num_heads_kv, block_size, head_dim]),
@@ -144,7 +144,6 @@ mod tests {
 
         assert_eq!(out.dims(), &[1, num_heads_q, head_dim]);
         let data: Vec<f32> = out.to_vec().unwrap();
-        // Values were 2.0, softmax weights sum to 1.0 -> output should be 2.0
         for &val in &data {
             assert!((val - 2.0).abs() < 1e-4);
         }

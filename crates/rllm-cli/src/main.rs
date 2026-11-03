@@ -1,3 +1,10 @@
+//! Command-line interface and binary entrypoint for the `rllm` inference and RAG engines.
+//!
+//! Subcommands:
+//! - `serve`: Launches the OpenAI-compatible HTTP service in `all`, `inference`, or `rag` decoupled mode.
+//! - `bench`: Runs the inference performance benchmark suite against target architectures (e.g. `edge-4gb`).
+//! - `rag-demo`: Runs an interactive retrieval-augmented generation pipeline with citations.
+
 mod benchmark;
 
 use benchmark::{run_comprehensive_benchmark, BenchmarkOptions};
@@ -24,10 +31,18 @@ struct Cli {
 enum Commands {
     /// Start the OpenAI-compatible HTTP & RAG Server
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        #[arg(long, default_value = "0.0.0.0:8080")]
         addr: SocketAddr,
 
-        #[arg(long, default_value = "llama-3-8b")]
+        /// Service mode to run: 'all', 'inference', or 'rag'
+        #[arg(long, default_value = "all")]
+        service: String,
+
+        /// Remote inference URL (e.g., http://inference:8000) for decoupled RAG container
+        #[arg(long, env = "INFERENCE_URL")]
+        inference_url: Option<String>,
+
+        #[arg(long, default_value = "edge-4gb")]
         model: String,
 
         #[arg(long, default_value_t = 32)]
@@ -68,43 +83,89 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Serve {
             addr,
+            service,
+            inference_url,
             model,
             max_batch_size,
         } => {
-            println!("🚀 Initializing rllm engine for model: {}", model);
+            use rllm_server::ServiceMode;
+            let mode = match service.to_lowercase().as_str() {
+                "inference" => ServiceMode::Inference,
+                "rag" => ServiceMode::Rag,
+                _ => ServiceMode::All,
+            };
+
+            println!("🚀 Initializing rllm server in [{:?}] mode", mode);
             let backend = Arc::new(CpuBackend);
 
-            let llama_cfg = LlamaConfig::tiny_test_config();
-            let llama_model = Arc::new(LlamaModel::new_random(llama_cfg, backend.clone())?);
-
-            let bert_cfg = BertConfig::tiny_test_config();
-            let bert_model =
-                Arc::new(BertEmbeddingModel::new_random(bert_cfg.clone(), backend.clone())?);
-
-            let sched_cfg = SchedulerConfig {
-                max_batch_size,
-                block_size: 16,
-                total_blocks: 1024,
+            // 1. Initialize inference scheduler if mode is All or Inference
+            let scheduler = if mode == ServiceMode::All || mode == ServiceMode::Inference {
+                let llama_cfg = match model.as_str() {
+                    "edge-4gb" => LlamaConfig::edge_4gb(),
+                    "1b" => LlamaConfig::llama_3_2_1b(),
+                    _ => LlamaConfig::tiny_test_config(),
+                };
+                let llama_model = Arc::new(LlamaModel::new_random(llama_cfg, backend.clone())?);
+                let sched_cfg = SchedulerConfig {
+                    max_batch_size,
+                    block_size: 16,
+                    total_blocks: 1024,
+                };
+                Some(Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?))
+            } else {
+                None
             };
-            let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?);
 
-            let rag_engine = Arc::new(RagEngine::new(
-                bert_model,
-                scheduler.clone(),
-                bert_cfg.hidden_size,
-            ));
+            // 2. Initialize RAG engine if mode is All or Rag
+            let rag_engine = if mode == ServiceMode::All || mode == ServiceMode::Rag {
+                let bert_cfg = BertConfig::tiny_test_config();
+                let bert_model =
+                    Arc::new(BertEmbeddingModel::new_random(bert_cfg.clone(), backend.clone())?);
+
+                // Use the local scheduler if present, or create a minimal one for RAG prompt driving
+                let dummy_scheduler = if let Some(ref s) = scheduler {
+                    s.clone()
+                } else {
+                    let dummy_cfg = LlamaConfig::tiny_test_config();
+                    let dummy_model = Arc::new(LlamaModel::new_random(dummy_cfg, backend.clone())?);
+                    let sched_cfg = SchedulerConfig {
+                        max_batch_size: 2,
+                        block_size: 16,
+                        total_blocks: 64,
+                    };
+                    Arc::new(ContinuousBatchScheduler::new(sched_cfg, dummy_model)?)
+                };
+
+                Some(Arc::new(RagEngine::new(
+                    bert_model,
+                    dummy_scheduler,
+                    bert_cfg.hidden_size,
+                )))
+            } else {
+                None
+            };
 
             let state = Arc::new(AppState {
                 scheduler,
                 rag_engine,
+                inference_url: inference_url.clone(),
                 model_name: model,
+                mode,
             });
 
-            println!("⚡ Serving OpenAI-compatible API at http://{}", addr);
+            println!("⚡ Serving API at http://{}", addr);
             println!("   - Health: http://{}/health", addr);
-            println!("   - Chat:   http://{}/v1/chat/completions", addr);
-            println!("   - Embed:  http://{}/v1/embeddings", addr);
-            println!("   - RAG:    http://{}/v1/rag/query", addr);
+            if mode == ServiceMode::All || mode == ServiceMode::Inference {
+                println!("   - Chat:   http://{}/v1/chat/completions", addr);
+                println!("   - Embed:  http://{}/v1/embeddings", addr);
+            }
+            if mode == ServiceMode::All || mode == ServiceMode::Rag {
+                println!("   - RAG:    http://{}/v1/rag/query", addr);
+                println!("   - Index:  http://{}/v1/rag/index", addr);
+                if let Some(ref url) = inference_url {
+                    println!("   - Remote Inference Target: {}", url);
+                }
+            }
 
             run_server(addr, state).await?;
         }

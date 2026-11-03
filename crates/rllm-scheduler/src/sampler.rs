@@ -1,17 +1,30 @@
+//! Logit post-processing, temperature scaling, top-k/top-p filtering, and sampling.
+//!
+//! Implements greedy argmax, categorical sampling with temperature, nucleus (top-p),
+//! top-k truncation, and frequency/repetition penalty.
+
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+/// Sampling parameters controlling token selection probability distributions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingParams {
+    /// Temperature scaling factor ($T$). Values $\le 0.0$ trigger deterministic greedy argmax.
     pub temperature: f32,
+    /// Nucleus sampling threshold ($0.0 < p \le 1.0$), capping cumulative probability mass.
     pub top_p: f32,
+    /// Top-K sampling cutoff, retaining only the $K$ highest-probability tokens.
     pub top_k: usize,
+    /// Repetition penalty factor applied to previously generated tokens.
     pub repetition_penalty: f32,
+    /// Maximum number of tokens to generate before halting.
     pub max_tokens: usize,
+    /// Set of token IDs that signal immediate end of generation when sampled.
     pub stop_tokens: Vec<u32>,
 }
 
 impl Default for SamplingParams {
+    /// Sensible conversational default sampling hyperparameters.
     fn default() -> Self {
         Self {
             temperature: 0.7,
@@ -24,9 +37,14 @@ impl Default for SamplingParams {
     }
 }
 
+/// Token sampler that processes raw unnormalized logits into sampled token IDs.
 pub struct Sampler;
 
 impl Sampler {
+    /// Samples a single token from raw model output logits according to [`SamplingParams`].
+    ///
+    /// Applies repetition penalty, temperature scaling, stable softmax, top-K filtering,
+    /// top-p nucleus truncation, and categorical sampling.
     pub fn sample(
         logits: &[f32],
         params: &SamplingParams,
@@ -125,4 +143,3 @@ impl Sampler {
         0
     }
 }
-

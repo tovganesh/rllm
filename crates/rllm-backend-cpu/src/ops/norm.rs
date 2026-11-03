@@ -1,5 +1,9 @@
+//! Root Mean Square Normalization (RMSNorm) and LayerNorm implementations.
+
 use rayon::prelude::*;
 
+/// Computes RMSNorm:
+/// $$y_i = \frac{x_i}{\sqrt{\frac{1}{d} \sum_{j=1}^d x_j^2 + \epsilon}} \cdot w_i$$
 pub fn rms_norm_f32(
     x: &[f32],
     weight: &[f32],
@@ -28,6 +32,7 @@ pub fn rms_norm_f32(
         });
 }
 
+/// Computes LayerNorm with mean subtraction, variance normalization, scale, and optional bias.
 pub fn layer_norm_f32(
     x: &[f32],
     weight: &[f32],
@@ -65,4 +70,3 @@ pub fn layer_norm_f32(
             }
         });
 }
-
