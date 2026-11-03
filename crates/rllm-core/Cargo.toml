@@ -1,0 +1,15 @@
+[package]
+name = "rllm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+half.workspace = true
+byteorder.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+

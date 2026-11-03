@@ -1,0 +1,21 @@
+[package]
+name = "rllm-rag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rllm-core = { workspace = true }
+rllm-models = { workspace = true }
+rllm-scheduler = { workspace = true }
+rayon.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rllm-backend-cpu = { workspace = true }
