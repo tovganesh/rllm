@@ -19,7 +19,7 @@ pub const STOP_WORDS: &[&str] = &[
     "ourselves", "out", "over", "own", "same", "shan't", "she", "should", "shouldn't", "so",
     "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves", "then",
     "there", "there's", "these", "they", "this", "those", "through", "to", "too", "under",
-    "until", "up", "very", "was", "wasn't", "we", "were", "weren't", "what", "when", "where",
+    "until", "up", "use", "used", "uses", "using", "very", "was", "wasn't", "we", "were", "weren't", "what", "when", "where",
     "which", "while", "who", "whom", "why", "with", "won't", "would", "wouldn't", "you",
     "your", "yours", "yourself", "yourselves",
 ];

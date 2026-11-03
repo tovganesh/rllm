@@ -22,7 +22,10 @@ pub use chunker::{DocumentChunk, TextChunker};
 pub use grounding::{extract_content_keywords, extract_grounded_quote, split_sentences, GroundedQuote};
 pub use hnsw::{HnswIndex, VectorMatch};
 pub use hybrid::{HybridIndex, HybridMatch};
-pub use pipeline::{Citation, RagEngine, RagResponse, DEFAULT_MIN_RELEVANCE_THRESHOLD};
+pub use pipeline::{
+    is_coherent_completion, synthesize_grounded_answer, Citation, RagEngine, RagResponse,
+    DEFAULT_MIN_RELEVANCE_THRESHOLD,
+};
 pub use reranker::{CrossEncoderReranker, RerankedMatch};
 
 #[cfg(test)]
@@ -162,6 +165,8 @@ mod tests {
         assert_eq!(response.citations[0].doc_id, "architecture_spec");
         assert!(response.citations[0].quote.contains("enterprise grade inference engine"));
         assert!(!response.citations[0].matched_keywords.is_empty());
+        assert!(response.answer.contains("enterprise grade inference engine"));
+        assert!(response.answer.contains("[1]"));
         assert_eq!(response.generated_tokens, 3);
     }
 

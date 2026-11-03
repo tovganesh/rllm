@@ -12,12 +12,17 @@ pub mod config;
 pub mod embedding;
 pub mod gguf;
 pub mod llama;
+pub mod tokenizer;
 pub mod weights;
 
 pub use config::{BertConfig, LlamaConfig};
 pub use embedding::BertEmbeddingModel;
 pub use gguf::{GgufFile, GgufTensorInfo};
 pub use llama::LlamaModel;
+pub use tokenizer::{
+    Tokenizer, ASSISTANT_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, SYSTEM_TOKEN_ID,
+    UNK_TOKEN_ID, USER_TOKEN_ID,
+};
 pub use weights::Weights;
 
 #[cfg(test)]

@@ -60,7 +60,7 @@ impl LlamaConfig {
             vocab_size: 1000,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
-            max_position_embeddings: 512,
+            max_position_embeddings: 2048,
         }
     }
 

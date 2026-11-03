@@ -183,7 +183,7 @@ impl<B: Backend> LlamaModel<B> {
 
             // Apply RoPE rotation for each sequence position
             for b in 0..batch_size {
-                let pos = context_lens[b] - 1;
+                let pos = (context_lens[b] - 1).min(self.config.max_position_embeddings - 1);
                 let half_d = head_dim / 2;
                 let cos_slice = &self.cos_table.as_f32_slice()?[pos * half_d..(pos + 1) * half_d];
                 let sin_slice = &self.sin_table.as_f32_slice()?[pos * half_d..(pos + 1) * half_d];
