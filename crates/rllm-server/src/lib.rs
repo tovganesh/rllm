@@ -152,6 +152,7 @@ mod tests {
             query: "where does rllm deliver sub-millisecond inference?".to_string(),
             top_k: Some(1),
             max_tokens: Some(2),
+            min_relevance: None,
         };
 
         let response = app

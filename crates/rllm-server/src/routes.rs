@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use rllm_backend_cpu::CpuBackend;
-use rllm_rag::RagEngine;
+use rllm_rag::{extract_grounded_quote, RagEngine};
 use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, Sequence};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -238,6 +238,7 @@ pub async fn rag_query_handler(
     // Check if remote inference engine container is configured
     if let Some(ref remote_url) = state.inference_url {
         info!("Executing RAG query with remote inference container at {}", remote_url);
+        let threshold = req.min_relevance.unwrap_or(rag_engine.min_relevance_threshold);
 
         // 1. Local hybrid dense + sparse retrieval using local RAG index
         let q_token_ids: Vec<u32> = req.query
@@ -258,21 +259,62 @@ pub async fn rag_query_handler(
         let candidate_chunks: Vec<_> = raw_matches.into_iter().map(|m| m.chunk).collect();
         let reranked = rllm_rag::CrossEncoderReranker::rerank(&req.query, candidate_chunks, top_k);
 
-        let citations: Vec<rllm_rag::Citation> = reranked
-            .iter()
-            .map(|r| rllm_rag::Citation {
-                doc_id: r.chunk.doc_id.clone(),
-                chunk_id: r.chunk.chunk_id,
-                text: r.chunk.text.clone(),
-                relevance: r.relevance_score,
-                metadata: r.chunk.metadata.clone(),
+        let max_relevance = reranked
+            .first()
+            .map(|r| r.relevance_score)
+            .unwrap_or(0.0);
+
+        let valid_matches: Vec<_> = reranked
+            .into_iter()
+            .filter(|r| r.relevance_score >= threshold)
+            .collect();
+
+        // If low relevance / unrelated query, flag explicitly and avoid remote generation
+        if valid_matches.is_empty() {
+            let warning_msg = format!(
+                "Low relevance detected (confidence: {:.2}, threshold: {:.2}). The query appears unrelated to the ingested knowledge base.",
+                max_relevance, threshold
+            );
+            return Ok(Json(rllm_rag::RagResponse {
+                query: req.query.clone(),
+                answer: format!(
+                    "⚠️ Unrelated Query Warning: No sufficiently relevant or grounded information was found in the indexed documents for your query '{}' (confidence: {:.2} < threshold {:.2}).",
+                    req.query, max_relevance, threshold
+                ),
+                citations: Vec::new(),
+                generated_tokens: 0,
+                is_relevant: false,
+                confidence_score: max_relevance,
+                warning: Some(warning_msg),
+            }));
+        }
+
+        // Extract precise grounded quotes for citations
+        let citations: Vec<rllm_rag::Citation> = valid_matches
+            .into_iter()
+            .map(|r| {
+                let grounded = extract_grounded_quote(&req.query, &r.chunk.text);
+                let combined_relevance = (r.relevance_score * 0.7 + grounded.score * 0.3).min(1.0);
+                rllm_rag::Citation {
+                    doc_id: r.chunk.doc_id.clone(),
+                    chunk_id: r.chunk.chunk_id,
+                    quote: grounded.quote.clone(),
+                    text: grounded.quote,
+                    passage: r.chunk.text.clone(),
+                    relevance: combined_relevance,
+                    matched_keywords: grounded.matched_keywords,
+                    metadata: r.chunk.metadata.clone(),
+                }
             })
             .collect();
 
-        // 2. Assemble prompt
+        // Assemble prompt with precise factual context
         let mut context_str = String::new();
         for (i, cit) in citations.iter().enumerate() {
-            context_str.push_str(&format!("\n[{}] {}\n", i + 1, cit.text));
+            context_str.push_str(&format!(
+                "\n[{}] Document: {} (Relevance: {:.2})\nExact Quote: \"{}\"\n",
+                i + 1, cit.doc_id, cit.relevance, cit.quote
+            ));
         }
 
         let client = reqwest::Client::new();
@@ -281,7 +323,10 @@ pub async fn rag_query_handler(
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: format!("You are an enterprise AI. Answer using the context:\n{}", context_str),
+                    content: format!(
+                        "You are an enterprise AI. Answer strictly using the grounded context citations:\n{}",
+                        context_str
+                    ),
                 },
                 ChatMessage {
                     role: "user".to_string(),
@@ -321,12 +366,15 @@ pub async fn rag_query_handler(
             answer,
             citations,
             generated_tokens: chat_resp.usage.completion_tokens,
+            is_relevant: true,
+            confidence_score: max_relevance,
+            warning: None,
         }));
     }
 
-    // Default to in-process local scheduler
+    // Default to in-process local scheduler with threshold
     let response = rag_engine
-        .query(&req.query, top_k, sampling)
+        .query_with_threshold(&req.query, top_k, sampling, req.min_relevance)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
