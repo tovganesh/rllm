@@ -1,11 +1,14 @@
+//! Rotary Positional Embeddings (RoPE) for queries and keys.
+
+/// Applies Rotary Positional Embeddings to queries `q` and keys `k` in-place.
 pub fn rope_f32(
     q: &mut [f32],
     k: &mut [f32],
     num_heads_q: usize,
     num_heads_k: usize,
     head_dim: usize,
-    cos: &[f32], // length = head_dim / 2
-    sin: &[f32], // length = head_dim / 2
+    cos: &[f32],
+    sin: &[f32],
 ) {
     let half_dim = head_dim / 2;
     debug_assert_eq!(cos.len(), half_dim);
@@ -40,7 +43,8 @@ pub fn rope_f32(
     }
 }
 
-/// Precompute RoPE table: cos and sin frequencies up to max_seq_len
+/// Precomputes RoPE cosine and sine frequency tables up to `max_seq_len`.
+/// $$\text{freq}_i = \frac{1}{\theta^{2i/d}}$$
 pub fn precompute_rope_freqs(
     head_dim: usize,
     max_seq_len: usize,
@@ -61,4 +65,3 @@ pub fn precompute_rope_freqs(
 
     (cos_table, sin_table)
 }
-

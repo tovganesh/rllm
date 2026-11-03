@@ -1,9 +1,18 @@
+//! Hierarchical Navigable Small World (HNSW) vector index.
+//!
+//! Provides approximate nearest neighbor (ANN) vector search with ARM NEON SIMD
+//! accelerated dot product and cosine distance.
+
 use crate::chunker::DocumentChunk;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 
+/// Computes the dot product (cosine similarity for normalized vectors) between two slices.
+///
+/// Uses ARM NEON 128-bit vector fused multiply-accumulate instructions on `aarch64` targets,
+/// and 4x unrolled scalar operations on other architectures.
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -46,10 +55,14 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// A matched document chunk returned from an HNSW vector similarity search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorMatch {
+    /// Internal vector index ID.
     pub chunk_idx: usize,
+    /// Cosine similarity score (higher is more similar).
     pub score: f32,
+    /// Associated document chunk content and metadata.
     pub chunk: DocumentChunk,
 }
 
@@ -73,11 +86,17 @@ impl PartialOrd for Candidate {
     }
 }
 
+/// Hierarchical Navigable Small World (HNSW) graph index for fast vector retrieval.
 pub struct HnswIndex {
+    /// Vector embedding dimensionality.
     pub dim: usize,
+    /// Number of bidirectional connection links per node.
     pub m: usize,
+    /// Size of the dynamic candidate list during graph construction.
     pub ef_construction: usize,
+    /// Size of the dynamic candidate list during nearest-neighbor queries.
     pub ef_search: usize,
+    /// Multiplier parameter for random level generation ($1 / \ln(M)$).
     pub ml: f64,
     vectors: Vec<Vec<f32>>,
     chunks: Vec<DocumentChunk>,
@@ -88,6 +107,7 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
+    /// Constructs a new empty [`HnswIndex`].
     pub fn new(dim: usize, m: usize, ef_construction: usize, ef_search: usize) -> Self {
         let ml = 1.0 / (m as f64).ln();
         Self {
@@ -104,10 +124,12 @@ impl HnswIndex {
         }
     }
 
+    /// Number of vectors stored in the index.
     pub fn len(&self) -> usize {
         self.vectors.len()
     }
 
+    /// True if the index contains no vectors.
     pub fn is_empty(&self) -> bool {
         self.vectors.is_empty()
     }
@@ -123,6 +145,7 @@ impl HnswIndex {
         1.0 - sim
     }
 
+    /// Inserts a normalized vector along with its corresponding [`DocumentChunk`].
     pub fn insert(&mut self, vector: Vec<f32>, chunk: DocumentChunk) {
         assert_eq!(vector.len(), self.dim);
         let id = self.vectors.len();
@@ -243,6 +266,7 @@ impl HnswIndex {
         nearest.into_sorted_vec()
     }
 
+    /// Performs approximate nearest neighbor search for a given query vector.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<VectorMatch> {
         if self.entry_point.is_none() {
             return Vec::new();

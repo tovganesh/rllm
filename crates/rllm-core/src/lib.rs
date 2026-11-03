@@ -1,3 +1,15 @@
+//! # `rllm-core`
+//!
+//! Core tensor data structures, backend traits, shapes, and hardware abstractions
+//! for the `rllm` inference engine.
+//!
+//! ## Key Types
+//! - [`Tensor`]: Multi-dimensional array with row-major layout, strided views, and zero-copy slicing.
+//! - [`DType`]: Scalar precision (`F32`, `F16`, `BF16`) and block-quantized formats (`Q4_0`, `Q4_K`, `Q8_0`).
+//! - [`Shape`]: Dimensional representation and broadcasting rules.
+//! - [`Device`]: Target compute device (`Cpu`, `Metal`, `Cuda`).
+//! - [`Backend`]: Hardware compute interface defining fundamental operations (GEMM, RMSNorm, RoPE, PagedAttention).
+
 pub mod backend;
 pub mod device;
 pub mod dtype;
@@ -44,4 +56,3 @@ mod tests {
         assert_eq!(DType::Q8_0.storage_bytes(32), 34);
     }
 }
-

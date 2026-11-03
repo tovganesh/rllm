@@ -1,15 +1,29 @@
 # `rllm`: Enterprise-Grade LLM Inference & High-Performance RAG Engine
 
-A modular, zero-cost-abstraction, multi-backend LLM inference engine and high-throughput RAG platform written in **Rust from the ground up**.
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
+[![Docker](https://img.shields.io/badge/Docker-Multi--Container-2496ED.svg)](docker-compose.yml)
 
-Designed to scale across the full hardware spectrum:
-- **Smartphone & Edge**: iOS / Android (ARM NEON, unified memory, Q4_0 / Q4_K / Q8_0 block quantization, zero-copy buffers).
-- **Apple Silicon / MLX**: Native Metal Shading Language (MSL) compute shaders, Unified Memory Architecture (UMA), SIMDgroup matrix ops.
-- **GPU Clusters**: NVIDIA CUDA / cuBLAS / FlashAttention runtime, continuous batching, and multi-node throughput scaling.
+A modular, zero-cost-abstraction, multi-backend LLM inference engine and high-throughput RAG platform written in **Rust from the ground up**.
 
 ---
 
-## 🏗️ System Architecture
+## 📚 Core Documentation & Benchmarks
+
+- **[System Architecture Specification](docs/ARCHITECTURE.md)**: Deep dive into the PagedAttention memory manager, continuous batching scheduler, Radix tree prompt cache, hardware abstraction, and hybrid RAG subsystem.
+- **[Inference Performance Benchmarks & 4GB Fit Report](docs/BENCHMARKS.md)**: Comprehensive empirical evaluation, memory footprint breakdown for 4GB hardware envelopes, micro-kernel timings, batch scaling efficiency, and Radix cache speedup metrics.
+
+---
+
+## 🌐 Designed for the Full Hardware Spectrum
+
+- **Smartphone & Edge**: iOS / Android (ARM NEON SIMD, unified memory, Q4_0 / Q4_K / Q8_0 block quantization, zero-copy buffers). Designed to comfortably run within **4 GB RAM** envelopes leaving >2.5 GB headroom for the operating system and apps.
+- **Apple Silicon / MLX**: Native Metal Shading Language (MSL) compute shaders, Unified Memory Architecture (UMA) zero-copy tensor passing, SIMDgroup matrix ops.
+- **GPU Clusters**: CUDA / cuBLAS / FlashAttention runtime, continuous batching, and multi-node throughput scaling.
+
+---
+
+## 🏗️ Workspace Architecture
 
 ```text
 rllm/
@@ -17,11 +31,19 @@ rllm/
 │   ├── rllm-core/          # Tensor abstraction, Shape, DType (F32/F16/BF16/Q4/Q8), Device & Backend traits
 │   ├── rllm-backend-cpu/   # SIMD CPU engine (NEON, AVX2, cache-tiled GEMM, Q4/Q8 GEMV, Rayon)
 │   ├── rllm-backend-metal/ # Apple Silicon / Metal compute shaders (MSL GEMV, RMSNorm, RoPE)
-│   ├── rllm-models/        # GGUF & Safetensors loaders, LLaMA 3.x / Mistral / Qwen, BERT embedding
+│   ├── rllm-models/        # GGUF parser, LLaMA 3.x / Mistral / Qwen, BERT embedding
 │   ├── rllm-scheduler/     # PagedAttention KV-Cache, Continuous Batching, Radix-Tree Prefix Cache
 │   ├── rllm-rag/           # SIMD HNSW vector store, Okapi BM25, Hybrid RRF, Cross-Encoder Reranker
 │   ├── rllm-server/        # OpenAI-compatible REST + SSE Streaming API (Axum)
 │   └── rllm-cli/           # CLI tool for serving, benchmarking, and interactive RAG queries
+├── docker/
+│   ├── Dockerfile.inference # Dedicated LLM Inference Engine container (port 8000)
+│   └── Dockerfile.rag       # Dedicated High-Performance RAG container (port 8080)
+├── docker-compose.yml       # Multi-container service orchestration
+├── docs/
+│   ├── ARCHITECTURE.md     # Full architectural specification
+│   └── BENCHMARKS.md       # Benchmarking results & memory footprint analysis
+└── LICENSE                 # Apache 2.0 License
 ```
 
 ---
@@ -35,11 +57,11 @@ rllm/
 
 ### 2. PagedAttention & Radix Prefix KV Caching (`rllm-scheduler`)
 - **Virtual Memory Paging**: KV caches are managed as non-contiguous physical blocks (16 tokens per block), eliminating up to 80% of memory fragmentation.
-- **Radix-Tree Prompt Caching**: Common system instructions, few-shot examples, and retrieved RAG context documents form paths in a prefix trie. Matching prefixes skip the prefill phase entirely for **0 ms Time-To-First-Token (TTFT)**!
+- **Radix-Tree Prompt Caching**: Common system instructions, few-shot examples, and retrieved RAG context documents form paths in a prefix trie. Matching prefixes skip the prefill phase entirely for **instant Time-To-First-Token (TTFT)**.
 - **Continuous (In-Flight) Batching**: Iteration-level scheduling allows new requests to join the forward pass without stalling existing sequence generation.
 
 ### 3. Edge & Smartphone Optimized (`rllm-backend-cpu` / `rllm-backend-metal`)
-- Direct Quantized GEMV: Multiplies Q4_0 and Q8_0 weight matrices directly with F32 activations with zero intermediate dequantization memory overhead.
+- **Direct Quantized GEMV**: Multiplies Q4_0 and Q8_0 weight matrices directly with F32 activations with zero intermediate dequantization memory overhead (delivering **1.42x speedup** over unquantized execution).
 - ARM NEON vectorization for sub-millisecond mobile latency.
 - Native Metal MSL compute shaders targeting Apple Silicon unified memory.
 
@@ -53,7 +75,107 @@ rllm/
 
 ---
 
-## 🛠️ Getting Started
+## 🐳 Docker Deployment: Separate Containers
+
+`rllm` supports running the **Inference Engine** and the **RAG Engine** in completely decoupled containers, allowing independent scaling, resource isolation, and deployment across heterogeneous infrastructure (e.g. GPU cluster for inference, CPU nodes for vector retrieval).
+
+```text
+ ┌────────────────────────────────────────────────────────┐
+ │                      Client / App                      │
+ └──────────────┬──────────────────────────┬──────────────┘
+                │                          │
+      POST /v1/chat/completions     POST /v1/rag/query
+                │                          │
+                ▼                          ▼
+ ┌──────────────────────────┐    ┌──────────────────────────┐
+ │      rllm-inference      │    │         rllm-rag         │
+ │     Container (Port 8000)│    │     Container (Port 8080)│
+ │                          │    │                          │
+ │  • Continuous Batching   │◄───┤  • SIMD HNSW (Vectors)   │
+ │  • PagedAttention        │    │  • Okapi BM25 (Lexical)  │
+ │  • Block Quant (Q4/Q8)   │    │  • Hybrid RRF Fusion     │
+ │  • OpenAI API Compatible │    │  • Cross-Encoder Rerank  │
+ └──────────────────────────┘    └──────────────────────────┘
+```
+
+### 1. One-Command Orchestration (Recommended)
+
+Run both services together with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+- **`rllm-inference`** listens on `http://localhost:8000`
+- **`rllm-rag`** listens on `http://localhost:8080` (configured with `INFERENCE_URL=http://rllm-inference:8000`)
+
+### 2. Standalone Inference Container
+
+Build and run only the LLM inference engine:
+
+```bash
+# Build
+docker build -f docker/Dockerfile.inference -t rllm-inference:latest .
+
+# Run on port 8000
+docker run -d --name rllm-inference -p 8000:8000 rllm-inference:latest
+```
+
+Test inference health and chat completion:
+
+```bash
+# Health check
+curl -s http://localhost:8000/health | jq
+
+# OpenAI-compatible Chat Completion
+curl -s -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Explain PagedAttention in Rust."}],
+    "temperature": 0.7,
+    "max_tokens": 64
+  }' | jq
+```
+
+### 3. Standalone RAG Container
+
+Build and run only the RAG engine, pointing it to an inference container:
+
+```bash
+# Build
+docker build -f docker/Dockerfile.rag -t rllm-rag:latest .
+
+# Run on port 8080 pointing to the inference host
+docker run -d --name rllm-rag \
+  -p 8080:8080 \
+  -e INFERENCE_URL=http://localhost:8000 \
+  rllm-rag:latest
+```
+
+Test RAG document ingestion and semantic query:
+
+```bash
+# Ingest an enterprise document
+curl -s -X POST http://localhost:8080/v1/rag/index \
+  -H "Content-Type: application/json" \
+  -d '{
+    "doc_id": "rust_paged_attn",
+    "text": "rllm implements PagedAttention in Rust, eliminating memory fragmentation and enabling sub-millisecond continuous batching."
+  }' | jq
+
+# Query knowledge base with citation synthesis
+curl -s -X POST http://localhost:8080/v1/rag/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How does rllm eliminate memory fragmentation?",
+    "top_k": 2,
+    "max_tokens": 32
+  }' | jq
+```
+
+---
+
+## 🛠️ Local Development & CLI
 
 ### Prerequisites
 - Rust 1.80+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
@@ -68,31 +190,23 @@ cargo build --release
 cargo test --workspace
 ```
 
----
-
-## 💻 CLI Usage
-
-### 1. Run Performance Benchmark
-Measures Time To First Token (TTFT), token generation throughput, and continuous batching scheduling:
+### Build Documentation
 ```bash
-cargo run --release -p rllm-cli -- bench --batch-size 4 --prompt-tokens 64 --generate-tokens 32
+cargo doc --workspace --no-deps --open
 ```
 
-### 2. Interactive High-Performance RAG Demo
-Indexes enterprise knowledge documents into the hybrid SIMD HNSW + BM25 store and answers queries with citations:
+### Run Performance Benchmarks
+```bash
+cargo run --release -p rllm-cli -- bench --preset edge-4gb --batch-size 4 --prompt-tokens 64 --generate-tokens 16
+```
+
+### Interactive RAG Demonstration
 ```bash
 cargo run --release -p rllm-cli -- rag-demo --query "What makes rllm enterprise grade and edge compatible?"
 ```
 
-### 3. Launch OpenAI-Compatible API Server
-```bash
-cargo run --release -p rllm-cli -- serve --addr 127.0.0.1:8080 --model llama-3-8b
-```
+---
 
-#### Endpoints:
-- `GET  /health` - Cluster health & active KV cache metrics
-- `POST /v1/chat/completions` - OpenAI-compatible chat completion
-- `POST /v1/embeddings` - OpenAI-compatible dense vector embeddings
-- `POST /v1/rag/index` - Ingest and index documents into hybrid store
-- `POST /v1/rag/query` - End-to-end RAG query with citations
+## 📄 License
 
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.

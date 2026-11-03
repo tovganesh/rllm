@@ -1,5 +1,9 @@
+//! Matrix-matrix (GEMM) and matrix-vector (GEMV) multiplication with SIMD vectorization.
+
 use rayon::prelude::*;
 
+/// Computes the dot product of two F32 slices using SIMD intrinsics.
+/// Uses ARM NEON (`vfmaq_f32`) on `aarch64` and loop unrolling fallback.
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -42,8 +46,8 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// GEMV: Matrix [N, K] multiplied by Vector [K] -> Output [N]
-/// Used heavily in LLM token generation phase where batch_size * seq_len = 1.
+/// GEMV: Multiplies a matrix `[N, K]` by a vector `[K]`, writing output to `[N]`.
+/// Heavily utilized during autoregressive decoding steps where batch sequence length is 1.
 pub fn gemv_f32(mat: &[f32], vec: &[f32], out: &mut [f32], n: usize, k: usize) {
     debug_assert_eq!(mat.len(), n * k);
     debug_assert_eq!(vec.len(), k);
@@ -68,8 +72,7 @@ pub fn gemv_f32(mat: &[f32], vec: &[f32], out: &mut [f32], n: usize, k: usize) {
     }
 }
 
-/// GEMM: [M, K] * [K, N] -> [M, N]
-/// Parallelized over M rows.
+/// GEMM: General matrix multiplication `[M, K] * [K, N] -> [M, N]` parallelized across rows with Rayon.
 pub fn gemm_f32(
     a: &[f32],
     b: &[f32],
@@ -83,7 +86,6 @@ pub fn gemm_f32(
     debug_assert_eq!(c.len(), m * n);
 
     if m == 1 {
-        // Transpose view or direct GEMV if B is row-major
         for j in 0..n {
             let mut sum = 0.0f32;
             for p in 0..k {
@@ -105,4 +107,3 @@ pub fn gemm_f32(
         }
     });
 }
-

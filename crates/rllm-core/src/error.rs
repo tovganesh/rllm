@@ -1,5 +1,8 @@
+//! Error and Result types for the `rllm` engine.
+
 use thiserror::Error;
 
+/// Comprehensive error enumeration across memory, shapes, quantization, and device operations.
 #[derive(Error, Debug)]
 pub enum RllmError {
     #[error("Shape mismatch: expected {expected:?}, got {got:?}")]
@@ -64,5 +67,5 @@ pub enum RllmError {
     RagError(String),
 }
 
+/// Standard Result alias for `rllm` operations.
 pub type Result<T> = std::result::Result<T, RllmError>;
-

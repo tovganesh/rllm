@@ -1,0 +1,49 @@
+version: "3.8"
+
+services:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. Dedicated LLM Inference Engine Container
+  #    Hosts continuous batching, PagedAttention, KV cache, and OpenAI chat completions.
+  # ──────────────────────────────────────────────────────────────────────────
+  rllm-inference:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.inference
+    container_name: rllm-inference
+    ports:
+      - "8000:8000"
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. Dedicated High-Performance RAG Engine Container
+  #    Hosts document ingestion, chunking, SIMD HNSW vector search, BM25, and reranking.
+  #    Delegates LLM generation to the rllm-inference container over network.
+  # ──────────────────────────────────────────────────────────────────────────
+  rllm-rag:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.rag
+    container_name: rllm-rag
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      - INFERENCE_URL=http://rllm-inference:8000
+    depends_on:
+      rllm-inference:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped

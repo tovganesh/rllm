@@ -1,3 +1,12 @@
+//! Comprehensive inference performance benchmarks and profiling suite.
+//!
+//! Evaluates:
+//! - 4GB device envelope compatibility and RAM consumption.
+//! - Micro-kernel benchmarks: FP32 GEMV vs Q4_0 quantized GEMV, RMSNorm, PagedAttention.
+//! - End-to-end autoregressive decoding throughput (tokens/sec) and latency percentiles (P50/P90/P99).
+//! - Continuous batch scaling efficiency across batch sizes.
+//! - Radix tree prefix cache speedup on repeated prompt prefixes.
+
 use rllm_backend_cpu::{
     ops::{
         gemm::gemv_f32,
@@ -19,20 +28,33 @@ use rllm_scheduler::{
 use std::sync::Arc;
 use std::time::Instant;
 
+/// CLI parameters configuring a benchmark run.
 pub struct BenchmarkOptions {
+    /// Model preset identifier (`"edge-4gb"`, `"1b"`, `"tiny"`).
     pub preset: String,
+    /// Number of concurrent requests to batch.
     pub batch_size: usize,
+    /// Number of tokens in the input prompt.
     pub prompt_tokens: usize,
+    /// Number of tokens to autoregressively generate per sequence.
     pub generate_tokens: usize,
+    /// Number of untimed warmup iterations before measurement.
     pub warmup: usize,
 }
 
+/// Aggregated latency statistics and percentiles in milliseconds.
 pub struct LatencyStats {
+    /// Arithmetic mean latency.
     pub mean_ms: f64,
+    /// 50th percentile (median) latency.
     pub p50_ms: f64,
+    /// 90th percentile latency.
     pub p90_ms: f64,
+    /// 99th percentile latency.
     pub p99_ms: f64,
+    /// Minimum observed latency.
     pub min_ms: f64,
+    /// Maximum observed latency.
     pub max_ms: f64,
 }
 
@@ -68,6 +90,7 @@ fn calculate_percentiles(mut latencies: Vec<f64>) -> LatencyStats {
     }
 }
 
+/// Executes the full benchmark suite across kernels, end-to-end decode, batching, and prefix caching.
 pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
     println!("══════════════════════════════════════════════════════════════════════");
     println!("          rllm High-Performance Inference Benchmark Suite             ");

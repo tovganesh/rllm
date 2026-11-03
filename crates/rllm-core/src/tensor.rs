@@ -1,9 +1,12 @@
+//! Multi-dimensional tensor implementation with zero-copy slicing and view reshaping.
+
 use crate::device::Device;
 use crate::dtype::DType;
 use crate::error::{Result, RllmError};
 use crate::shape::Shape;
 use crate::storage::{CpuStorage, Storage};
 
+/// Multi-dimensional tensor backed by physical device storage with strided layout.
 #[derive(Debug, Clone)]
 pub struct Tensor {
     shape: Shape,
@@ -15,6 +18,7 @@ pub struct Tensor {
 }
 
 impl Tensor {
+    /// Creates a tensor from an explicit shape, dtype, device, and backing storage.
     pub fn new(shape: Shape, dtype: DType, device: Device, storage: Storage) -> Self {
         let strides = shape.default_strides();
         Self {
@@ -27,6 +31,7 @@ impl Tensor {
         }
     }
 
+    /// Creates an F32 tensor initialized from a slice of floating-point values.
     pub fn from_f32(data: &[f32], shape: Shape, device: Device) -> Result<Self> {
         if shape.numel() != data.len() {
             return Err(RllmError::ShapeMismatch {
@@ -41,47 +46,58 @@ impl Tensor {
         Ok(Self::new(shape, DType::F32, device, storage))
     }
 
+    /// Creates a zeroed tensor of specified shape, dtype, and target device.
     pub fn zeros(shape: Shape, dtype: DType, device: Device) -> Result<Self> {
         let storage = Storage::allocate(device, dtype, shape.numel())?;
         Ok(Self::new(shape, dtype, device, storage))
     }
 
+    /// Returns a reference to the tensor shape.
     pub fn shape(&self) -> &Shape {
         &self.shape
     }
 
+    /// Returns a slice of the dimension sizes.
     pub fn dims(&self) -> &[usize] {
         self.shape.dims()
     }
 
+    /// Returns a slice of the current strides.
     pub fn strides(&self) -> &[usize] {
         &self.strides
     }
 
+    /// Data type of the tensor elements.
     pub fn dtype(&self) -> DType {
         self.dtype
     }
 
+    /// Hardware device hosting the tensor storage.
     pub fn device(&self) -> Device {
         self.device
     }
 
+    /// Reference to underlying storage.
     pub fn storage(&self) -> &Storage {
         &self.storage
     }
 
+    /// Mutable reference to underlying storage.
     pub fn storage_mut(&mut self) -> &mut Storage {
         &mut self.storage
     }
 
+    /// Total number of scalar elements.
     pub fn numel(&self) -> usize {
         self.shape.numel()
     }
 
+    /// Returns true if the tensor elements are contiguous in row-major order.
     pub fn is_contiguous(&self) -> bool {
         self.strides == self.shape.default_strides()
     }
 
+    /// Reshapes the tensor to a new shape with matching total element count (zero-copy view).
     pub fn reshape(&self, new_shape: Shape) -> Result<Self> {
         if self.numel() != new_shape.numel() {
             return Err(RllmError::ShapeMismatch {
@@ -100,6 +116,7 @@ impl Tensor {
         })
     }
 
+    /// Transposes dimensions `dim0` and `dim1` (zero-copy strided view).
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Result<Self> {
         if dim0 >= self.shape.rank() || dim1 >= self.shape.rank() {
             return Err(RllmError::DimOutOfRange {
@@ -122,6 +139,7 @@ impl Tensor {
         })
     }
 
+    /// Copies elements to a standard owned `Vec<T>`.
     pub fn to_vec<T: Copy>(&self) -> Result<Vec<T>> {
         let cpu_storage = self.storage.as_cpu()?;
         let slice: &[T] = cpu_storage.as_slice();
@@ -135,6 +153,7 @@ impl Tensor {
         Ok(slice[start..start + numel].to_vec())
     }
 
+    /// Returns a direct read-only slice reference to the contiguous F32 data.
     pub fn as_f32_slice(&self) -> Result<&[f32]> {
         if self.dtype != DType::F32 {
             return Err(RllmError::DTypeMismatch {
@@ -148,6 +167,7 @@ impl Tensor {
         Ok(&all[offset..offset + self.numel()])
     }
 
+    /// Returns a direct mutable slice reference to the contiguous F32 data.
     pub fn as_mut_f32_slice(&mut self) -> Result<&mut [f32]> {
         if self.dtype != DType::F32 {
             return Err(RllmError::DTypeMismatch {

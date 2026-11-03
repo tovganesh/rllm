@@ -1,5 +1,10 @@
+//! Numerically stable softmax implementation.
+
 use rayon::prelude::*;
 
+/// Computes in-place softmax across rows of length `row_len`.
+/// Subtracts the maximum element before exponentiation to prevent numerical overflow:
+/// $$\text{Softmax}(z_i) = \frac{e^{z_i - \max(z)}}{\sum_j e^{z_j - \max(z)}}$$
 pub fn softmax_inplace(x: &mut [f32], row_len: usize) {
     debug_assert_eq!(x.len() % row_len, 0);
 
@@ -16,4 +21,3 @@ pub fn softmax_inplace(x: &mut [f32], row_len: usize) {
         }
     });
 }
-

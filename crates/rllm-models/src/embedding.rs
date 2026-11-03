@@ -1,3 +1,5 @@
+//! Bidirectional transformer encoder model for high-throughput dense vector embeddings.
+
 use crate::config::BertConfig;
 use rllm_backend_cpu::ops::activations::gelu_f32;
 use rllm_backend_cpu::ops::norm::layer_norm_f32;
@@ -9,6 +11,7 @@ use rllm_core::{
 };
 use std::sync::Arc;
 
+/// Single bidirectional transformer encoder layer.
 pub struct BertLayer {
     pub q_proj: Tensor,
     pub k_proj: Tensor,
@@ -20,6 +23,7 @@ pub struct BertLayer {
     pub output_norm: Tensor,
 }
 
+/// Transformer encoder model that converts token ID sequences to L2-normalized unit embeddings.
 pub struct BertEmbeddingModel<B: Backend> {
     pub config: BertConfig,
     pub backend: Arc<B>,
@@ -31,6 +35,7 @@ pub struct BertEmbeddingModel<B: Backend> {
 }
 
 impl<B: Backend> BertEmbeddingModel<B> {
+    /// Creates a synthetic model with pseudo-random weights.
     pub fn new_random(config: BertConfig, backend: Arc<B>) -> Result<Self> {
         let dev = backend.device();
         let h = config.hidden_size;
@@ -126,7 +131,6 @@ impl<B: Backend> BertEmbeddingModel<B> {
 
         // 2. Transformer layers
         for layer in &self.layers {
-            // Simplified bidirectional self-attention forward pass
             let q = self
                 .backend
                 .matmul(&hidden, &layer.q_proj.transpose(0, 1)?)?;
@@ -144,7 +148,6 @@ impl<B: Backend> BertEmbeddingModel<B> {
                 .backend
                 .matmul(&attn_out, &layer.o_proj.transpose(0, 1)?)?;
 
-            // Residual + Norm
             let hidden_slice = hidden.as_mut_f32_slice()?;
             let proj_slice = proj_out.as_f32_slice()?;
             for i in 0..hidden_slice.len() {
@@ -182,7 +185,6 @@ impl<B: Backend> BertEmbeddingModel<B> {
                 .backend
                 .matmul(&gelu_t, &layer.output_proj.transpose(0, 1)?)?;
 
-            // Residual + Norm
             let ffn_slice = ffn_out.as_f32_slice()?;
             for i in 0..hidden_slice.len() {
                 hidden_slice[i] = post_attn[i] + ffn_slice[i];
@@ -213,7 +215,7 @@ impl<B: Backend> BertEmbeddingModel<B> {
             pooled[d] /= seq_len as f32;
         }
 
-        // 4. L2 Normalization -> Unit Vector
+        // 4. L2 Normalization -> Unit Vector on hypersphere
         let norm_sq: f32 = pooled.iter().map(|&v| v * v).sum();
         let inv_norm = 1.0f32 / (norm_sq.sqrt().max(1e-12));
         for d in 0..h {

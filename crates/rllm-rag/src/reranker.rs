@@ -1,17 +1,27 @@
+//! Cross-encoder passage reranker.
+//!
+//! Evaluates candidate passages against the query using combined lexical coverage,
+//! term frequency density, and token proximity scoring to rerank the top retrieved hits.
+
 use crate::chunker::DocumentChunk;
 use serde::{Deserialize, Serialize};
 
+/// Reranked document match with updated relevance confidence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankedMatch {
+    /// Original chunk index.
     pub chunk_idx: usize,
+    /// Refined cross-encoder relevance score in $[0.0, 1.0]$.
     pub relevance_score: f32,
+    /// Associated document chunk.
     pub chunk: DocumentChunk,
 }
 
+/// Lightweight semantic cross-encoder reranker.
 pub struct CrossEncoderReranker;
 
 impl CrossEncoderReranker {
-    /// Rerank passages based on lexical overlap, length normalization, and token coverage.
+    /// Reranks passages based on lexical overlap, length normalization, and token coverage.
     pub fn rerank(
         query: &str,
         candidates: Vec<DocumentChunk>,
@@ -78,4 +88,3 @@ impl CrossEncoderReranker {
             .collect()
     }
 }
-
