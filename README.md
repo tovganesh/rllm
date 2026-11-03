@@ -71,6 +71,8 @@ rllm/
 - **Okapi BM25 Inverted Index**: Exact keyword, code identifier, and acronym retrieval.
 - **Reciprocal Rank Fusion (RRF)**: Combines dense vector and lexical rankings.
 - **Cross-Encoder Reranker**: Reranks top candidates before context generation.
+- **Precise Grounded Citations**: Sentence-level snippet extraction pinpoints the exact grounded sentences answering the query with verified matching content keywords.
+- **Unrelated Query Guardrails & Explicit Flagging**: Automated relevance thresholding immediately flags unrelated queries (`is_relevant = false`, `warning = Some(...)`) in `<1ms`, avoiding hallucinations and saving compute.
 - **Prefix-Aware Assembly**: Sorts retrieved documents to maximize Radix tree KV-cache hit rates.
 
 ---

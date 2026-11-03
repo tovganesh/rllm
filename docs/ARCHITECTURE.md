@@ -119,6 +119,14 @@ rllm/
 - **Hybrid Fusion**:
   - Dense HNSW retrieval + BM25 inverted index fused via Reciprocal Rank Fusion (RRF).
 - **In-Engine Cross-Encoder Reranker**:
-  - Fast reranking pass directly in the GPU/Metal pipeline.
+  - Fast reranking pass evaluating content keyword coverage and phrase matches directly in the tensor pipeline.
+- **Precise Grounded Citation Extraction**:
+  - Sentence-level extraction (`extract_grounded_quote`) pinpoints the exact grounded sentences answering the query rather than returning arbitrary monolithic chunk windows.
+  - Matches verified content keywords (`matched_keywords`), excluding common English stop words to prevent false attribution.
+  - Returns both the exact factual quote (`quote`) and the full passage context (`passage`).
+- **Relevance Confidence Thresholding & Hallucination Guardrails**:
+  - Configurable minimum relevance threshold (`min_relevance_threshold`, default 0.25).
+  - Explicitly flags unrelated queries (`is_relevant: false`, `warning: Some(...)`).
+  - Short-circuits generation on unrelated queries with `<1ms` turnaround, preventing LLM hallucinations and saving compute.
 - **Prefix-Aware KV Assembly**:
   - Assembles retrieved context chunks sorted by access frequency to maximize Radix Tree KV-cache hits.

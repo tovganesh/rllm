@@ -3,7 +3,7 @@
 //! Subcommands:
 //! - `serve`: Launches the OpenAI-compatible HTTP service in `all`, `inference`, or `rag` decoupled mode.
 //! - `bench`: Runs the inference performance benchmark suite against target architectures (e.g. `edge-4gb`).
-//! - `rag-demo`: Runs an interactive retrieval-augmented generation pipeline with citations.
+//! - `rag-demo`: Runs an interactive retrieval-augmented generation pipeline with citations and relevance verification.
 
 mod benchmark;
 
@@ -68,10 +68,14 @@ enum Commands {
         warmup: usize,
     },
 
-    /// Run end-to-end RAG interactive demonstration with citations
+    /// Run end-to-end RAG interactive demonstration with citations and relevance verification
     RagDemo {
         #[arg(long, default_value = "What makes rllm enterprise grade and edge compatible?")]
         query: String,
+
+        /// Minimum relevance threshold (0.0 to 1.0) for qualifying citations
+        #[arg(long)]
+        min_relevance: Option<f32>,
     },
 }
 
@@ -187,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
             run_comprehensive_benchmark(opts)?;
         }
 
-        Commands::RagDemo { query } => {
+        Commands::RagDemo { query, min_relevance } => {
             println!("📚 Initializing rllm High-Performance RAG Demonstration");
             let backend = Arc::new(CpuBackend);
 
@@ -237,20 +241,33 @@ async fn main() -> anyhow::Result<()> {
             let mut sampling = SamplingParams::default();
             sampling.max_tokens = 32;
 
-            let resp = rag_engine.query(&query, 2, sampling).await?;
+            let resp = rag_engine
+                .query_with_threshold(&query, 2, sampling, min_relevance)
+                .await?;
             let elapsed = start.elapsed();
 
-            println!("\n✨ Answer: {}", resp.answer);
             println!("⏱️  Query Latency: {:.2?}", elapsed);
-            println!("📑 Retrieved Citations:");
-            for (i, cit) in resp.citations.iter().enumerate() {
-                println!(
-                    "   [{}] Document: {} (Relevance: {:.2})\n       \"{}\"",
-                    i + 1,
-                    cit.doc_id,
-                    cit.relevance,
-                    cit.text
-                );
+            println!("📊 Confidence Score: {:.2}", resp.confidence_score);
+
+            if resp.is_relevant {
+                println!("✅ Status: RELEVANT (Grounded)");
+                println!("✨ Synthesized Answer: {}", resp.answer);
+                println!("📑 Grounded Citations ({} retrieved):", resp.citations.len());
+                for (i, cit) in resp.citations.iter().enumerate() {
+                    println!("\n   [{}] Document: {} (Relevance: {:.2})", i + 1, cit.doc_id, cit.relevance);
+                    if !cit.matched_keywords.is_empty() {
+                        println!("       Matched Keywords: [{}]", cit.matched_keywords.join(", "));
+                    }
+                    println!("       Exact Grounded Quote: \"{}\"", cit.quote);
+                    println!("       Full Passage Context: \"{}\"", cit.passage);
+                }
+            } else {
+                println!("⚠️  Status: UNRELATED / LOW RELEVANCE (Flagged)");
+                if let Some(ref w) = resp.warning {
+                    println!("⚠️  Warning: {}", w);
+                }
+                println!("✨ Refusal Answer: {}", resp.answer);
+                println!("💡 Hallucination avoided: Generation short-circuited to save compute and maintain truthfulness.");
             }
         }
     }

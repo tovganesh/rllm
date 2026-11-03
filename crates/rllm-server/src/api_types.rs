@@ -131,4 +131,7 @@ pub struct RagQueryRequest {
     pub top_k: Option<usize>,
     /// Maximum output tokens to generate in the final synthesis.
     pub max_tokens: Option<usize>,
+    /// Optional minimum relevance threshold in $[0.0, 1.0]$. If citations fail to meet this,
+    /// the response flags `is_relevant = false` and skips generation.
+    pub min_relevance: Option<f32>,
 }
