@@ -73,6 +73,10 @@ enum Commands {
         #[arg(long, default_value = "What makes rllm enterprise grade and edge compatible?")]
         query: String,
 
+        /// Number of top citations to retrieve
+        #[arg(long, default_value_t = 4)]
+        top_k: usize,
+
         /// Minimum relevance threshold (0.0 to 1.0) for qualifying citations
         #[arg(long)]
         min_relevance: Option<f32>,
@@ -191,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             run_comprehensive_benchmark(opts)?;
         }
 
-        Commands::RagDemo { query, min_relevance } => {
+        Commands::RagDemo { query, top_k, min_relevance } => {
             println!("📚 Initializing rllm High-Performance RAG Demonstration");
             let backend = Arc::new(CpuBackend);
 
@@ -205,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
             let sched_cfg = SchedulerConfig {
                 max_batch_size: 4,
                 block_size: 16,
-                total_blocks: 256,
+                total_blocks: 512,
             };
             let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?);
             let rag_engine = RagEngine::new(bert_model, scheduler, bert_cfg.hidden_size);
@@ -242,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
             sampling.max_tokens = 32;
 
             let resp = rag_engine
-                .query_with_threshold(&query, 2, sampling, min_relevance)
+                .query_with_threshold(&query, top_k, sampling, min_relevance)
                 .await?;
             let elapsed = start.elapsed();
 
@@ -251,7 +255,8 @@ async fn main() -> anyhow::Result<()> {
 
             if resp.is_relevant {
                 println!("✅ Status: RELEVANT (Grounded)");
-                println!("✨ Synthesized Answer: {}", resp.answer);
+                println!("✨ Synthesized Answer:\n{}\n", resp.answer);
+                println!("⚡ Autoregressive Inference: {} tokens generated & decoded via continuous batch scheduler", resp.generated_tokens);
                 println!("📑 Grounded Citations ({} retrieved):", resp.citations.len());
                 for (i, cit) in resp.citations.iter().enumerate() {
                     println!("\n   [{}] Document: {} (Relevance: {:.2})", i + 1, cit.doc_id, cit.relevance);
