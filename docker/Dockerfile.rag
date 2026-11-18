@@ -36,4 +36,6 @@ ENV INFERENCE_URL=http://inference:8000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:8080/health || exit 1
 
+# Optional: RLLM_EMBEDDING_MODEL=/models/<bert>.gguf (synthetic embedder otherwise).
+
 ENTRYPOINT ["rllm", "serve", "--service", "rag", "--addr", "0.0.0.0:8080"]

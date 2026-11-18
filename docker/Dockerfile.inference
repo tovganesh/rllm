@@ -35,4 +35,8 @@ ENV RUST_LOG=info
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:8000/health || exit 1
 
-ENTRYPOINT ["rllm", "serve", "--service", "inference", "--addr", "0.0.0.0:8000", "--model", "edge-4gb"]
+# Model selection: RLLM_MODEL (GGUF path or synthetic preset) and optionally
+# RLLM_EMBEDDING_MODEL (GGUF BERT model for /v1/embeddings). Mount model files under /models.
+ENV RLLM_MODEL=edge-4gb
+
+ENTRYPOINT ["rllm", "serve", "--service", "inference", "--addr", "0.0.0.0:8000"]

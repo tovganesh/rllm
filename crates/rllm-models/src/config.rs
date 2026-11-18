@@ -161,6 +161,17 @@ pub struct BertConfig {
     pub layer_norm_eps: f32,
     /// Maximum position embeddings supported.
     pub max_position_embeddings: usize,
+    /// How token states are pooled into a single vector.
+    pub pooling: BertPooling,
+}
+
+/// Pooling strategy of a BERT-style embedding model (`bert.pooling_type` in GGUF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BertPooling {
+    /// Mean of all token states (e.g. all-MiniLM-L6-v2).
+    Mean,
+    /// State of the first (`[CLS]`) token (e.g. bge).
+    Cls,
 }
 
 impl Default for BertConfig {
@@ -174,6 +185,7 @@ impl Default for BertConfig {
             vocab_size: 30522,
             layer_norm_eps: 1e-12,
             max_position_embeddings: 512,
+            pooling: BertPooling::Mean,
         }
     }
 }
@@ -189,11 +201,53 @@ impl BertConfig {
             vocab_size: 1000,
             layer_norm_eps: 1e-5,
             max_position_embeddings: 128,
+            pooling: BertPooling::Mean,
         }
     }
 
     /// Attention head dimension ($d_{head} = \frac{d_{model}}{n_{heads}}$).
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+
+    /// Reads a BERT configuration from GGUF metadata (`general.architecture = "bert"`).
+    pub fn from_gguf(g: &crate::gguf::GgufFile) -> rllm_core::error::Result<Self> {
+        use rllm_core::error::RllmError;
+        let arch = g.get_str("general.architecture")?;
+        if arch != "bert" {
+            return Err(RllmError::ModelError(format!(
+                "Unsupported embedding architecture '{arch}' (only 'bert' is supported)"
+            )));
+        }
+        if g.get("bert.attention.causal").and_then(crate::gguf::GgufValue::as_bool) == Some(true) {
+            return Err(RllmError::ModelError("Causal BERT models are not supported".to_string()));
+        }
+        let pooling = match g.get("bert.pooling_type").and_then(crate::gguf::GgufValue::as_u64) {
+            None | Some(1) => BertPooling::Mean,
+            Some(2) => BertPooling::Cls,
+            Some(other) => {
+                return Err(RllmError::ModelError(format!("Unsupported bert.pooling_type {other}")))
+            }
+        };
+        let hidden_size = g.get_u64("bert.embedding_length")? as usize;
+        let num_attention_heads = g.get_u64("bert.attention.head_count")? as usize;
+        if num_attention_heads == 0 || !hidden_size.is_multiple_of(num_attention_heads) {
+            return Err(RllmError::ModelError("hidden size not divisible by head count".to_string()));
+        }
+        let vocab_size = g
+            .get("tokenizer.ggml.tokens")
+            .and_then(crate::gguf::GgufValue::as_array)
+            .map(|a| a.len())
+            .ok_or_else(|| RllmError::ModelError("tokenizer.ggml.tokens missing".to_string()))?;
+        Ok(Self {
+            hidden_size,
+            intermediate_size: g.get_u64("bert.feed_forward_length")? as usize,
+            num_attention_heads,
+            num_hidden_layers: g.get_u64("bert.block_count")? as usize,
+            vocab_size,
+            layer_norm_eps: g.get_f64("bert.attention.layer_norm_epsilon")? as f32,
+            max_position_embeddings: g.get_u64("bert.context_length")? as usize,
+            pooling,
+        })
     }
 }

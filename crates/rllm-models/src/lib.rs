@@ -18,11 +18,12 @@ pub mod llama;
 pub mod loader;
 pub mod tokenizer;
 pub mod weights;
+pub mod wordpiece;
 
 pub use bpe::{BpeTokenizer, StreamDecoder};
 pub use chat::{ChatMessage, ChatTemplate};
-pub use config::{BertConfig, LlamaConfig};
-pub use embedding::BertEmbeddingModel;
+pub use config::{BertConfig, BertPooling, LlamaConfig};
+pub use embedding::{BertEmbeddingModel, EmbeddingTokenizer, TextEmbedder};
 pub use gguf::{GgmlType, GgufFile, GgufTensorInfo, GgufValue, MappedGguf};
 pub use llama::{ForwardBatch, LlamaModel};
 pub use loader::{GgufBundle, LoadOptions};
@@ -31,6 +32,7 @@ pub use tokenizer::{
     UNK_TOKEN_ID, USER_TOKEN_ID,
 };
 pub use weights::Weights;
+pub use wordpiece::WordPieceTokenizer;
 
 #[cfg(test)]
 mod tests {

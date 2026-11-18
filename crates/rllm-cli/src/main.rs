@@ -11,10 +11,10 @@ use benchmark::{run_comprehensive_benchmark, BenchmarkOptions};
 use clap::{Parser, Subcommand};
 use rllm_backend_cpu::CpuBackend;
 use rllm_models::{
-    BertConfig, BertEmbeddingModel, ChatMessage, GgufBundle, LlamaConfig, LlamaModel, LoadOptions,
-    StreamDecoder,
+    BertConfig, ChatMessage, GgufBundle, LlamaConfig, LlamaModel, LoadOptions, StreamDecoder,
+    TextEmbedder,
 };
-use rllm_rag::RagEngine;
+use rllm_rag::{LlmGenerator, RagEngine};
 use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, SchedulerConfig, Sequence};
 use std::io::Write;
 use rllm_server::{run_server, AppState};
@@ -47,7 +47,7 @@ enum Commands {
         inference_url: Option<String>,
 
         /// Path to a GGUF model file, or a synthetic preset: 'edge-4gb', '1b', 'tiny'
-        #[arg(long, default_value = "edge-4gb")]
+        #[arg(long, env = "RLLM_MODEL", default_value = "edge-4gb")]
         model: String,
 
         #[arg(long, default_value_t = 32)]
@@ -60,6 +60,16 @@ enum Commands {
         /// Total KV-cache capacity in tokens, shared by all concurrent sequences
         #[arg(long, default_value_t = 16384)]
         kv_cache_tokens: usize,
+
+        /// Path to a BERT-architecture GGUF embedding model (e.g. bge-small-en-v1.5).
+        /// Without it, a synthetic embedder is used and dense retrieval is meaningless.
+        #[arg(long, env = "RLLM_EMBEDDING_MODEL")]
+        embedding_model: Option<std::path::PathBuf>,
+
+        /// Minimum query/passage cosine similarity for a passage to count as relevant.
+        /// Defaults to the calibrated value for known embedding models (bge 0.6, MiniLM 0.3).
+        #[arg(long)]
+        min_dense_similarity: Option<f32>,
     },
 
     /// Generate text from a GGUF model
@@ -122,16 +132,24 @@ enum Commands {
 
     /// Run end-to-end RAG interactive demonstration with citations and relevance verification
     RagDemo {
-        #[arg(long, default_value = "What makes rllm enterprise grade and edge compatible?")]
+        #[arg(long, default_value = "At what temperature does water boil at sea level?")]
         query: String,
 
-        /// Number of top citations to retrieve
-        #[arg(long, default_value_t = 4)]
+        /// Number of passages to retrieve
+        #[arg(long, default_value_t = 3)]
         top_k: usize,
 
-        /// Minimum relevance threshold (0.0 to 1.0) for qualifying citations
+        /// Minimum lexical relevance (0.0 to 1.0) for qualifying citations
         #[arg(long)]
         min_relevance: Option<f32>,
+
+        /// GGUF LLM that writes the answer (otherwise the answer is extractive)
+        #[arg(long)]
+        model: Option<std::path::PathBuf>,
+
+        /// GGUF BERT embedding model (otherwise a synthetic embedder is used)
+        #[arg(long)]
+        embedding_model: Option<std::path::PathBuf>,
     },
 }
 
@@ -149,6 +167,8 @@ async fn main() -> anyhow::Result<()> {
             max_batch_size,
             max_context,
             kv_cache_tokens,
+            embedding_model,
+            min_dense_similarity,
         } => {
             use rllm_server::ServiceMode;
             let mode = match service.to_lowercase().as_str() {
@@ -198,32 +218,25 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
-            // 2. Initialize RAG engine if mode is All or Rag
+            // 2. Embedding model (serves /v1/embeddings and RAG retrieval).
+            let embedder = Arc::new(load_embedder(embedding_model.as_deref(), backend.clone())?);
+
+            // 3. RAG engine. A locally loaded GGUF model writes the answers; otherwise the
+            //    remote INFERENCE_URL does, or answers are extractive.
             let rag_engine = if mode == ServiceMode::All || mode == ServiceMode::Rag {
-                let bert_cfg = BertConfig::tiny_test_config();
-                let bert_model =
-                    Arc::new(BertEmbeddingModel::new_random(bert_cfg.clone(), backend.clone())?);
-
-                // Use the local scheduler if present, or create a minimal one for RAG prompt driving
-                let dummy_scheduler = if let Some(ref s) = scheduler {
-                    s.clone()
-                } else {
-                    let dummy_cfg = LlamaConfig::tiny_test_config();
-                    let dummy_model = Arc::new(LlamaModel::new_random(dummy_cfg, backend.clone())?);
-                    let sched_cfg = SchedulerConfig {
-                        max_batch_size: 2,
-                        block_size: 16,
-                        total_blocks: 64,
-                        ..SchedulerConfig::default()
-                    };
-                    Arc::new(ContinuousBatchScheduler::new(sched_cfg, dummy_model)?)
+                let generator = match (&scheduler, &tokenizer, &chat_template) {
+                    (Some(s), Some(t), Some(c)) if inference_url.is_none() => Some(LlmGenerator {
+                        scheduler: s.clone(),
+                        tokenizer: t.clone(),
+                        chat_template: c.clone(),
+                    }),
+                    _ => None,
                 };
-
-                Some(Arc::new(RagEngine::new(
-                    bert_model,
-                    dummy_scheduler,
-                    bert_cfg.hidden_size,
-                )))
+                let mut engine = RagEngine::new(embedder.clone(), generator);
+                if let Some(t) = min_dense_similarity {
+                    engine = engine.with_dense_threshold(t);
+                }
+                Some(Arc::new(engine))
             } else {
                 None
             };
@@ -232,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
                 scheduler,
                 tokenizer,
                 chat_template,
+                embedder: Some(embedder),
                 rag_engine,
                 inference_url: inference_url.clone(),
                 model_name,
@@ -298,87 +312,81 @@ async fn main() -> anyhow::Result<()> {
             run_comprehensive_benchmark(opts)?;
         }
 
-        Commands::RagDemo { query, top_k, min_relevance } => {
-            println!("📚 Initializing rllm High-Performance RAG Demonstration");
+        Commands::RagDemo {
+            query,
+            top_k,
+            min_relevance,
+            model,
+            embedding_model,
+        } => {
             let backend = Arc::new(CpuBackend);
-
-            let bert_cfg = BertConfig::tiny_test_config();
-            let bert_model =
-                Arc::new(BertEmbeddingModel::new_random(bert_cfg.clone(), backend.clone())?);
-
-            let llama_cfg = LlamaConfig::tiny_test_config();
-            let llama_model = Arc::new(LlamaModel::new_random(llama_cfg, backend)?);
-
-            let sched_cfg = SchedulerConfig {
-                max_batch_size: 4,
-                block_size: 16,
-                total_blocks: 512,
-                ..SchedulerConfig::default()
+            let embedder = Arc::new(load_embedder(embedding_model.as_deref(), backend.clone())?);
+            let generator = match model {
+                Some(path) => {
+                    let b = GgufBundle::load(&path, backend.clone(), &LoadOptions { max_context: Some(4096) })?;
+                    let scheduler = ContinuousBatchScheduler::new(
+                        SchedulerConfig {
+                            max_batch_size: 1,
+                            block_size: 16,
+                            total_blocks: 256,
+                            ..SchedulerConfig::default()
+                        },
+                        Arc::new(b.model),
+                    )?;
+                    Some(LlmGenerator {
+                        scheduler: Arc::new(scheduler),
+                        tokenizer: Arc::new(b.tokenizer),
+                        chat_template: Arc::new(b.chat_template),
+                    })
+                }
+                None => None,
             };
-            let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?);
-            let rag_engine = RagEngine::new(bert_model, scheduler, bert_cfg.hidden_size);
+            let rag_engine = RagEngine::new(embedder.clone(), generator);
 
-            println!("📥 Ingesting enterprise knowledge base...");
-            let docs = vec![
-                (
-                    "doc_arch",
-                    "rllm is an enterprise grade inference engine built in Rust from ground up. It implements continuous batching, PagedAttention, and a Radix tree prefix cache to eliminate memory fragmentation and minimize TTFT.",
-                ),
-                (
-                    "doc_edge",
-                    "For smartphone and edge deployments on iOS and Android, rllm supports Q4_0, Q4_K_M, and Q8_0 block quantization. This allows 7B/8B parameter models to run within 2-4 GB of unified memory.",
-                ),
-                (
-                    "doc_cluster",
-                    "On Apple Silicon and GPU clusters, rllm leverages Metal Shading Language (MSL) and CUDA kernels with unified memory zero-copy tensor passing and FlashAttention.",
-                ),
-                (
-                    "doc_rag",
-                    "The rllm high-performance RAG engine features an in-memory SIMD HNSW vector store, Okapi BM25 lexical search, reciprocal rank fusion (RRF), cross-encoder reranking, and prefix-aware KV cache reuse.",
-                ),
+            let docs = [
+                ("water", "Water boils at 100 degrees Celsius (212 Fahrenheit) at sea level. At higher altitudes the boiling point is lower because air pressure is lower; in Denver water boils at about 95 degrees Celsius."),
+                ("photosynthesis", "Photosynthesis is the process by which green plants use sunlight, water and carbon dioxide to produce glucose and release oxygen. It takes place mainly in the chloroplasts of leaf cells."),
+                ("paris", "Paris is the capital and most populous city of France, located on the Seine river. It is known for the Eiffel Tower, completed in 1889."),
+                ("rust", "The Rust programming language guarantees memory safety without a garbage collector through its ownership and borrowing system, checked at compile time."),
+                ("reef", "The Great Barrier Reef, off the coast of Queensland, Australia, is the world's largest coral reef system, stretching for over 2,300 kilometres."),
             ];
-
+            println!("Embedder: {}{}", embedder.name, if embedder.is_synthetic() { " (synthetic: dense retrieval disabled)" } else { "" });
+            println!("Indexing {} documents...", docs.len());
             for (id, text) in docs {
-                let mut meta = HashMap::new();
-                meta.insert("source".to_string(), "knowledge_base".to_string());
-                rag_engine.ingest_document(id, text, meta)?;
+                rag_engine.ingest_document(id, text, HashMap::new())?;
             }
 
-            println!("\n🔍 Executing RAG Query: \"{}\"", query);
+            println!("\nQuery: {query}");
             let start = Instant::now();
             let sampling = SamplingParams {
-                max_tokens: 32,
+                temperature: 0.0,
+                max_tokens: 128,
                 ..SamplingParams::default()
             };
-
             let resp = rag_engine
                 .query_with_threshold(&query, top_k, sampling, min_relevance)
                 .await?;
-            let elapsed = start.elapsed();
-
-            println!("⏱️  Query Latency: {:.2?}", elapsed);
-            println!("📊 Confidence Score: {:.2}", resp.confidence_score);
-
-            if resp.is_relevant {
-                println!("✅ Status: RELEVANT (Grounded)");
-                println!("✨ Synthesized Answer:\n{}\n", resp.answer);
-                println!("⚡ Autoregressive Inference: {} tokens generated & decoded via continuous batch scheduler", resp.generated_tokens);
-                println!("📑 Grounded Citations ({} retrieved):", resp.citations.len());
-                for (i, cit) in resp.citations.iter().enumerate() {
-                    println!("\n   [{}] Document: {} (Relevance: {:.2})", i + 1, cit.doc_id, cit.relevance);
-                    if !cit.matched_keywords.is_empty() {
-                        println!("       Matched Keywords: [{}]", cit.matched_keywords.join(", "));
-                    }
-                    println!("       Exact Grounded Quote: \"{}\"", cit.quote);
-                    println!("       Full Passage Context: \"{}\"", cit.passage);
-                }
-            } else {
-                println!("⚠️  Status: UNRELATED / LOW RELEVANCE (Flagged)");
-                if let Some(ref w) = resp.warning {
-                    println!("⚠️  Warning: {}", w);
-                }
-                println!("✨ Refusal Answer: {}", resp.answer);
-                println!("💡 Hallucination avoided: Generation short-circuited to save compute and maintain truthfulness.");
+            println!("Latency: {:.2?}", start.elapsed());
+            println!(
+                "Relevant: {} | lexical confidence {:.2} | max dense similarity {}",
+                resp.is_relevant,
+                resp.confidence_score,
+                resp.max_dense_similarity.map_or("n/a".to_string(), |d| format!("{d:.2}"))
+            );
+            println!("\nAnswer ({}, {} tokens generated):\n{}", resp.answer_source, resp.generated_tokens, resp.answer);
+            if let Some(w) = &resp.warning {
+                println!("\nWarning: {w}");
+            }
+            for (i, c) in resp.citations.iter().enumerate() {
+                println!(
+                    "\n[{}] {} (lexical {:.2}, dense {}, cited: {})\n    {}",
+                    i + 1,
+                    c.doc_id,
+                    c.relevance,
+                    c.dense_similarity.map_or("n/a".to_string(), |d| format!("{d:.2}")),
+                    c.cited_in_answer,
+                    c.passage
+                );
             }
         }
     }
@@ -471,4 +479,12 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
         if decode_secs > 0.0 { decode_tokens as f64 / decode_secs } else { 0.0 },
     );
     Ok(())
+}
+
+/// Loads a GGUF embedding model, or a synthetic one when no path is given.
+fn load_embedder(path: Option<&std::path::Path>, backend: Arc<CpuBackend>) -> anyhow::Result<TextEmbedder<CpuBackend>> {
+    Ok(match path {
+        Some(p) => TextEmbedder::from_gguf(p, backend)?,
+        None => TextEmbedder::synthetic(BertConfig::tiny_test_config(), backend)?,
+    })
 }

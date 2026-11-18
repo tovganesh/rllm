@@ -66,6 +66,14 @@ impl HybridIndex {
         self.hnsw.is_empty()
     }
 
+    /// Cosine similarity between `query_vector` and the stored embedding of chunk
+    /// `chunk_idx` (both indexes share insertion order).
+    pub fn dense_similarity(&self, chunk_idx: usize, query_vector: &[f32]) -> Option<f32> {
+        self.hnsw
+            .vector(chunk_idx)
+            .map(|v| crate::hnsw::cosine_similarity(v, query_vector))
+    }
+
     /// Performs hybrid search over dense vector embeddings and lexical text, fusing ranks via RRF.
     pub fn search(
         &self,

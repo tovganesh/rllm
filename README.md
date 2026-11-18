@@ -7,7 +7,7 @@
 A modular, multi-backend LLM inference engine and hybrid RAG platform written in Rust from the ground up.
 
 > [!WARNING]
-> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF models on the CPU, with output verified token-for-token against llama.cpp, but it is several times slower than llama.cpp, has no GPU backend, and its RAG subsystem still uses a synthetic embedding model. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
+> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU, with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. It is several times slower than llama.cpp and has no GPU backend. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
 
 ---
 
@@ -34,12 +34,13 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | Component | Status | Notes |
 | :--- | :---: | :--- |
 | LLaMA-architecture decoder (GQA, RoPE, SwiGLU, tied embeddings, LLaMA 3 RoPE frequency factors) | ✅ | Loads from GGUF. Greedy output matches llama.cpp token-for-token on SmolLM2-135M in F16, Q8_0, Q4_0, Q4_K_M and Q5_K_M. |
-| BERT-style embedding encoder | 🟡 | Synthetic weights; single-head attention. |
+| BERT embedding models (bge, MiniLM) | ✅ | Loaded from GGUF with a WordPiece tokenizer; mean or `[CLS]` pooling. Embeddings match llama.cpp (cosine ≥ 0.999999) for bge-small-en-v1.5 and all-MiniLM-L6-v2. |
+| WordPiece tokenizer | ✅ | BERT basic tokenization (NFD, lower-casing, accent stripping, CJK splitting) and greedy longest-match. Matches `llama-tokenize` on a 23-case corpus. |
 | GGUF reader | ✅ | Typed metadata, memory-mapped tensor data, `general.alignment`; `LlamaModel::from_gguf` / `GgufBundle::load`. Architectures other than `llama` (e.g. `qwen2`, `gemma`) are not supported yet. |
 | Safetensors loader | 📋 | |
 | Byte-level BPE tokenizer (from GGUF) | ✅ | Special tokens, `llama3` / `qwen2` / `smollm` / `gpt2` pre-tokenizers, streaming UTF-8 decode. Matches `llama-tokenize` on a 23-case corpus. SentencePiece (`tokenizer.ggml.model = llama`) is not supported yet. |
 | Chat templates | ✅ | The model's Jinja template rendered with minijinja; ChatML fallback. |
-| Legacy word-list tokenizer | 🟡 | Still used by the RAG pipeline and synthetic models; to be replaced in P1b. |
+| Legacy word-list tokenizer | 🟡 | Only used by synthetic test models. |
 | Mistral / Qwen / DeepSeek architectures | 📋 | |
 
 ### Scheduler
@@ -61,14 +62,15 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | HNSW vector index | ✅ | In-memory; no persistence or SQ8 quantization. |
 | Reciprocal Rank Fusion | ✅ | |
 | Reranker | 🟡 | Lexical keyword-coverage scorer, **not a neural cross-encoder**. |
-| Grounded quote extraction & relevance thresholding | ✅ | Sentence-level keyword heuristics. |
-| Answer generation | 🟡 | Currently template-based over extracted quotes; LLM output is only appended if it passes a heuristic filter. |
+| Relevance gating | ✅ | A passage is relevant if its lexical score ≥ 0.25 **or** its embedding cosine similarity ≥ a per-model threshold (bge 0.6, MiniLM 0.3, calibrated on a small set; override with `--min-dense-similarity`). Unrelated queries are refused without generation. |
+| Grounded quote extraction | ✅ | Sentence-level keyword heuristics. |
+| Answer generation | ✅ | A local or remote LLM answers from numbered source passages; `[n]` citations in the answer are verified, and a warning is returned when the answer cites nothing or cites a non-existent source. Without an LLM the answer is extractive. |
 
 ### Serving
 
 | Component | Status | Notes |
 | :--- | :---: | :--- |
-| Axum HTTP server (`/health`, `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/rag/index`, `/v1/rag/query`) | 🟡 | With `--model <file.gguf>`, chat completions use the model's chat template and tokenizer, stop at end-of-turn tokens and report `finish_reason` / usage; errors use OpenAI's error format. `/v1/embeddings` and the RAG endpoints still use the synthetic embedder. |
+| Axum HTTP server (`/health`, `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/rag/index`, `/v1/rag/query`) | 🟡 | With `--model <file.gguf>`, chat completions use the model's chat template and tokenizer, stop at end-of-turn tokens and report `finish_reason` / usage; errors use OpenAI's error format. With `--embedding-model <bert.gguf>`, `/v1/embeddings` and RAG use a real embedding model. |
 | SSE streaming | 📋 | `stream: true` is rejected with 400 for now. |
 | gRPC | 📋 | |
 | Separate inference / RAG containers (Docker, Compose) | ✅ | Both run synthetic models. |
@@ -84,7 +86,7 @@ Remaining limitations:
 1. **Only LLaMA-architecture GGUF models with a byte-level BPE tokenizer load.** Qwen2 (attention biases, NeoX RoPE), Gemma, Phi, and SentencePiece tokenizers are not supported yet.
 2. **CPU only, and slower than llama.cpp.** On an Apple M4 (CPU, SmolLM2-135M Q8_0) rllm prefills ~340 tok/s and decodes ~70 tok/s versus llama.cpp's ~2,900 and ~360. See [BENCHMARKS](docs/BENCHMARKS.md).
 3. **Non-Q8_0/Q4_0 weights are expanded to F32 at load**, so a Q4_K_M file uses about 8× its file size in RAM.
-4. **The RAG subsystem still uses the synthetic embedding model and word-list tokenizer**, and its answers are template-based (P1b).
+4. **Small models rarely write `[n]` citations.** SmolLM2-135M answers correctly from the sources but usually without citation markers; the response then carries a warning. Dense thresholds are calibrated only for bge-small-en-v1.5 and all-MiniLM-L6-v2. The reranker is lexical, not a neural cross-encoder.
 5. **No streaming responses; request handlers run generation in blocking tasks** rather than a dedicated engine loop.
 6. **The prefix cache only records completed sequences** and shares whole blocks only (no copy-on-write of partial blocks).
 
@@ -93,7 +95,7 @@ Remaining limitations:
 ## 🗺️ Roadmap
 
 - **P0 — Correctness:** ✅ done — projection layout, causal prefill, per-token RoPE, prefix-cache block ownership, aligned storage, input bounds, numerical reference tests.
-- **P1 — Real models:** 🟡 P1a done — GGUF tensor loading (mmap), LLaMA weight mapping, byte-level BPE tokenizer, chat templates, `rllm generate`, real-model chat completions. P1b next — a real embedding model and LLM-generated grounded RAG answers.
+- **P1 — Real models:** ✅ done — GGUF loading, BPE and WordPiece tokenizers, chat templates, `rllm generate`, real-model chat completions, BERT embedding models, LLM-generated RAG answers with verified citations.
 - **P2 — Serving:** dedicated engine loop with per-request channels, SSE streaming, preemption, cancellation, request limits, structured errors, metrics.
 - **P3 — Performance & backends:** tiled GEMM, SIMD quantized kernels, Q4_K, F16 KV cache, Metal pipeline dispatch, CUDA behind a feature flag; re-benchmark against a real model.
 
@@ -109,7 +111,7 @@ rllm/
 │   ├── rllm-core/          # Tensor, Shape, DType, Device, Backend trait, errors
 │   ├── rllm-backend-cpu/   # CPU kernels (NEON dot/GEMV, Q4_0/Q8_0 GEMV, PagedAttention, norms, RoPE)
 │   ├── rllm-backend-metal/ # Metal backend (stub) + MSL shader sources
-│   ├── rllm-models/        # LLaMA decoder, GGUF reader/loader, BPE tokenizer, chat templates, BERT-style encoder
+│   ├── rllm-models/        # LLaMA decoder, BERT embedder, GGUF reader/loader, BPE + WordPiece tokenizers, chat templates
 │   ├── rllm-scheduler/     # Block allocator, radix prefix cache, continuous batching, sampler
 │   ├── rllm-rag/           # Chunker, HNSW, BM25, RRF fusion, lexical reranker, grounding
 │   ├── rllm-server/        # Axum HTTP API
@@ -157,7 +159,25 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
 ```
 
-`models/` is git-ignored. With the model present, `cargo test --workspace` also runs the llama.cpp parity tests in `crates/rllm-models/tests/real_model.rs`.
+### Question answering over your documents (RAG)
+
+```bash
+curl -L -o models/bge-small-en-v1.5-q8_0.gguf \
+  https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-q8_0.gguf
+
+# Built-in demo corpus
+cargo run --release -p rllm-cli -- rag-demo \
+  --model models/SmolLM2-135M-Instruct-Q8_0.gguf \
+  --embedding-model models/bge-small-en-v1.5-q8_0.gguf \
+  --query "At what temperature does water boil at sea level?"
+
+# Server with chat, embeddings and RAG in one process
+cargo run --release -p rllm-cli -- serve --service all --addr 127.0.0.1:8080 \
+  --model models/SmolLM2-135M-Instruct-Q8_0.gguf \
+  --embedding-model models/bge-small-en-v1.5-q8_0.gguf
+```
+
+`models/` is git-ignored. With the model files present, `cargo test --workspace` also runs the llama.cpp parity tests (`crates/rllm-models/tests/real_model.rs`, `real_embedding.rs`) and the RAG tests in `crates/rllm-rag/tests/real_rag.rs`.
 
 ### CLI
 ```bash
@@ -175,25 +195,21 @@ cargo run --release -p rllm-cli -- serve --service all --addr 127.0.0.1:8080 --m
 
 ## 🐳 Docker
 
-The inference engine and the RAG engine can run as separate containers. Both currently use synthetic models, so generated text is not meaningful; retrieval (BM25 + lexical reranking) does work on ingested text.
+The inference engine and the RAG engine can run as separate containers. Without model files both use synthetic models (generated text is meaningless; lexical retrieval still works). To use real models, download them into `./models` (mounted read-only at `/models`) and uncomment the `RLLM_MODEL` / `RLLM_EMBEDDING_MODEL` lines in `docker-compose.yml`.
 
 ```bash
 docker compose up --build
 ```
 
-- `rllm-inference` → `http://localhost:8000` (`/health`, `/v1/chat/completions`, `/v1/embeddings`)
-- `rllm-rag` → `http://localhost:8080` (`/health`, `/v1/rag/index`, `/v1/rag/query`), forwarding generation to `INFERENCE_URL=http://rllm-inference:8000`
-
-Ingest and query:
+- `rllm-inference` → `http://localhost:8000` (`/health`, `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`)
+- `rllm-rag` → `http://localhost:8080` (`/health`, `/v1/rag/index`, `/v1/rag/query`); retrieval runs here and answers are generated by `INFERENCE_URL=http://rllm-inference:8000`
 
 ```bash
-curl -s -X POST http://localhost:8080/v1/rag/index \
-  -H "Content-Type: application/json" \
-  -d '{"doc_id": "paged_attn", "text": "rllm implements PagedAttention in Rust to reduce KV cache fragmentation."}' | jq
+curl -s -X POST http://localhost:8080/v1/rag/index -H "Content-Type: application/json" \
+  -d '{"doc_id": "eiffel", "text": "The Eiffel Tower in Paris was completed in 1889 and is 330 metres tall."}' | jq
 
-curl -s -X POST http://localhost:8080/v1/rag/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "How does rllm reduce fragmentation?", "top_k": 2, "max_tokens": 32}' | jq
+curl -s -X POST http://localhost:8080/v1/rag/query -H "Content-Type: application/json" \
+  -d '{"query": "How tall is the tower in the French capital?", "top_k": 2, "max_tokens": 64}' | jq
 ```
 
 ---

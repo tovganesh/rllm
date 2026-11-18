@@ -18,4 +18,7 @@ half.workspace = true
 fancy-regex.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
+unicode-normalization.workspace = true
+unicode-general-category.workspace = true
+rayon.workspace = true
 
