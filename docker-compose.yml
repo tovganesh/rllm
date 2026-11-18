@@ -14,6 +14,11 @@ services:
       - "8000:8000"
     environment:
       - RUST_LOG=info
+      # Real models (download into ./models first, see README):
+      # - RLLM_MODEL=/models/SmolLM2-135M-Instruct-Q8_0.gguf
+      # - RLLM_EMBEDDING_MODEL=/models/bge-small-en-v1.5-q8_0.gguf
+    volumes:
+      - ./models:/models:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
@@ -37,6 +42,9 @@ services:
     environment:
       - RUST_LOG=info
       - INFERENCE_URL=http://rllm-inference:8000
+      # - RLLM_EMBEDDING_MODEL=/models/bge-small-en-v1.5-q8_0.gguf
+    volumes:
+      - ./models:/models:ro
     depends_on:
       rllm-inference:
         condition: service_healthy

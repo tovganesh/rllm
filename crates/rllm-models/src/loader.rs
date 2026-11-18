@@ -196,7 +196,7 @@ impl<B: Backend> LlamaModel<B> {
 
 /// Loads one tensor, checking its shape. With `keep_quantized`, Q8_0 / Q4_0 payloads
 /// are kept as-is; every other type is converted to F32.
-fn load_tensor(g: &MappedGguf, name: &str, shape: &[usize], keep_quantized: bool) -> Result<Tensor> {
+pub(crate) fn load_tensor(g: &MappedGguf, name: &str, shape: &[usize], keep_quantized: bool) -> Result<Tensor> {
     let info = g
         .tensor_info(name)
         .ok_or_else(|| RllmError::ModelError(format!("Missing tensor '{name}'")))?;

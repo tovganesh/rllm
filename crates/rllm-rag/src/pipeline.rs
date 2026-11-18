@@ -1,403 +1,429 @@
-//! End-to-end Retrieval-Augmented Generation (RAG) execution pipeline.
+//! End-to-end Retrieval-Augmented Generation (RAG) pipeline.
 //!
-//! Integrates document ingestion, BERT dense embeddings, hybrid index querying,
-//! cross-encoder reranking, precise grounded sentence quotation extraction,
-//! relevance thresholding with explicit unrelated-query flagging, and continuous batching
-//! with grounded answer synthesis.
+//! 1. **Ingest:** documents are chunked, embedded with a [`TextEmbedder`] and added to a
+//!    hybrid (HNSW + BM25) index.
+//! 2. **Retrieve:** dense and lexical candidates are fused with Reciprocal Rank Fusion.
+//!    Each candidate gets a lexical relevance score (keyword coverage) and, with a real
+//!    embedding model, its cosine similarity to the query. A candidate is relevant if
+//!    either score clears its threshold; if none is, the query is flagged as unrelated
+//!    and nothing is generated.
+//! 3. **Answer:** with an [`LlmGenerator`], the model answers from numbered source
+//!    passages and is asked to cite them as `[n]`; without one, an extractive answer
+//!    lists the most relevant quotes.
+//! 4. **Verify:** `[n]` markers in the answer are checked against the citations.
 
 use crate::chunker::{DocumentChunk, TextChunker};
 use crate::grounding::{extract_content_keywords, extract_grounded_quote};
 use crate::hybrid::HybridIndex;
 use crate::reranker::CrossEncoderReranker;
 use parking_lot::Mutex;
-use rllm_core::{backend::Backend, error::Result};
-use rllm_models::{BertEmbeddingModel, Tokenizer};
+use rllm_core::{backend::Backend, error::{Result, RllmError}};
+use rllm_models::{BpeTokenizer, ChatMessage, ChatTemplate, TextEmbedder};
 use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, Sequence};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::info;
 
-/// Default minimum relevance score threshold below which a query is flagged as unrelated.
+/// Default minimum lexical relevance score (keyword coverage, `0..=1`).
 pub const DEFAULT_MIN_RELEVANCE_THRESHOLD: f32 = 0.25;
 
-/// Source citation attributing answer content to an exact grounded passage in an ingested document.
+/// Fallback minimum cosine similarity for embedding models without a calibrated
+/// threshold ([`TextEmbedder::calibrated_dense_threshold`]). Similarity scales differ a
+/// lot between models, so calibrate and set it explicitly for unknown models.
+pub const DEFAULT_MIN_DENSE_SIMILARITY: f32 = 0.5;
+
+/// Instructions given to the LLM before the numbered sources.
+pub const GROUNDING_INSTRUCTIONS: &str = "You are a helpful assistant. Answer the user's question using only the numbered sources below. Cite the sources you use inline, like [1] or [2]. If the sources do not contain the answer, say that you don't know.";
+
+/// A source passage supporting the answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Citation {
     /// Document identifier.
     pub doc_id: String,
-    /// Chunk index within document.
+    /// Chunk index within the document.
     pub chunk_id: usize,
-    /// Exact grounded quotation / sentence extracted from the document that is relevant to the query.
+    /// Most relevant sentence(s) of the passage for the query.
     pub quote: String,
-    /// Passage text used in prompt context (contains the exact grounded quotation).
-    pub text: String,
-    /// Full surrounding passage text from the document chunk.
+    /// Full passage text given to the model.
     pub passage: String,
-    /// Calculated relevance score from retrieval and reranking in $[0.0, 1.0]$.
+    /// Lexical relevance score in `[0, 1]` (keyword coverage and quote grounding).
     pub relevance: f32,
-    /// Content keywords that grounded this citation to the query.
+    /// Cosine similarity between query and passage embeddings (real embedders only).
+    pub dense_similarity: Option<f32>,
+    /// Query keywords found in the quote.
     pub matched_keywords: Vec<String>,
-    /// Associated metadata key-value pairs.
+    /// Whether the generated answer cites this source as `[n]`.
+    pub cited_in_answer: bool,
+    /// Document metadata.
     pub metadata: HashMap<String, String>,
 }
 
-/// Final answer synthesized by the RAG engine along with source citations and relevance status.
+/// Result of a RAG query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagResponse {
-    /// Original user query string.
+    /// The user query.
     pub query: String,
-    /// Generated answer text or explicit warning if unrelated.
+    /// The answer (LLM-generated, extractive, or a refusal when nothing is relevant).
     pub answer: String,
-    /// List of source passages cited in the synthesized response.
+    /// `"llm"`, `"extractive"`, or `"none"` when the query was flagged as unrelated.
+    pub answer_source: String,
+    /// Sources, numbered from 1 in the order given to the model.
     pub citations: Vec<Citation>,
-    /// Number of output tokens generated.
+    /// Number of tokens generated by the LLM.
     pub generated_tokens: usize,
-    /// Explicit flag indicating whether sufficiently relevant and grounded context was found.
+    /// Whether sufficiently relevant context was found.
     pub is_relevant: bool,
-    /// Maximum relevance confidence score ($0.0$ to $1.0$) among candidate documents.
+    /// Highest lexical relevance among candidates.
     pub confidence_score: f32,
-    /// Explicit warning if the query was flagged as low relevance or unrelated to the index.
+    /// Highest dense cosine similarity among candidates (real embedders only).
+    pub max_dense_similarity: Option<f32>,
+    /// Warning for unrelated queries or answers that cite no valid source.
     pub warning: Option<String>,
 }
 
-/// Determines if decoded LLM output represents coherent natural language text
-/// rather than random token noise from an untrained/synthetic neural network.
-pub fn is_coherent_completion(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.len() < 12 {
-        return false;
-    }
-    // Filter out special tokens like <|system|>, <|user|>, <|assistant|>
-    if trimmed.contains("<|") || trimmed.contains("|>") {
-        return false;
-    }
-    // Filter out heavy symbol/noise outputs from random logits
-    let total_chars = trimmed.chars().count();
-    let alpha_chars = trimmed
-        .chars()
-        .filter(|c| c.is_alphabetic() || c.is_whitespace() || *c == '.' || *c == ',' || *c == '-')
-        .count();
-    let alpha_ratio = alpha_chars as f32 / total_chars as f32;
-    if alpha_ratio < 0.85 {
-        return false;
-    }
-    // Ensure multiple real words exist
-    let words: Vec<&str> = trimmed
-        .split_whitespace()
-        .filter(|w| w.len() >= 2 && w.chars().all(|c| c.is_alphabetic()))
-        .collect();
-    if words.len() < 4 {
-        return false;
-    }
-    true
+/// Outcome of the retrieval stage.
+#[derive(Debug, Clone)]
+pub struct Retrieval {
+    /// Relevant passages, best first.
+    pub citations: Vec<Citation>,
+    /// Highest lexical relevance among candidates.
+    pub confidence_score: f32,
+    /// Highest dense similarity among candidates.
+    pub max_dense_similarity: Option<f32>,
+    /// Whether any passage cleared a relevance threshold.
+    pub is_relevant: bool,
 }
 
-/// Synthesizes a factual, coherent, and grounded answer to the user query based strictly on the retrieved citations.
-pub fn synthesize_grounded_answer(query: &str, citations: &[Citation], decoded_llm: &str) -> String {
-    if citations.is_empty() {
-        return "No relevant context was available to synthesize an answer.".to_string();
-    }
-
-    let mut answer = String::new();
-    let q_lower = query.to_lowercase();
-
-    // Contextual introductory summary answering the query intent
-    if q_lower.contains("where") || q_lower.contains("all") {
-        answer.push_str("Based on the verified documentation, rllm can be deployed and used across the following environments:\n\n");
-    } else if q_lower.contains("what makes") || q_lower.contains("how does") || q_lower.contains("why") {
-        answer.push_str("Based on the verified documentation, here is how rllm operates:\n\n");
-    } else if q_lower.contains("what is") || q_lower.contains("explain") {
-        answer.push_str("Based on the retrieved architecture specifications:\n\n");
-    } else {
-        answer.push_str("According to the verified documentation:\n\n");
-    }
-
-    for (i, cit) in citations.iter().enumerate() {
-        let topic = match cit.doc_id.as_str() {
-            "doc_cluster" => "Apple Silicon & GPU Clusters",
-            "doc_edge" => "Smartphones & Mobile Edge (iOS / Android)",
-            "doc_arch" | "architecture_spec" => "Enterprise Core Architecture & Paged Memory",
-            "doc_rag" => "High-Performance RAG Subsystem",
-            _ => {
-                if cit.doc_id.starts_with("doc_") {
-                    &cit.doc_id[4..]
-                } else {
-                    cit.doc_id.as_str()
-                }
-            }
-        };
-
-        answer.push_str(&format!(
-            "• **{}**: {} [{}]\n",
-            topic, cit.quote.trim(), i + 1
-        ));
-    }
-
-    // If a trained model generated additional cohesive text tokens, append it
-    let clean_decoded = decoded_llm.trim();
-    if is_coherent_completion(clean_decoded) {
-        answer.push_str(&format!("\n{}", clean_decoded));
-    }
-
-    answer.trim().to_string()
-}
-
-/// Unified RAG engine coordinating embedding models, hybrid indexes, and continuous batch schedulers.
-pub struct RagEngine<B: Backend> {
-    /// Local embedding model used for dense semantic retrieval.
-    pub embedding_model: Arc<BertEmbeddingModel<B>>,
-    /// Hybrid index containing vectors and inverted BM25 index.
-    pub hybrid_index: Mutex<HybridIndex>,
-    /// Configured text chunker for passage splitting.
-    pub chunker: TextChunker,
-    /// Continuous batching scheduler executing the autoregressive LLM.
+/// A local LLM used to write grounded answers.
+pub struct LlmGenerator<B: Backend> {
+    /// Scheduler running the model.
     pub scheduler: Arc<ContinuousBatchScheduler<B>>,
-    /// Bidirectional tokenizer for prompt encoding and token decoding.
-    pub tokenizer: Tokenizer,
-    /// Minimum relevance threshold for qualifying retrieved citations.
+    /// The model's tokenizer.
+    pub tokenizer: Arc<BpeTokenizer>,
+    /// The model's chat template.
+    pub chat_template: Arc<ChatTemplate>,
+}
+
+impl<B: Backend> Clone for LlmGenerator<B> {
+    fn clone(&self) -> Self {
+        Self {
+            scheduler: self.scheduler.clone(),
+            tokenizer: self.tokenizer.clone(),
+            chat_template: self.chat_template.clone(),
+        }
+    }
+}
+
+/// RAG engine: embedding model, hybrid index and optional answer generator.
+pub struct RagEngine<B: Backend> {
+    /// Embedding model used for documents and queries.
+    pub embedder: Arc<TextEmbedder<B>>,
+    /// Dense + lexical index.
+    pub hybrid_index: Mutex<HybridIndex>,
+    /// Passage splitter.
+    pub chunker: TextChunker,
+    /// Minimum lexical relevance for a passage to count as relevant.
     pub min_relevance_threshold: f32,
-    seq_counter: Mutex<u64>,
+    /// Minimum dense cosine similarity for a passage to count as relevant.
+    pub min_dense_similarity: f32,
+    /// Local LLM for generated answers; `None` gives extractive answers.
+    pub generator: Option<LlmGenerator<B>>,
 }
 
 impl<B: Backend> RagEngine<B> {
-    /// Constructs a new [`RagEngine`] with embedding and LLM generation backends.
-    pub fn new(
-        embedding_model: Arc<BertEmbeddingModel<B>>,
-        scheduler: Arc<ContinuousBatchScheduler<B>>,
-        dim: usize,
-    ) -> Self {
+    /// Creates an engine. Without a `generator`, answers are extractive.
+    pub fn new(embedder: Arc<TextEmbedder<B>>, generator: Option<LlmGenerator<B>>) -> Self {
+        let dim = embedder.dim();
+        let min_dense_similarity = match embedder.calibrated_dense_threshold() {
+            Some(t) => t,
+            None => {
+                if !embedder.is_synthetic() {
+                    tracing::warn!(
+                        "No calibrated dense-similarity threshold for '{}'; using {}. Set it explicitly for reliable relevance gating.",
+                        embedder.name,
+                        DEFAULT_MIN_DENSE_SIMILARITY
+                    );
+                }
+                DEFAULT_MIN_DENSE_SIMILARITY
+            }
+        };
         Self {
-            embedding_model,
+            embedder,
             hybrid_index: Mutex::new(HybridIndex::new(dim, 16, 64, 32)),
             chunker: TextChunker::default(),
-            scheduler,
-            tokenizer: Tokenizer::new(),
             min_relevance_threshold: DEFAULT_MIN_RELEVANCE_THRESHOLD,
-            seq_counter: Mutex::new(1),
+            min_dense_similarity,
+            generator,
         }
     }
 
-    /// Sets a custom minimum relevance threshold.
+    /// Sets the minimum lexical relevance threshold.
     pub fn with_relevance_threshold(mut self, threshold: f32) -> Self {
         self.min_relevance_threshold = threshold;
         self
     }
 
-    /// Ingests a text document into the RAG engine:
-    /// Chunks text, computes dense embeddings on the inference engine, and adds to hybrid index.
-    pub fn ingest_document(
-        &self,
-        doc_id: &str,
-        text: &str,
-        metadata: HashMap<String, String>,
-    ) -> Result<usize> {
-        let chunks = self.chunker.chunk_text(doc_id, text, metadata);
-        let num_chunks = chunks.len();
+    /// Sets the minimum dense cosine similarity threshold.
+    pub fn with_dense_threshold(mut self, threshold: f32) -> Self {
+        self.min_dense_similarity = threshold;
+        self
+    }
 
+    /// Chunks, embeds and indexes a document. Returns the number of chunks.
+    pub fn ingest_document(&self, doc_id: &str, text: &str, metadata: HashMap<String, String>) -> Result<usize> {
+        let chunks = self.chunker.chunk_text(doc_id, text, metadata);
+        // Embed before taking the index lock so queries are not blocked meanwhile.
+        let embedded: Vec<(Vec<f32>, DocumentChunk)> = chunks
+            .into_iter()
+            .map(|c| Ok((self.embedder.embed_text(&c.text)?, c)))
+            .collect::<Result<_>>()?;
+        let n = embedded.len();
         let mut index = self.hybrid_index.lock();
-        for chunk in chunks {
-            // Encode words to tokens with the tokenizer
-            let token_ids = self.tokenizer.encode(&chunk.text);
-            let emb = self.embedding_model.embed(&token_ids)?;
+        for (emb, chunk) in embedded {
             index.insert(emb, chunk);
         }
-
-        info!(
-            "Ingested document '{}' ({} chunks) into hybrid index",
-            doc_id, num_chunks
-        );
-        Ok(num_chunks)
+        info!("Ingested document '{}' ({} chunks)", doc_id, n);
+        Ok(n)
     }
 
-    /// Executes end-to-end RAG with the default configured relevance threshold.
-    pub async fn query(
-        &self,
-        query_text: &str,
-        top_k: usize,
-        sampling: SamplingParams,
-    ) -> Result<RagResponse> {
-        self.query_with_threshold(query_text, top_k, sampling, None).await
-    }
+    /// Retrieves, scores and filters passages for `query`.
+    ///
+    /// `min_lexical` overrides the engine's lexical threshold for this call.
+    pub fn retrieve(&self, query: &str, top_k: usize, min_lexical: Option<f32>) -> Result<Retrieval> {
+        let lexical_threshold = min_lexical.unwrap_or(self.min_relevance_threshold);
+        let use_dense = !self.embedder.is_synthetic();
+        let q_emb = self.embedder.embed_text(query)?;
 
-    /// Executes end-to-end RAG with an optional custom relevance threshold:
-    /// Retrieval -> Rerank -> Relevance Check & Flagging -> Grounded Quote Extraction -> Generation.
-    pub async fn query_with_threshold(
-        &self,
-        query_text: &str,
-        top_k: usize,
-        sampling: SamplingParams,
-        min_threshold: Option<f32>,
-    ) -> Result<RagResponse> {
-        let threshold = min_threshold.unwrap_or(self.min_relevance_threshold);
-
-        // 1. Generate query embedding with tokenizer
-        let q_token_ids = self.tokenizer.encode(query_text);
-        let q_emb = self.embedding_model.embed(&q_token_ids)?;
-
-        // 2. Hybrid search (dense HNSW + sparse BM25)
-        let raw_matches = {
+        let (candidates, dense): (Vec<DocumentChunk>, Vec<Option<f32>>) = {
             let index = self.hybrid_index.lock();
-            index.search(query_text, &q_emb, top_k * 2)
-        };
-
-        // 3. Rerank candidates with content keyword verification
-        let candidate_chunks: Vec<DocumentChunk> = raw_matches.into_iter().map(|m| m.chunk).collect();
-        let reranked = CrossEncoderReranker::rerank(query_text, candidate_chunks, top_k);
-
-        let max_relevance = reranked
-            .first()
-            .map(|r| r.relevance_score)
-            .unwrap_or(0.0);
-
-        // 4. Check if relevance is low or query is unrelated
-        let content_kws = extract_content_keywords(query_text);
-        let valid_matches: Vec<_> = reranked
-            .into_iter()
-            .filter(|r| r.relevance_score >= threshold)
-            .collect();
-
-        if valid_matches.is_empty() || (!content_kws.is_empty() && max_relevance < threshold) {
-            let warning_msg = format!(
-                "Low relevance detected (max relevance score: {:.2}, threshold: {:.2}). The query appears unrelated to the ingested knowledge base.",
-                max_relevance, threshold
-            );
-            info!("{}", warning_msg);
-
-            let answer = format!(
-                "⚠️ Unrelated Query Warning: No sufficiently relevant or grounded information was found in the indexed documents for your query '{}' (confidence: {:.2} < threshold {:.2}).",
-                query_text, max_relevance, threshold
-            );
-
-            return Ok(RagResponse {
-                query: query_text.to_string(),
-                answer,
-                citations: Vec::new(),
-                generated_tokens: 0,
-                is_relevant: false,
-                confidence_score: max_relevance,
-                warning: Some(warning_msg),
-            });
-        }
-
-        // 5. Extract precise grounded quotes for each qualifying citation
-        let citations: Vec<Citation> = valid_matches
-            .into_iter()
-            .filter_map(|r| {
-                let grounded = extract_grounded_quote(query_text, &r.chunk.text);
-                if !content_kws.is_empty() && grounded.matched_keywords.is_empty() {
-                    return None;
-                }
-                let combined_relevance = (r.relevance_score * 0.7 + grounded.score * 0.3).min(1.0);
-                Some(Citation {
-                    doc_id: r.chunk.doc_id.clone(),
-                    chunk_id: r.chunk.chunk_id,
-                    quote: grounded.quote.clone(),
-                    text: grounded.quote,
-                    passage: r.chunk.text.clone(),
-                    relevance: combined_relevance,
-                    matched_keywords: grounded.matched_keywords,
-                    metadata: r.chunk.metadata.clone(),
+            index
+                .search(query, &q_emb, top_k.max(1) * 2)
+                .into_iter()
+                .map(|m| {
+                    let d = if use_dense { index.dense_similarity(m.chunk_idx, &q_emb) } else { None };
+                    (m.chunk, d)
                 })
-            })
-            .collect();
-
-        if citations.is_empty() {
-            let warning_msg = format!(
-                "Low relevance detected (confidence: {:.2}, threshold: {:.2}). The query appears unrelated to the ingested knowledge base.",
-                max_relevance, threshold
-            );
-            info!("{}", warning_msg);
-
-            let answer = format!(
-                "⚠️ Unrelated Query Warning: No sufficiently relevant or grounded information was found in the indexed documents for your query '{}' (confidence: {:.2} < threshold {:.2}).",
-                query_text, max_relevance, threshold
-            );
-
-            return Ok(RagResponse {
-                query: query_text.to_string(),
-                answer,
-                citations: Vec::new(),
-                generated_tokens: 0,
-                is_relevant: false,
-                confidence_score: max_relevance,
-                warning: Some(warning_msg),
-            });
-        }
-
-        // 6. Assemble grounded prompt with citations:
-        // [System Prompt] -> [Exact Factual Citations] -> [User Question]
-        let mut context_str = String::new();
-        for (i, cit) in citations.iter().enumerate() {
-            context_str.push_str(&format!(
-                "\n[{}] Document: {} (Relevance: {:.2})\nExact Quote: \"{}\"\n",
-                i + 1, cit.doc_id, cit.relevance, cit.quote
-            ));
-        }
-
-        let assembled_prompt = format!(
-            "System: You are an enterprise intelligence assistant. You must answer the user's question strictly grounded in the provided factual context passages below.\n\
-             For every claim you make, cite the corresponding source reference [1], [2], etc.\n\
-             If the provided context does not contain enough information to answer the question, state that clearly without guessing.\n\n\
-             Factual Context:\n{}\n\
-             Question: {}\n\
-             Grounded Answer:",
-            context_str, query_text
-        );
-
-        // Tokenize prompt to token IDs with the Tokenizer
-        let prompt_tokens = self.tokenizer.encode(&assembled_prompt);
-
-        // 7. Submit to ContinuousBatchScheduler with a streaming channel
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let seq_id = {
-            let mut c = self.seq_counter.lock();
-            let id = *c;
-            *c += 1;
-            id
+                .unzip()
         };
 
-        let seq = Sequence::new(
-            seq_id,
-            prompt_tokens,
-            sampling,
-            self.scheduler.config.block_size,
-            Some(tx),
-        );
+        // Lexical score per candidate (candidates are in RRF order).
+        let n = candidates.len();
+        let mut lexical = vec![0.0f32; n];
+        for r in CrossEncoderReranker::rerank(query, candidates.clone(), n) {
+            lexical[r.chunk_idx] = r.relevance_score;
+        }
+        let confidence_score = lexical.iter().cloned().fold(0.0, f32::max);
+        let max_dense_similarity = dense.iter().flatten().cloned().reduce(f32::max);
 
-        self.scheduler.submit_sequence(seq)?;
-
-        // Drive scheduler loop until sequence finishes
-        let mut generated_tokens = 0;
-        let mut output_tokens = Vec::new();
-        let mut max_steps = 200;
-
-        while max_steps > 0 {
-            max_steps -= 1;
-            let _ = self.scheduler.step()?;
-            while let Ok(token) = rx.try_recv() {
-                output_tokens.push(token);
-                generated_tokens += 1;
+        let content_keywords = extract_content_keywords(query);
+        let mut citations = Vec::new();
+        for (i, chunk) in candidates.into_iter().enumerate() {
+            let grounded = extract_grounded_quote(query, &chunk.text);
+            let lexical_ok = lexical[i] >= lexical_threshold
+                && (content_keywords.is_empty() || !grounded.matched_keywords.is_empty());
+            let dense_ok = dense[i].is_some_and(|d| d >= self.min_dense_similarity);
+            if !(lexical_ok || dense_ok) {
+                continue;
             }
-
-            // Check if scheduler is done with this sequence
-            if self.scheduler.num_running() == 0 && self.scheduler.num_waiting() == 0 {
+            citations.push(Citation {
+                doc_id: chunk.doc_id.clone(),
+                chunk_id: chunk.chunk_id,
+                quote: grounded.quote,
+                passage: chunk.text.clone(),
+                relevance: (lexical[i] * 0.7 + grounded.score * 0.3).min(1.0),
+                dense_similarity: dense[i],
+                matched_keywords: grounded.matched_keywords,
+                cited_in_answer: false,
+                metadata: chunk.metadata,
+            });
+            if citations.len() == top_k {
                 break;
             }
         }
 
-        let decoded_tokens = self.tokenizer.decode(&output_tokens);
-        let answer = synthesize_grounded_answer(query_text, &citations, &decoded_tokens);
+        Ok(Retrieval {
+            is_relevant: !citations.is_empty(),
+            citations,
+            confidence_score,
+            max_dense_similarity,
+        })
+    }
 
+    /// Runs the full pipeline with the engine's default thresholds.
+    pub async fn query(&self, query: &str, top_k: usize, sampling: SamplingParams) -> Result<RagResponse> {
+        self.query_with_threshold(query, top_k, sampling, None).await
+    }
+
+    /// Runs the full pipeline: retrieve → (refuse | generate | extract) → verify.
+    pub async fn query_with_threshold(
+        &self,
+        query: &str,
+        top_k: usize,
+        mut sampling: SamplingParams,
+        min_lexical: Option<f32>,
+    ) -> Result<RagResponse> {
+        let retrieval = self.retrieve(query, top_k, min_lexical)?;
+        if !retrieval.is_relevant {
+            return Ok(unrelated_response(query, &retrieval, min_lexical.unwrap_or(self.min_relevance_threshold), self.min_dense_similarity));
+        }
+        let mut citations = retrieval.citations;
+
+        let (answer, answer_source, generated_tokens) = match &self.generator {
+            Some(generator) => {
+                let generator = generator.clone();
+                let max_pos = generator.scheduler.model.config.max_position_embeddings;
+                // Drop the weakest sources until the prompt leaves room for the answer.
+                let prompt_tokens = loop {
+                    let prompt = generator.chat_template.render(&grounded_messages(query, &citations), true)?;
+                    let tokens = generator.tokenizer.encode(&prompt, true, true);
+                    if tokens.len() + sampling.max_tokens < max_pos || citations.len() <= 1 {
+                        break tokens;
+                    }
+                    citations.pop();
+                };
+                sampling.stop_tokens = generator.tokenizer.stop_token_ids.clone();
+                let stops = sampling.stop_tokens.clone();
+                let block_size = generator.scheduler.config.block_size;
+                let seq = Sequence::new(rand::random::<u64>(), prompt_tokens, sampling, block_size, None);
+                let scheduler = generator.scheduler.clone();
+                let mut out = tokio::task::spawn_blocking(move || scheduler.generate(seq, |_| {}))
+                    .await
+                    .map_err(|e| RllmError::RagError(format!("generation task failed: {e}")))??;
+                let generated = out.len();
+                if out.last().is_some_and(|t| stops.contains(t)) {
+                    out.pop();
+                }
+                (generator.tokenizer.decode(&out, true).trim().to_string(), "llm", generated)
+            }
+            None => (extractive_answer(&citations), "extractive", 0),
+        };
+
+        let warning = verify_citations(&answer, &mut citations);
         Ok(RagResponse {
-            query: query_text.to_string(),
+            query: query.to_string(),
             answer,
+            answer_source: answer_source.to_string(),
             citations,
             generated_tokens,
             is_relevant: true,
-            confidence_score: max_relevance,
-            warning: None,
+            confidence_score: retrieval.confidence_score,
+            max_dense_similarity: retrieval.max_dense_similarity,
+            warning,
         })
+    }
+}
+
+/// Chat messages asking a model to answer `query` from numbered `citations`.
+pub fn grounded_messages(query: &str, citations: &[Citation]) -> Vec<ChatMessage> {
+    let mut system = String::from(GROUNDING_INSTRUCTIONS);
+    system.push_str("\n\nSources:\n");
+    for (i, c) in citations.iter().enumerate() {
+        system.push_str(&format!("[{}] {}\n", i + 1, c.passage.trim()));
+    }
+    vec![ChatMessage::new("system", system.trim_end()), ChatMessage::new("user", query)]
+}
+
+/// Answer listing the grounded quote of each source, used without an LLM.
+pub fn extractive_answer(citations: &[Citation]) -> String {
+    citations
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{} [{}]", c.quote.trim(), i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Marks citations referenced as `[n]` in `answer`. Returns a warning if the answer
+/// cites no source or cites a number that does not exist.
+pub fn verify_citations(answer: &str, citations: &mut [Citation]) -> Option<String> {
+    let mut invalid = Vec::new();
+    let bytes = answer.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let digits: String = answer[i + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() && answer[i + 1 + digits.len()..].starts_with(']') {
+                match digits.parse::<usize>() {
+                    Ok(n) if (1..=citations.len()).contains(&n) => citations[n - 1].cited_in_answer = true,
+                    _ => invalid.push(format!("[{digits}]")),
+                }
+                i += digits.len() + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !invalid.is_empty() {
+        Some(format!("The answer cites sources that do not exist: {}", invalid.join(", ")))
+    } else if !citations.iter().any(|c| c.cited_in_answer) {
+        Some("The answer does not cite any of the retrieved sources.".to_string())
+    } else {
+        None
+    }
+}
+
+/// Response for a query with no relevant passages (nothing is generated).
+pub fn unrelated_response(query: &str, r: &Retrieval, lexical_threshold: f32, dense_threshold: f32) -> RagResponse {
+    let dense = match r.max_dense_similarity {
+        Some(d) => format!(", dense similarity {d:.2} < {dense_threshold:.2}"),
+        None => String::new(),
+    };
+    let warning = format!(
+        "No sufficiently relevant passages found (lexical relevance {:.2} < {:.2}{}). The query appears unrelated to the indexed documents.",
+        r.confidence_score, lexical_threshold, dense
+    );
+    info!("{}", warning);
+    RagResponse {
+        query: query.to_string(),
+        answer: "I couldn't find information about this in the indexed documents.".to_string(),
+        answer_source: "none".to_string(),
+        citations: Vec::new(),
+        generated_tokens: 0,
+        is_relevant: false,
+        confidence_score: r.confidence_score,
+        max_dense_similarity: r.max_dense_similarity,
+        warning: Some(warning),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cit(quote: &str) -> Citation {
+        Citation {
+            doc_id: "d".into(),
+            chunk_id: 0,
+            quote: quote.into(),
+            passage: format!("{quote} More context."),
+            relevance: 0.5,
+            dense_similarity: None,
+            matched_keywords: vec![],
+            cited_in_answer: false,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn verify_marks_cited_sources_and_flags_invalid_ones() {
+        let mut c = vec![cit("a"), cit("b"), cit("c")];
+        assert_eq!(verify_citations("Water boils at 100 °C [1][3].", &mut c), None);
+        assert_eq!(c.iter().map(|c| c.cited_in_answer).collect::<Vec<_>>(), vec![true, false, true]);
+
+        let mut c = vec![cit("a")];
+        assert!(verify_citations("See [2] and [x].", &mut c).unwrap().contains("[2]"));
+        let mut c = vec![cit("a")];
+        assert!(verify_citations("No citations here.", &mut c).unwrap().contains("does not cite"));
+    }
+
+    #[test]
+    fn grounded_messages_number_sources_and_extractive_answer_cites_them() {
+        let c = vec![cit("First fact."), cit("Second fact.")];
+        let m = grounded_messages("q?", &c);
+        assert_eq!(m.len(), 2);
+        assert!(m[0].content.contains("[1] First fact. More context.\n[2] Second fact."));
+        assert_eq!(m[1].content, "q?");
+        assert_eq!(extractive_answer(&c), "First fact. [1]\nSecond fact. [2]");
     }
 }

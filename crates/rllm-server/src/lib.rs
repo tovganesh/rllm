@@ -62,16 +62,15 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use rllm_backend_cpu::CpuBackend;
-    use rllm_models::{BertConfig, BertEmbeddingModel, LlamaConfig, LlamaModel};
+    use rllm_models::{BertConfig, LlamaConfig, LlamaModel, TextEmbedder};
     use rllm_rag::RagEngine;
     use rllm_scheduler::{ContinuousBatchScheduler, SchedulerConfig};
     use tower::ServiceExt;
 
     fn setup_test_state(mode: ServiceMode) -> Arc<AppState> {
         let backend = Arc::new(CpuBackend);
-        let bert_config = BertConfig::tiny_test_config();
-        let bert_model =
-            Arc::new(BertEmbeddingModel::new_random(bert_config.clone(), backend.clone()).unwrap());
+        let embedder =
+            Arc::new(TextEmbedder::synthetic(BertConfig::tiny_test_config(), backend.clone()).unwrap());
 
         let llama_config = LlamaConfig::tiny_test_config();
         let llama_model = Arc::new(LlamaModel::new_random(llama_config, backend).unwrap());
@@ -89,16 +88,13 @@ mod tests {
             .unwrap(),
         );
 
-        let rag_engine = Arc::new(RagEngine::new(
-            bert_model,
-            scheduler.clone(),
-            bert_config.hidden_size,
-        ));
+        let rag_engine = Arc::new(RagEngine::new(embedder.clone(), None));
 
         Arc::new(AppState {
             scheduler: Some(scheduler),
             tokenizer: None,
             chat_template: None,
+            embedder: Some(embedder),
             rag_engine: Some(rag_engine),
             inference_url: None,
             model_name: "rllm-tiny-test".to_string(),
@@ -172,5 +168,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rag: rllm_rag::RagResponse = serde_json::from_slice(&body).unwrap();
+        assert!(rag.is_relevant);
+        assert_eq!(rag.answer_source, "extractive");
+        assert_eq!(rag.citations[0].doc_id, "doc_edge");
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_endpoint_and_error_bodies() {
+        let app = create_router(setup_test_state(ServiceMode::All));
+        let post = |uri: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(post("/v1/embeddings", r#"{"input":["hello world","second"]}"#)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"][0]["embedding"].as_array().unwrap().len(), 64);
+
+        let resp = app.clone().oneshot(post("/v1/rag/query", r#"{"query":"   "}"#)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
     }
 }

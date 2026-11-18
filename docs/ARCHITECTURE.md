@@ -21,6 +21,7 @@ flowchart TD
         Chunker["Word-window chunker ✅"]
         HybridIndex["HNSW ✅ + BM25 ✅ + RRF ✅"]
         Reranker["Lexical reranker 🟡 (neural cross-encoder 📋)"]
+        Answer["Grounded LLM answers + citation check ✅"]
         Grounding["Grounded quote extraction ✅"]
     end
 
@@ -34,7 +35,7 @@ flowchart TD
     subgraph ModelLayer ["Models (rllm-models)"]
         Weights["GGUF loader ✅ · Safetensors 📋"]
         Llama["LLaMA-architecture decoder ✅ (GGUF)"]
-        Embed["BERT-style encoder 🟡 (synthetic weights)"]
+        Embed["BERT embedder ✅ (GGUF, WordPiece)"]
         Tok["Byte-level BPE tokenizer ✅ · chat templates ✅"]
     end
 
@@ -101,7 +102,7 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 - Q4_0 (32 elements / 18 bytes) and Q8_0 (32 / 34 bytes) GEMV operate directly on quantized blocks without dequantizing the full matrix. Inner loops are scalar.
 - PagedAttention decode: per-head logits over a block table, softmax, weighted V accumulation; GQA supported.
 
-### 4.3 Models (`rllm-models`) — ✅ decoder · 🟡 embedder
+### 4.3 Models (`rllm-models`) — ✅
 
 - `LlamaModel::forward` takes a flattened batch of rows, each with its own token, absolute position and block table: embedding → N × (RMSNorm, QKV, per-row RoPE, KV write for every row, causal PagedAttention, O-proj, RMSNorm, SwiGLU MLP) → final norm → LM head for selected rows only. All prompt tokens of a sequence = causal prefill; one token per sequence = batched decode; both can be mixed. `forward_decode` is a convenience wrapper.
 - Numerical tests compare it against a naive dense reference implementation.
@@ -109,8 +110,8 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 - **Tokenizer.** `BpeTokenizer` implements llama.cpp-compatible byte-level BPE from `tokenizer.ggml.{tokens,token_type,merges,pre}`: special-token splitting, per-model pre-tokenizer regexes applied in sequence, rank-ordered merges, and streaming UTF-8 decode (`StreamDecoder`). Stop tokens come from EOS/EOT metadata plus known end-of-turn markers.
 - **Chat templates.** `ChatTemplate` renders the model's Jinja `tokenizer.chat_template` with minijinja (Python-compatible methods, `raise_exception`, `bos_token`, `eos_token`), falling back to ChatML.
 - **Verification.** Besides the dense reference test, `tests/real_model.rs` compares tokenization and greedy generation with llama.cpp fixtures for SmolLM2-135M in five weight formats.
-- `BertEmbeddingModel::embed` runs a simplified encoder with mean pooling and L2 normalisation, still with synthetic weights (P1b).
-- The legacy word-list `Tokenizer` remains for the RAG pipeline and synthetic models until P1b.
+- **Embeddings.** `TextEmbedder::from_gguf` loads a `bert`-architecture model (token, position and token-type embeddings; post-norm encoder layers with biases; GELU FFN; mean or `[CLS]` pooling from `bert.pooling_type`; L2 normalisation) and its `WordPieceTokenizer` (BERT basic tokenization + greedy longest-match, `▁`-prefixed word-initial pieces as stored in GGUF). Inputs beyond `bert.context_length` are truncated, keeping `[SEP]`. `calibrated_dense_threshold()` gives the relevance cutoff for known models.
+- The legacy word-list `Tokenizer` is only used by synthetic test models.
 
 ### 4.4 Scheduling (`rllm-scheduler`) — 🟡
 
@@ -125,15 +126,17 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 - **HNSW** ✅ — in-memory multi-layer graph, cosine distance (NEON dot on `aarch64`). Persistence and SQ8 vector quantization are planned.
 - **BM25** ✅ — Okapi BM25 (`k1 = 1.2`, `b = 0.75`) over a lowercase alphanumeric tokenisation.
 - **Hybrid fusion** ✅ — Reciprocal Rank Fusion (`k = 60`) of dense and BM25 rankings.
-- **Reranking** 🟡 — `CrossEncoderReranker` is currently a lexical scorer (content-keyword coverage, term density, exact-phrase bonus). A neural cross-encoder is planned.
-- **Grounding & relevance** ✅ — sentence-level quote extraction keyed on non-stop-word query terms; queries whose best score is below `min_relevance_threshold` (default 0.25) are returned with `is_relevant: false` and a `warning`, without invoking generation.
-- **Answer generation** 🟡 — today the answer is assembled from extracted quotes by a template, and model output is appended only if a heuristic deems it coherent. Target design: the LLM generates the answer from the grounded prompt, and citations are verified against the output.
+- **Reranking** 🟡 — `CrossEncoderReranker` is a lexical scorer (content-keyword coverage, term density, exact-phrase bonus). A neural cross-encoder is planned.
+- **Relevance gating** ✅ — `RagEngine::retrieve` takes the RRF-ordered candidates and keeps a passage if its lexical score ≥ `min_relevance_threshold` (default 0.25, with at least one query keyword in the grounded quote) **or** its embedding cosine similarity ≥ `min_dense_similarity`. Similarity scales differ by model, so the dense threshold comes from `TextEmbedder::calibrated_dense_threshold` (bge-small-en-v1.5: 0.6 — related ≥ 0.67, unrelated ≤ 0.55; all-MiniLM-L6-v2: 0.3 — related ≥ 0.42, unrelated ≤ 0.14; measured on a small paraphrase/off-topic set) or a configured value. If nothing passes, the query is refused with `is_relevant: false` and no generation.
+- **Answer generation** ✅ — `grounded_messages` builds a system prompt with numbered source passages and an instruction to cite them as `[n]`, rendered with the LLM's chat template. Sources are dropped from the end if the prompt would not leave room for `max_tokens`. With no `LlmGenerator` (and no remote inference service), the answer is extractive: each source's grounded quote with its number.
+- **Citation verification** ✅ — `verify_citations` sets `cited_in_answer` for every valid `[n]` and returns a warning if the answer cites no source or a non-existent one. It does not check that the cited text supports the claim.
 - **Prefix-aware context ordering** 📋 — ordering retrieved chunks to maximise radix-cache hits is a design goal and is not implemented.
 
 ### 4.6 Serving (`rllm-server`) — 🟡
 
 - Service modes: `all`, `inference`, `rag`. In `rag` mode with `INFERENCE_URL` set, retrieval runs locally and generation is delegated to the inference container's `/v1/chat/completions`.
-- Handlers currently drive `scheduler.step()` inline until the scheduler is idle; this is a placeholder for a dedicated engine task.
+- Generation runs in `tokio::task::spawn_blocking` via `ContinuousBatchScheduler::generate`, which steps the shared scheduler until the request's own sequence finishes; a dedicated engine task is planned (P2).
+- `/v1/embeddings` uses the server's `TextEmbedder` (`--embedding-model`); RAG answers are generated by the local GGUF model, by the remote inference service in split deployments, or extractively.
 - Chat and embeddings endpoints do not yet tokenize input text (placeholder token IDs).
 - SSE streaming, gRPC, authentication, request limits and metrics are planned.
 

@@ -266,6 +266,11 @@ impl HnswIndex {
         nearest.into_sorted_vec()
     }
 
+    /// Stored vector of the item with internal index `idx`.
+    pub fn vector(&self, idx: usize) -> Option<&[f32]> {
+        self.vectors.get(idx).map(Vec::as_slice)
+    }
+
     /// Performs approximate nearest neighbor search for a given query vector.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<VectorMatch> {
         if self.entry_point.is_none() {
