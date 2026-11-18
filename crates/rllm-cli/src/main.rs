@@ -15,9 +15,11 @@ use rllm_models::{
     TextEmbedder,
 };
 use rllm_rag::{LlmGenerator, RagEngine};
-use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, SchedulerConfig, Sequence};
+use rllm_scheduler::{
+    ContinuousBatchScheduler, EngineConfig, EngineHandle, SamplingParams, SchedulerConfig, Sequence,
+};
 use std::io::Write;
-use rllm_server::{run_server, AppState};
+use rllm_server::{run_server, AppState, ServerLimits, ServerMetrics};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -70,6 +72,14 @@ enum Commands {
         /// Defaults to the calibrated value for known embedding models (bge 0.6, MiniLM 0.3).
         #[arg(long)]
         min_dense_similarity: Option<f32>,
+
+        /// Maximum requests waiting for admission; further requests get HTTP 429
+        #[arg(long, default_value_t = 256)]
+        max_waiting: usize,
+
+        /// Largest max_tokens a request may ask for
+        #[arg(long, default_value_t = 4096)]
+        max_tokens_limit: usize,
     },
 
     /// Generate text from a GGUF model
@@ -169,6 +179,8 @@ async fn main() -> anyhow::Result<()> {
             kv_cache_tokens,
             embedding_model,
             min_dense_similarity,
+            max_waiting,
+            max_tokens_limit,
         } => {
             use rllm_server::ServiceMode;
             let mode = match service.to_lowercase().as_str() {
@@ -213,7 +225,8 @@ async fn main() -> anyhow::Result<()> {
                     total_blocks: kv_cache_tokens.div_ceil(block_size).max(1),
                     ..SchedulerConfig::default()
                 };
-                Some(Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?))
+                let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?);
+                Some(EngineHandle::start(scheduler, EngineConfig { max_waiting }))
             } else {
                 None
             };
@@ -226,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
             let rag_engine = if mode == ServiceMode::All || mode == ServiceMode::Rag {
                 let generator = match (&scheduler, &tokenizer, &chat_template) {
                     (Some(s), Some(t), Some(c)) if inference_url.is_none() => Some(LlmGenerator {
-                        scheduler: s.clone(),
+                        engine: s.clone(),
                         tokenizer: t.clone(),
                         chat_template: c.clone(),
                     }),
@@ -242,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let state = Arc::new(AppState {
-                scheduler,
+                engine: scheduler,
                 tokenizer,
                 chat_template,
                 embedder: Some(embedder),
@@ -250,6 +263,11 @@ async fn main() -> anyhow::Result<()> {
                 inference_url: inference_url.clone(),
                 model_name,
                 mode,
+                limits: ServerLimits {
+                    max_tokens: max_tokens_limit,
+                    ..ServerLimits::default()
+                },
+                metrics: Arc::new(ServerMetrics::default()),
             });
 
             println!("⚡ Serving API at http://{}", addr);
@@ -334,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
                         Arc::new(b.model),
                     )?;
                     Some(LlmGenerator {
-                        scheduler: Arc::new(scheduler),
+                        engine: EngineHandle::start(Arc::new(scheduler), EngineConfig::default()),
                         tokenizer: Arc::new(b.tokenizer),
                         chat_template: Arc::new(b.chat_template),
                     })

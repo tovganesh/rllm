@@ -243,3 +243,89 @@ fn generate_returns_when_its_own_sequence_finishes() {
     assert_eq!(streamed, out);
     assert_eq!(s.num_running(), 1, "the other sequence is still running");
 }
+
+// ───────────────────────────── engine thread ─────────────────────────────
+
+use rllm_scheduler::{EngineConfig, EngineHandle, FinishReason, SequenceEvent, SubmitError};
+
+fn collect(stream: &mut rllm_scheduler::GenerationStream) -> (Vec<u32>, SequenceEvent) {
+    let mut toks = Vec::new();
+    loop {
+        match stream.blocking_next().expect("stream ended without a terminal event") {
+            SequenceEvent::Token(t) => toks.push(t),
+            other => return (toks, other),
+        }
+    }
+}
+
+#[test]
+fn engine_serves_concurrent_requests_from_many_threads() {
+    let m = model();
+    let engine = EngineHandle::start(Arc::new(scheduler(128, 8)), EngineConfig::default());
+    let prompts: Vec<Vec<u32>> = (0..6u32).map(|i| (0..(3 + i as usize * 2)).map(|t| (t as u32 * 7 + i * 5) % 64).collect()).collect();
+    let handles: Vec<_> = prompts
+        .iter()
+        .cloned()
+        .map(|p| {
+            let engine = engine.clone();
+            std::thread::spawn(move || {
+                let mut s = engine.submit(p, greedy(6)).unwrap();
+                collect(&mut s)
+            })
+        })
+        .collect();
+    for (p, h) in prompts.iter().zip(handles) {
+        let (toks, end) = h.join().unwrap();
+        assert_eq!(end, SequenceEvent::Finished(FinishReason::Length));
+        assert_eq!(toks, reference_greedy(&m, p, 6));
+    }
+    let metrics = &engine.scheduler().metrics;
+    assert_eq!(metrics.finished_length.load(std::sync::atomic::Ordering::Relaxed), 6);
+    assert_eq!(metrics.generated_tokens.load(std::sync::atomic::Ordering::Relaxed), 36);
+    engine.shutdown();
+}
+
+#[test]
+fn dropping_the_stream_cancels_and_frees_blocks() {
+    let total = 64;
+    let engine = EngineHandle::start(Arc::new(scheduler(total, 4)), EngineConfig::default());
+    let mut s = engine.submit(PROMPT_A.to_vec(), greedy(100)).unwrap();
+    // Receive a couple of tokens, then disconnect.
+    for _ in 0..2 {
+        assert!(matches!(s.blocking_next(), Some(SequenceEvent::Token(_))));
+    }
+    drop(s);
+    let sched = engine.scheduler().clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sched.num_running() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(sched.num_running(), 0, "cancelled sequence must be retired");
+    assert_eq!(sched.metrics.finished_abort.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(sched.num_free_blocks() + sched.num_cached_blocks(), total);
+    engine.shutdown();
+}
+
+#[test]
+fn engine_rejects_invalid_and_overload() {
+    let engine = EngineHandle::start(Arc::new(scheduler(64, 1)), EngineConfig { max_waiting: 0 });
+    assert!(matches!(engine.submit(vec![1, 2], greedy(4)), Err(SubmitError::Overloaded { .. })));
+    engine.shutdown();
+    assert_eq!(engine.submit(vec![1], greedy(1)).err(), Some(SubmitError::ShutDown));
+
+    let engine = EngineHandle::start(Arc::new(scheduler(64, 1)), EngineConfig::default());
+    assert!(matches!(engine.submit(vec![], greedy(4)), Err(SubmitError::Invalid(_))));
+    assert!(matches!(engine.submit(vec![1], greedy(0)), Err(SubmitError::Invalid(_))));
+    engine.shutdown();
+}
+
+#[test]
+fn oversized_sequence_gets_a_terminal_event_instead_of_looping() {
+    // 4 blocks x 4 tokens = 16 slots; a 10-token prompt asking for 50 tokens outgrows it.
+    let engine = EngineHandle::start(Arc::new(scheduler(4, 1)), EngineConfig::default());
+    let mut s = engine.submit((0..10).collect(), greedy(50)).unwrap();
+    let (toks, end) = collect(&mut s);
+    assert_eq!(end, SequenceEvent::Finished(FinishReason::Length));
+    assert!(toks.len() < 50);
+    engine.shutdown();
+}

@@ -19,7 +19,7 @@ use crate::reranker::CrossEncoderReranker;
 use parking_lot::Mutex;
 use rllm_core::{backend::Backend, error::{Result, RllmError}};
 use rllm_models::{BpeTokenizer, ChatMessage, ChatTemplate, TextEmbedder};
-use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, Sequence};
+use rllm_scheduler::{EngineHandle, SamplingParams, SequenceEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,8 +97,8 @@ pub struct Retrieval {
 
 /// A local LLM used to write grounded answers.
 pub struct LlmGenerator<B: Backend> {
-    /// Scheduler running the model.
-    pub scheduler: Arc<ContinuousBatchScheduler<B>>,
+    /// Engine running the model.
+    pub engine: EngineHandle<B>,
     /// The model's tokenizer.
     pub tokenizer: Arc<BpeTokenizer>,
     /// The model's chat template.
@@ -108,7 +108,7 @@ pub struct LlmGenerator<B: Backend> {
 impl<B: Backend> Clone for LlmGenerator<B> {
     fn clone(&self) -> Self {
         Self {
-            scheduler: self.scheduler.clone(),
+            engine: self.engine.clone(),
             tokenizer: self.tokenizer.clone(),
             chat_template: self.chat_template.clone(),
         }
@@ -271,8 +271,7 @@ impl<B: Backend> RagEngine<B> {
 
         let (answer, answer_source, generated_tokens) = match &self.generator {
             Some(generator) => {
-                let generator = generator.clone();
-                let max_pos = generator.scheduler.model.config.max_position_embeddings;
+                let max_pos = generator.engine.scheduler().model.config.max_position_embeddings;
                 // Drop the weakest sources until the prompt leaves room for the answer.
                 let prompt_tokens = loop {
                     let prompt = generator.chat_template.render(&grounded_messages(query, &citations), true)?;
@@ -284,12 +283,18 @@ impl<B: Backend> RagEngine<B> {
                 };
                 sampling.stop_tokens = generator.tokenizer.stop_token_ids.clone();
                 let stops = sampling.stop_tokens.clone();
-                let block_size = generator.scheduler.config.block_size;
-                let seq = Sequence::new(rand::random::<u64>(), prompt_tokens, sampling, block_size, None);
-                let scheduler = generator.scheduler.clone();
-                let mut out = tokio::task::spawn_blocking(move || scheduler.generate(seq, |_| {}))
-                    .await
-                    .map_err(|e| RllmError::RagError(format!("generation task failed: {e}")))??;
+                let mut stream = generator
+                    .engine
+                    .submit(prompt_tokens, sampling)
+                    .map_err(|e| RllmError::RagError(e.to_string()))?;
+                let mut out = Vec::new();
+                while let Some(event) = stream.next().await {
+                    match event {
+                        SequenceEvent::Token(t) => out.push(t),
+                        SequenceEvent::Finished(_) => break,
+                        SequenceEvent::Error(e) => return Err(RllmError::RagError(e)),
+                    }
+                }
                 let generated = out.len();
                 if out.last().is_some_and(|t| stops.contains(t)) {
                     out.pop();

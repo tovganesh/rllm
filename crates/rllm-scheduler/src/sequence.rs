@@ -19,6 +19,17 @@ pub enum FinishReason {
     Abort,
 }
 
+/// Event delivered to the owner of a sequence through its channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SequenceEvent {
+    /// A newly generated token.
+    Token(u32),
+    /// Generation finished; no further events follow.
+    Finished(FinishReason),
+    /// Generation failed; no further events follow.
+    Error(String),
+}
+
 /// Lifecycle status of an individual sequence in the continuous batching scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SequenceStatus {
@@ -44,8 +55,9 @@ pub struct Sequence {
     pub block_table: BlockTable,
     /// Sampling hyperparameters (temperature, top_p, top_k, repetition penalty).
     pub sampling_params: SamplingParams,
-    /// Optional Tokio channel sender for streaming tokens back to the HTTP client.
-    pub sender: Option<UnboundedSender<u32>>,
+    /// Channel to the sequence's owner. Dropping the receiving end cancels the sequence
+    /// at the next scheduler step.
+    pub sender: Option<UnboundedSender<SequenceEvent>>,
     /// Number of leading tokens whose keys/values are already in the KV cache
     /// (from prefix-cache reuse or earlier forward passes).
     pub num_computed_tokens: usize,
@@ -58,7 +70,7 @@ impl Sequence {
         prompt_tokens: Vec<u32>,
         sampling_params: SamplingParams,
         block_size: usize,
-        sender: Option<UnboundedSender<u32>>,
+        sender: Option<UnboundedSender<SequenceEvent>>,
     ) -> Self {
         Self {
             id,
@@ -105,17 +117,40 @@ impl Sequence {
         }
     }
 
-    /// Appends a newly sampled token, emits it to the streaming channel, and checks stop criteria.
+    /// Appends a newly sampled token, emits it to the owner, and checks stop criteria.
+    /// If the owner has gone away, the sequence is marked `Finished(Abort)`.
     pub fn append_token(&mut self, token: u32) {
         self.output_tokens.push(token);
-        if let Some(ref tx) = self.sender {
-            let _ = tx.send(token);
+        if let Some(tx) = &self.sender {
+            if tx.send(SequenceEvent::Token(token)).is_err() {
+                self.status = SequenceStatus::Finished(FinishReason::Abort);
+                return;
+            }
         }
 
         if self.sampling_params.stop_tokens.contains(&token) {
             self.status = SequenceStatus::Finished(FinishReason::Stop);
         } else if self.output_tokens.len() >= self.sampling_params.max_tokens {
             self.status = SequenceStatus::Finished(FinishReason::Length);
+        }
+    }
+
+    /// Whether the owner dropped its receiver (client disconnected / request cancelled).
+    pub fn is_cancelled(&self) -> bool {
+        self.sender.as_ref().is_some_and(|tx| tx.is_closed())
+    }
+
+    /// Sends the terminal `Finished` event if the sequence has finished.
+    pub fn notify_finished(&self) {
+        if let (SequenceStatus::Finished(reason), Some(tx)) = (self.status, &self.sender) {
+            let _ = tx.send(SequenceEvent::Finished(reason));
+        }
+    }
+
+    /// Sends a terminal `Error` event.
+    pub fn notify_error(&self, message: &str) {
+        if let Some(tx) = &self.sender {
+            let _ = tx.send(SequenceEvent::Error(message.to_string()));
         }
     }
 }

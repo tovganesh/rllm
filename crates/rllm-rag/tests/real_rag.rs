@@ -5,7 +5,7 @@
 use rllm_backend_cpu::CpuBackend;
 use rllm_models::{GgufBundle, LoadOptions, TextEmbedder};
 use rllm_rag::{LlmGenerator, RagEngine};
-use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, SchedulerConfig};
+use rllm_scheduler::{ContinuousBatchScheduler, EngineConfig, EngineHandle, SamplingParams, SchedulerConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ fn engine(with_llm: bool) -> Option<RagEngine<CpuBackend>> {
         )
         .unwrap();
         LlmGenerator {
-            scheduler: Arc::new(scheduler),
+            engine: EngineHandle::start(Arc::new(scheduler), EngineConfig::default()),
             tokenizer: Arc::new(b.tokenizer),
             chat_template: Arc::new(b.chat_template),
         }

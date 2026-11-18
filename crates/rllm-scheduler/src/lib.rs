@@ -9,16 +9,18 @@
 //!   retrieved RAG passages) for instant 0 ms Time-To-First-Token (TTFT).
 
 pub mod block_allocator;
+pub mod engine;
 pub mod prefix_cache;
 pub mod sampler;
 pub mod scheduler;
 pub mod sequence;
 
 pub use block_allocator::BlockAllocator;
+pub use engine::{EngineConfig, EngineHandle, GenerationStream, SubmitError};
 pub use prefix_cache::PrefixCache;
 pub use sampler::{Sampler, SamplingParams};
-pub use scheduler::{ContinuousBatchScheduler, SchedulerConfig};
-pub use sequence::{FinishReason, Sequence, SequenceStatus};
+pub use scheduler::{ContinuousBatchScheduler, SchedulerConfig, SchedulerMetrics};
+pub use sequence::{FinishReason, Sequence, SequenceEvent, SequenceStatus};
 
 #[cfg(test)]
 mod tests {
