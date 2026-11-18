@@ -15,6 +15,7 @@ pub mod embedding;
 pub mod gguf;
 pub mod init;
 pub mod llama;
+pub mod lm;
 pub mod loader;
 pub mod perplexity;
 pub mod tokenizer;
@@ -27,6 +28,7 @@ pub use config::{BertConfig, BertPooling, LlamaConfig};
 pub use embedding::{BertEmbeddingModel, EmbeddingTokenizer, TextEmbedder};
 pub use gguf::{GgmlType, GgufFile, GgufTensorInfo, GgufValue, MappedGguf};
 pub use llama::{ForwardBatch, LlamaModel};
+pub use lm::LanguageModel;
 pub use loader::{GgufBundle, LoadOptions};
 pub use perplexity::{perplexity, Perplexity};
 pub use tokenizer::{

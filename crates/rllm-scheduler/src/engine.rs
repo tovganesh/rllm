@@ -13,7 +13,6 @@ use crate::sampler::SamplingParams;
 use crate::scheduler::ContinuousBatchScheduler;
 use crate::sequence::{Sequence, SequenceEvent};
 use parking_lot::{Condvar, Mutex};
-use rllm_core::backend::Backend;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -67,13 +66,13 @@ impl Shared {
 }
 
 /// Cloneable handle to a running engine.
-pub struct EngineHandle<B: Backend> {
-    scheduler: Arc<ContinuousBatchScheduler<B>>,
+pub struct EngineHandle {
+    scheduler: Arc<ContinuousBatchScheduler>,
     shared: Arc<Shared>,
     config: EngineConfig,
 }
 
-impl<B: Backend> Clone for EngineHandle<B> {
+impl Clone for EngineHandle {
     fn clone(&self) -> Self {
         Self {
             scheduler: self.scheduler.clone(),
@@ -83,9 +82,9 @@ impl<B: Backend> Clone for EngineHandle<B> {
     }
 }
 
-impl<B: Backend> EngineHandle<B> {
+impl EngineHandle {
     /// Starts the engine thread for `scheduler`.
-    pub fn start(scheduler: Arc<ContinuousBatchScheduler<B>>, config: EngineConfig) -> Self {
+    pub fn start(scheduler: Arc<ContinuousBatchScheduler>, config: EngineConfig) -> Self {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             work: Mutex::new(false),
@@ -110,7 +109,7 @@ impl<B: Backend> EngineHandle<B> {
     }
 
     /// The scheduler driven by this engine (for configuration and gauges).
-    pub fn scheduler(&self) -> &Arc<ContinuousBatchScheduler<B>> {
+    pub fn scheduler(&self) -> &Arc<ContinuousBatchScheduler> {
         &self.scheduler
     }
 
@@ -173,7 +172,7 @@ impl GenerationStream {
     }
 }
 
-fn run<B: Backend>(scheduler: Arc<ContinuousBatchScheduler<B>>, shared: Arc<Shared>) {
+fn run(scheduler: Arc<ContinuousBatchScheduler>, shared: Arc<Shared>) {
     while !shared.stop.load(Ordering::Acquire) {
         if scheduler.has_work() {
             if let Err(e) = scheduler.step() {

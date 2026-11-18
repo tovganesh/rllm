@@ -1,0 +1,12 @@
+{
+ "generator": "llama-perplexity -c 128 -ngl 99 on LICENSE",
+ "ctx": 128,
+ "text": "LICENSE",
+ "ppl": {
+  "Q8_0": 12.3975,
+  "Q4_0": 15.6738,
+  "Q4_K_M": 12.8523,
+  "Q5_K_M": 12.6854,
+  "F16": 12.3966
+ }
+}

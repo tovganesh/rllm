@@ -10,13 +10,10 @@ use crate::sampler::Sampler;
 use crate::sequence::{FinishReason, Sequence, SequenceEvent, SequenceStatus};
 use parking_lot::Mutex;
 use rllm_core::{
-    backend::{Backend, BlockTable},
-    dtype::DType,
+    backend::BlockTable,
     error::{Result, RllmError},
-    shape::Shape,
-    tensor::Tensor,
 };
-use rllm_models::{ForwardBatch, LlamaModel};
+use rllm_models::{ForwardBatch, LanguageModel};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -53,8 +50,6 @@ struct EngineState {
     running: Vec<Sequence>,
     allocator: BlockAllocator,
     prefix_cache: PrefixCache,
-    k_caches: Vec<Tensor>,
-    v_caches: Vec<Tensor>,
     num_preemptions: u64,
 }
 
@@ -102,11 +97,11 @@ impl SchedulerMetrics {
 /// - the newest token of every sequence already decoding,
 ///
 /// then samples one token per sequence.
-pub struct ContinuousBatchScheduler<B: Backend> {
+pub struct ContinuousBatchScheduler {
     /// Scheduler configuration parameters.
     pub config: SchedulerConfig,
     /// Shared reference to the underlying LLM model.
-    pub model: Arc<LlamaModel<B>>,
+    pub model: Arc<dyn LanguageModel>,
     waiting: Mutex<VecDeque<Sequence>>,
     state: Mutex<EngineState>,
     next_id: AtomicU64,
@@ -114,9 +109,9 @@ pub struct ContinuousBatchScheduler<B: Backend> {
     pub metrics: SchedulerMetrics,
 }
 
-impl<B: Backend> ContinuousBatchScheduler<B> {
+impl ContinuousBatchScheduler {
     /// Constructs and initializes the scheduler, pre-allocating contiguous KV cache pools.
-    pub fn new(config: SchedulerConfig, model: Arc<LlamaModel<B>>) -> Result<Self> {
+    pub fn new(config: SchedulerConfig, model: Arc<dyn LanguageModel>) -> Result<Self> {
         if config.block_size == 0 || config.total_blocks == 0 || config.max_batch_size == 0 {
             return Err(RllmError::BackendError(
                 "SchedulerConfig: block_size, total_blocks and max_batch_size must be > 0"
@@ -125,18 +120,7 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
         }
         let block_size = config.block_size;
         let total_blocks = config.total_blocks;
-        let num_layers = model.config.num_hidden_layers;
-        let num_kv_heads = model.config.num_key_value_heads;
-        let head_dim = model.config.head_dim();
-        let dev = model.backend.device();
-
-        let mut k_caches = Vec::with_capacity(num_layers);
-        let mut v_caches = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
-            let shape = Shape::new(vec![total_blocks, num_kv_heads, block_size, head_dim]);
-            k_caches.push(Tensor::zeros(shape.clone(), DType::F32, dev)?);
-            v_caches.push(Tensor::zeros(shape, DType::F32, dev)?);
-        }
+        model.init_kv_cache(total_blocks, block_size)?;
 
         info!(
             "ContinuousBatchScheduler initialized: {} total blocks (block_size={}), max batch size={}",
@@ -151,8 +135,6 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
                 running: Vec::new(),
                 allocator: BlockAllocator::new(block_size, total_blocks),
                 prefix_cache: PrefixCache::new(block_size),
-                k_caches,
-                v_caches,
                 num_preemptions: 0,
             }),
             next_id: AtomicU64::new(1),
@@ -169,7 +151,7 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
     /// context window and the KV pool, with token IDs inside the vocabulary.
     pub fn validate(&self, seq: &Sequence) -> Result<()> {
         let prompt_len = seq.prompt_tokens.len();
-        let max_pos = self.model.config.max_position_embeddings;
+        let max_pos = self.model.config().max_position_embeddings;
         if prompt_len == 0 {
             return Err(RllmError::BackendError("Sequence prompt is empty".to_string()));
         }
@@ -189,11 +171,11 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
         if let Some(&bad) = seq
             .prompt_tokens
             .iter()
-            .find(|&&t| t as usize >= self.model.config.vocab_size)
+            .find(|&&t| t as usize >= self.model.config().vocab_size)
         {
             return Err(RllmError::BackendError(format!(
                 "Token ID {} exceeds vocabulary size {}",
-                bad, self.model.config.vocab_size
+                bad, self.model.config().vocab_size
             )));
         }
         if seq.sampling_params.max_tokens == 0 {
@@ -235,8 +217,6 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
             running,
             allocator,
             prefix_cache,
-            k_caches,
-            v_caches,
             num_preemptions,
         } = &mut *state;
 
@@ -349,25 +329,20 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
             .prefill_tokens
             .fetch_add((tokens.len() - decode_rows) as u64, Ordering::Relaxed);
         let started = Instant::now();
-        let logits = self.model.forward(
-            &ForwardBatch {
-                tokens: &tokens,
-                positions: &positions,
-                block_tables: &row_tables,
-                logits_rows: &logits_rows,
-            },
-            k_caches,
-            v_caches,
-        )?;
+        let logits_slice = self.model.forward_cached(&ForwardBatch {
+            tokens: &tokens,
+            positions: &positions,
+            block_tables: &row_tables,
+            logits_rows: &logits_rows,
+        })?;
         self.metrics.forward_passes.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .forward_time_us
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         // 4. Sample the next token of every sequence.
-        let vocab_size = self.model.config.vocab_size;
-        let max_pos = self.model.config.max_position_embeddings;
-        let logits_slice = logits.as_f32_slice()?;
+        let vocab_size = self.model.config().vocab_size;
+        let max_pos = self.model.config().max_position_embeddings;
         let mut generated = Vec::with_capacity(running.len());
         for (idx, seq) in running.iter_mut().enumerate() {
             seq.num_computed_tokens = seq.total_tokens();

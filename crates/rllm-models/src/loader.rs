@@ -206,6 +206,7 @@ impl<B: Backend> LlamaModel<B> {
             lm_head,
             cos_table,
             sin_table,
+            kv_cache: Default::default(),
         })
     }
 }

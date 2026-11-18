@@ -44,6 +44,8 @@ pub struct LlamaModel<B: Backend> {
     pub lm_head: Tensor,
     pub cos_table: Tensor,
     pub sin_table: Tensor,
+    /// KV cache used by [`crate::LanguageModel::forward_cached`].
+    pub(crate) kv_cache: std::sync::Mutex<crate::lm::KvCache>,
 }
 
 impl<B: Backend> LlamaModel<B> {
@@ -105,6 +107,7 @@ impl<B: Backend> LlamaModel<B> {
             lm_head,
             cos_table,
             sin_table,
+            kv_cache: Default::default(),
         })
     }
 
