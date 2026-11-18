@@ -23,6 +23,7 @@ pub fn swiglu_f32(gate: &[f32], up: &[f32], out: &mut [f32]) {
     out.par_iter_mut()
         .zip(gate.par_iter())
         .zip(up.par_iter())
+        .with_min_len(super::ELEMENTWISE_GRAIN)
         .for_each(|((o, &g), &u)| {
             *o = silu(g) * u;
         });
@@ -34,6 +35,7 @@ pub fn gelu_f32(x: &[f32], out: &mut [f32]) {
 
     out.par_iter_mut()
         .zip(x.par_iter())
+        .with_min_len(super::ELEMENTWISE_GRAIN)
         .for_each(|(o, &val)| {
             *o = gelu(val);
         });

@@ -29,6 +29,11 @@ use std::time::Instant;
 #[command(name = "rllm")]
 #[command(about = "Enterprise-Grade LLM Inference & High-Performance RAG Engine in Rust", long_about = None)]
 struct Cli {
+    /// CPU worker threads (default: performance cores on Apple Silicon, otherwise all
+    /// cores; RAYON_NUM_THREADS is also honoured)
+    #[arg(long, global = true)]
+    threads: Option<usize>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -121,6 +126,21 @@ enum Commands {
         max_context: usize,
     },
 
+    /// Measure perplexity of a GGUF model on a text file (llama.cpp's protocol:
+    /// non-overlapping chunks of --ctx tokens, scoring the second half of each chunk)
+    Perplexity {
+        #[arg(long)]
+        model: std::path::PathBuf,
+
+        /// UTF-8 text file to score
+        #[arg(long)]
+        file: std::path::PathBuf,
+
+        /// Tokens per chunk
+        #[arg(long, default_value_t = 128)]
+        ctx: usize,
+    },
+
     /// Run high-throughput inference performance benchmark
     Bench {
         /// Target model architecture preset: 'edge-4gb' (~400M params, fits in 4GB), 'llama-1b', or 'tiny'
@@ -167,6 +187,8 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    let threads = rllm_backend_cpu::threads::init_thread_pool(cli.threads);
+    tracing::info!("Using {threads} CPU worker threads");
 
     match cli.command {
         Commands::Serve {
@@ -201,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
                     let bundle = GgufBundle::load(
                         &model,
                         backend.clone(),
-                        &LoadOptions { max_context: Some(max_context) },
+                        &LoadOptions { max_context: Some(max_context), ..LoadOptions::default() },
                     )?;
                     model_name = std::path::Path::new(&model)
                         .file_stem()
@@ -313,6 +335,10 @@ async fn main() -> anyhow::Result<()> {
             })?;
         }
 
+        Commands::Perplexity { model, file, ctx } => {
+            run_perplexity(&model, &file, ctx)?;
+        }
+
         Commands::Bench {
             preset,
             batch_size,
@@ -341,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
             let embedder = Arc::new(load_embedder(embedding_model.as_deref(), backend.clone())?);
             let generator = match model {
                 Some(path) => {
-                    let b = GgufBundle::load(&path, backend.clone(), &LoadOptions { max_context: Some(4096) })?;
+                    let b = GgufBundle::load(&path, backend.clone(), &LoadOptions { max_context: Some(4096), ..LoadOptions::default() })?;
                     let scheduler = ContinuousBatchScheduler::new(
                         SchedulerConfig {
                             max_batch_size: 1,
@@ -431,7 +457,7 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     let bundle = GgufBundle::load(
         &args.model,
         Arc::new(CpuBackend),
-        &LoadOptions { max_context: Some(args.max_context) },
+        &LoadOptions { max_context: Some(args.max_context), ..LoadOptions::default() },
     )?;
     let load_time = load_start.elapsed();
     let tokenizer = &bundle.tokenizer;
@@ -505,4 +531,25 @@ fn load_embedder(path: Option<&std::path::Path>, backend: Arc<CpuBackend>) -> an
         Some(p) => TextEmbedder::from_gguf(p, backend)?,
         None => TextEmbedder::synthetic(BertConfig::tiny_test_config(), backend)?,
     })
+}
+
+/// `rllm perplexity`: mirrors `llama-perplexity` so results can be compared directly.
+fn run_perplexity(model: &std::path::Path, file: &std::path::Path, ctx: usize) -> anyhow::Result<()> {
+    let bundle = GgufBundle::load(model, Arc::new(CpuBackend), &LoadOptions { max_context: Some(ctx), ..LoadOptions::default() })?;
+    let text = std::fs::read_to_string(file)?;
+    let tokens = bundle.tokenizer.encode(&text, true, false);
+    let bos = if bundle.tokenizer.add_bos { bundle.tokenizer.bos_token_id } else { None };
+    let start = Instant::now();
+    let p = rllm_models::perplexity(&bundle.model, &tokens, ctx, bos)?;
+    let secs = start.elapsed().as_secs_f64();
+    println!(
+        "{} chunks of {} tokens, {} scored: PPL = {:.4} ({:.2}s, {:.0} tok/s)",
+        p.chunks,
+        ctx,
+        p.scored_tokens,
+        p.ppl,
+        secs,
+        (p.chunks * ctx) as f64 / secs
+    );
+    Ok(())
 }

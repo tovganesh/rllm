@@ -7,7 +7,7 @@
 A modular, multi-backend LLM inference engine and hybrid RAG platform written in Rust from the ground up.
 
 > [!WARNING]
-> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU, with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. It is several times slower than llama.cpp and has no GPU backend. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
+> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU, with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. On Apple Silicon its CPU prefill is faster than llama.cpp's CPU backend and decode is 15–35% slower; there is no GPU backend. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
 
 ---
 
@@ -21,10 +21,10 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | :--- | :---: | :--- |
 | Tensor, `Shape`, `DType`, `Device`, `Backend` trait (`rllm-core`) | ✅ | Strided views exist, but CPU kernels assume contiguous inputs. |
 | CPU F32 kernels: GEMV, RMSNorm, LayerNorm, RoPE, SwiGLU, GELU, softmax | ✅ | GEMV/dot use ARM NEON on `aarch64`, scalar elsewhere; Rayon-parallel. |
-| CPU GEMM | 🟡 | Row-parallel; `A·Wᵀ` uses contiguous dot products, `A·B` a row-streaming AXPY loop. Not cache-tiled. |
-| Q4_0 / Q8_0 quantized linear layers (no full dequantization) | ✅ | Decode uses GEMV on quantized blocks; prefill dequantizes one weight row at a time and reuses it across all prompt rows. Scalar inner loop; not yet SIMD. |
-| F16, BF16, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K weights | 🟡 | Dequantized to F32 at load (correct, but uses 4 bytes per weight). Native compute is planned. |
-| AVX2 / AVX-512 kernels | 📋 | |
+| CPU GEMM | ✅ / 🟡 | Batches of 32+ rows use Accelerate `cblas_sgemm` on macOS (Apple matrix units); elsewhere a portable row-parallel kernel (not cache-tiled). |
+| Q4_0 / Q8_0 quantized linear layers | ✅ | Decode quantizes activations to Q8 and uses ARM `SDOT` int8 dot products (runtime-detected; scalar fallback); batches of 32+ rows dequantize and use the GEMM above. |
+| F16, BF16, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K weights | 🟡 | K-quant and other 4–6-bit formats are converted to Q8_0 at load (≈2× the file size in RAM; perplexity within 0.25% of llama.cpp); F16 / BF16 become F32. Native K-quant kernels are planned. |
+| AVX2 / AVX-512 kernels | 📋 | x86 uses portable scalar int8 kernels. |
 | PagedAttention kernel (CPU) | ✅ | Causal prefill and batched decode; parallel over (row, head). |
 | Metal backend | ⛔ | MSL shader source exists; every `Backend` method returns an error. |
 | CUDA backend | 📋 | No crate yet. |
@@ -85,8 +85,8 @@ The P0 correctness issues found in the initial review (stride-ignoring matmul on
 Remaining limitations:
 
 1. **Only LLaMA-architecture GGUF models with a byte-level BPE tokenizer load.** Qwen2 (attention biases, NeoX RoPE), Gemma, Phi, and SentencePiece tokenizers are not supported yet.
-2. **CPU only, and slower than llama.cpp.** On an Apple M4 (CPU, SmolLM2-135M Q8_0) rllm prefills ~340 tok/s and decodes ~70 tok/s versus llama.cpp's ~2,900 and ~360. See [BENCHMARKS](docs/BENCHMARKS.md).
-3. **Non-Q8_0/Q4_0 weights are expanded to F32 at load**, so a Q4_K_M file uses about 8× its file size in RAM.
+2. **CPU only.** On an Apple M4 (4 threads, SmolLM2-135M) rllm's prefill is faster than llama.cpp's CPU backend (pp512 ~1,890 vs ~1,310 tok/s for Q8_0) but decode is 15–35% slower (Q8_0 340 vs 399 tok/s). There is no GPU backend. See [BENCHMARKS](docs/BENCHMARKS.md).
+3. **K-quant weights are converted to Q8_0 at load**, so a Q4_K_M file uses about 2× its file size in RAM; F16 / BF16 files use 2× (F32).
 4. **Small models rarely write `[n]` citations.** SmolLM2-135M answers correctly from the sources but usually without citation markers; the response then carries a warning. Dense thresholds are calibrated only for bge-small-en-v1.5 and all-MiniLM-L6-v2. The reranker is lexical, not a neural cross-encoder.
 5. **No authentication, per-client rate limiting or TLS** — put rllm behind a reverse proxy for anything exposed. A single engine thread serves one model per process.
 6. **The prefix cache only records completed sequences** and shares whole blocks only (no copy-on-write of partial blocks).
@@ -98,7 +98,7 @@ Remaining limitations:
 - **P0 — Correctness:** ✅ done — projection layout, causal prefill, per-token RoPE, prefix-cache block ownership, aligned storage, input bounds, numerical reference tests.
 - **P1 — Real models:** ✅ done — GGUF loading, BPE and WordPiece tokenizers, chat templates, `rllm generate`, real-model chat completions, BERT embedding models, LLM-generated RAG answers with verified citations.
 - **P2 — Serving:** ✅ done — dedicated engine thread with per-request channels, SSE streaming, cancellation on disconnect, queue/`max_tokens`/body limits with 429s, structured errors, Prometheus metrics, graceful shutdown.
-- **P3 — Performance & backends:** tiled GEMM, SIMD quantized kernels, Q4_K, F16 KV cache, Metal pipeline dispatch, CUDA behind a feature flag; re-benchmark against a real model.
+- **P3 — Performance & backends:** 🟡 CPU done — int8 `SDOT` kernels, Accelerate GEMM, thread/parallelism tuning, GQA-grouped attention, K-quant → Q8_0 at load, perplexity parity tests. Remaining: native K-quant kernels, F16 KV cache, x86 SIMD, Metal and CUDA backends.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the target design and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for benchmark status.
 

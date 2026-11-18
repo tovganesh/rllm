@@ -16,6 +16,7 @@ pub mod gguf;
 pub mod init;
 pub mod llama;
 pub mod loader;
+pub mod perplexity;
 pub mod tokenizer;
 pub mod weights;
 pub mod wordpiece;
@@ -27,6 +28,7 @@ pub use embedding::{BertEmbeddingModel, EmbeddingTokenizer, TextEmbedder};
 pub use gguf::{GgmlType, GgufFile, GgufTensorInfo, GgufValue, MappedGguf};
 pub use llama::{ForwardBatch, LlamaModel};
 pub use loader::{GgufBundle, LoadOptions};
+pub use perplexity::{perplexity, Perplexity};
 pub use tokenizer::{
     Tokenizer, ASSISTANT_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, SYSTEM_TOKEN_ID,
     UNK_TOKEN_ID, USER_TOKEN_ID,

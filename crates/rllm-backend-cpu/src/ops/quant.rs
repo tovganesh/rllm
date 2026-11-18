@@ -134,6 +134,22 @@ pub fn gemv_q8_0_f32(
         });
 }
 
+/// Quantizes an F32 slice (length a multiple of 32) into `Q8_0` blocks, like ggml's
+/// reference `quantize_row_q8_0`.
+pub fn quantize_f32_to_q8_0(src: &[f32], dst: &mut [u8]) {
+    assert_eq!(src.len() % QK8_0, 0);
+    assert_eq!(dst.len(), src.len() / QK8_0 * 34);
+    for (block, out) in src.chunks_exact(QK8_0).zip(dst.chunks_exact_mut(34)) {
+        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        out[..2].copy_from_slice(&f16::from_f32(d).to_le_bytes());
+        for (o, v) in out[2..].iter_mut().zip(block) {
+            *o = (v * id).round() as i8 as u8;
+        }
+    }
+}
+
 /// Quantizes an uncompressed F32 slice into `Q4_0` format blocks.
 pub fn quantize_f32_to_q4_0(src: &[f32], dst: &mut [u8]) {
     let k = src.len();

@@ -1,11 +1,11 @@
 {
  "model": "SmolLM2-135M-Instruct-Q4_0.requant.gguf",
- "generator": "llama-completion greedy (--temp 0 --top-k 1), -n 32",
+ "generator": "llama-completion greedy on CPU (--temp 0 --top-k 1 -ngl 0), -n 32",
  "cases": [
   {
    "prompt": "The capital of France is",
    "max_tokens": 32,
-   "completion": " the capital of the 20th arrondissement, the 20th arrondissement is the 20th arrondissement",
+   "completion": " the capital of the 20th arrondissement, the 21st arrondissement, and the 22nd arrondisse",
    "stopped_on_eos": false
   },
   {
@@ -17,13 +17,13 @@
   {
    "prompt": "Rust is a systems programming language that",
    "max_tokens": 32,
-   "completion": " is used to write and run operating systems, but it is also used to write and run other systems programming languages. It is a C-like language that is",
+   "completion": " is used to write and run operating systems, but it is also used to write and run other systems programming languages. It is a type of programming language that is",
    "stopped_on_eos": false
   },
   {
    "prompt": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nWhat is the boiling point of water at sea level?<|im_end|>\n<|im_start|>assistant\n",
    "max_tokens": 32,
-   "completion": "At sea level, the boiling point of water is approximately 212 degrees Fahrenheit (100 degrees Celsius). This is because the pressure at sea level",
+   "completion": "At sea level, the boiling point of water is approximately 100°C (212°F). This is because the pressure at sea level",
    "stopped_on_eos": false
   }
  ]

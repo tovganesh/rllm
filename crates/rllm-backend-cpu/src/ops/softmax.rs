@@ -8,7 +8,7 @@ use rayon::prelude::*;
 pub fn softmax_inplace(x: &mut [f32], row_len: usize) {
     debug_assert_eq!(x.len() % row_len, 0);
 
-    x.par_chunks_mut(row_len).for_each(|row| {
+    x.par_chunks_mut(row_len).with_min_len((super::ELEMENTWISE_GRAIN / row_len.max(1)).max(1)).for_each(|row| {
         let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum_exp = 0.0f32;
         for val in row.iter_mut() {

@@ -32,7 +32,7 @@ fn engine(with_llm: bool) -> Option<RagEngine<CpuBackend>> {
     let backend = Arc::new(CpuBackend);
     let embedder = Arc::new(TextEmbedder::from_gguf(&emb_path, backend.clone()).unwrap());
     let generator = with_llm.then(|| {
-        let b = GgufBundle::load(&llm_path, backend, &LoadOptions { max_context: Some(2048) }).unwrap();
+        let b = GgufBundle::load(&llm_path, backend, &LoadOptions { max_context: Some(2048), ..LoadOptions::default() }).unwrap();
         let scheduler = ContinuousBatchScheduler::new(
             SchedulerConfig { max_batch_size: 4, block_size: 16, total_blocks: 256, ..SchedulerConfig::default() },
             Arc::new(b.model),

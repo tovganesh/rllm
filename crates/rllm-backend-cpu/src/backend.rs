@@ -2,8 +2,10 @@ use crate::ops::{
     activations::swiglu_f32,
     gemm::{gemm_f32, gemm_nt_f32},
     norm::rms_norm_f32,
-    paged_attn::paged_attention_head,
-    quant::{dequantize_q4_0, dequantize_q8_0, gemv_q4_0_f32, gemv_q8_0_f32, linear_quantized_f32},
+    paged_attn::paged_attention_kv_group,
+    blas::sgemm_nt,
+    qdot::{gemv_quantized, linear_quantized},
+    quant::{dequantize_q4_0, dequantize_q8_0, gemv_q4_0_f32, gemv_q8_0_f32},
     rope::rope_f32,
     softmax::softmax_inplace,
 };
@@ -16,6 +18,10 @@ use rllm_core::{
     shape::Shape,
     tensor::Tensor,
 };
+
+/// Batches with at least this many rows use dequantized-weight F32 GEMM instead of
+/// integer dot products (llama.cpp uses the same cut-over for its BLAS path).
+pub const BATCHED_F32_MIN_ROWS: usize = 32;
 
 #[derive(Debug, Clone, Default)]
 pub struct CpuBackend;
@@ -65,7 +71,11 @@ impl Backend for CpuBackend {
         if b.is_contiguous() {
             gemm_f32(a_slice, b.as_f32_slice()?, out_slice, m, k, n);
         } else if is_transposed_contiguous {
-            gemm_nt_f32(a_slice, b.storage_f32_slice()?, out_slice, m, k, n);
+            if m >= BATCHED_F32_MIN_ROWS {
+                sgemm_nt(a_slice, b.storage_f32_slice()?, out_slice, m, k, n);
+            } else {
+                gemm_nt_f32(a_slice, b.storage_f32_slice()?, out_slice, m, k, n);
+            }
         } else {
             let b = b.contiguous()?;
             gemm_f32(a_slice, b.as_f32_slice()?, out_slice, m, k, n);
@@ -100,9 +110,9 @@ impl Backend for CpuBackend {
             return y.reshape(Shape::new(out_dims));
         }
 
-        let gemv: fn(&[u8], &[f32], &mut [f32], usize, usize) = match w.dtype() {
-            DType::Q8_0 => gemv_q8_0_f32,
-            DType::Q4_0 => gemv_q4_0_f32,
+        let is_q8 = match w.dtype() {
+            DType::Q8_0 => true,
+            DType::Q4_0 => false,
             other => {
                 return Err(RllmError::UnsupportedOp {
                     op: "linear",
@@ -130,12 +140,24 @@ impl Backend for CpuBackend {
         let mut out = Tensor::zeros(Shape::new(out_dims), DType::F32, Device::Cpu)?;
         let out_slice = out.as_mut_f32_slice()?;
         let m = x_slice.len() / k;
-        if m == 1 {
-            // Decode: a single GEMV on the quantized blocks.
-            gemv(w_bytes, x_slice, out_slice, n, k);
+        if m >= BATCHED_F32_MIN_ROWS {
+            // Large batches (prefill): dequantize the weight and use an F32 GEMM, as
+            // llama.cpp's CPU backend does for batches of 32+ rows.
+            let mut wf = vec![0f32; n * k];
+            let row_bytes = w.dtype().storage_bytes(k);
+            wf.par_chunks_mut(k).zip(w_bytes.par_chunks(row_bytes)).for_each(|(dst, src)| {
+                if is_q8 {
+                    dequantize_q8_0(src, dst);
+                } else {
+                    dequantize_q4_0(src, dst);
+                }
+            });
+            sgemm_nt(x_slice, &wf, out_slice, m, k, n);
+        } else if m == 1 {
+            // Decode: activations quantized to Q8, integer dot products.
+            gemv_quantized(is_q8, w_bytes, x_slice, out_slice, n, k);
         } else {
-            // Prefill: stream the weight once for all rows.
-            linear_quantized_f32(w.dtype() == DType::Q8_0, w_bytes, x_slice, out_slice, m, n, k);
+            linear_quantized(is_q8, w_bytes, x_slice, out_slice, m, n, k);
         }
         Ok(out)
     }
@@ -319,26 +341,31 @@ impl Backend for CpuBackend {
         let v_slice = v_cache.as_f32_slice()?;
         let out_slice = out.as_mut_f32_slice()?;
 
-        // Parallelise over every (row, head) pair so both decode (many sequences)
-        // and prefill (many tokens of one sequence) use all cores.
+        // One work item per (row, KV head): it computes all `heads_per_group` query
+        // heads that share the KV head, reading each cached key/value once. Items are
+        // batched so short-context decode does not pay fork/join overhead.
+        let group_len = heads_per_group * head_dim;
+        let max_ctx = context_lens.iter().copied().max().unwrap_or(1);
+        let min_items = (crate::ops::ELEMENTWISE_GRAIN / (max_ctx * group_len).max(1)).max(1);
         out_slice
-            .par_chunks_mut(head_dim)
+            .par_chunks_mut(group_len)
+            .with_min_len(min_items)
             .enumerate()
-            .for_each(|(idx, out_head)| {
-                let row = idx / num_heads_q;
-                let head = idx % num_heads_q;
-                let q_head = &q_slice[idx * head_dim..(idx + 1) * head_dim];
-                paged_attention_head(
-                    q_head,
+            .for_each(|(idx, out_group)| {
+                let row = idx / num_heads_kv;
+                let kv_head = idx % num_heads_kv;
+                let q_group = &q_slice[idx * group_len..(idx + 1) * group_len];
+                paged_attention_kv_group(
+                    q_group,
                     k_slice,
                     v_slice,
                     &block_tables[row],
                     context_lens[row],
-                    head / heads_per_group,
+                    kv_head,
                     num_heads_kv,
                     head_dim,
                     scale,
-                    out_head,
+                    out_group,
                 );
             });
 

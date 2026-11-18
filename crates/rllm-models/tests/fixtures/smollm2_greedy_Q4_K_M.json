@@ -1,29 +1,29 @@
 {
  "model": "SmolLM2-135M-Instruct-Q4_K_M.requant.gguf",
- "generator": "llama-completion greedy (--temp 0 --top-k 1), -n 32",
+ "generator": "llama-completion greedy on CPU (--temp 0 --top-k 1 -ngl 0), -n 32",
  "cases": [
   {
    "prompt": "The capital of France is",
    "max_tokens": 32,
-   "completion": " Paris. Paris is a city known for its historical landmarks, art museums, fashion, and cuisine. It is the largest city in France and the third-largest",
+   "completion": " Paris. Paris is a city that is known for its historical landmarks, art museums, and cultural institutions. It is also a major center of international trade and commerce",
    "stopped_on_eos": false
   },
   {
    "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
    "max_tokens": 32,
-   "completion": "```\n\nThis implementation uses a recursive approach to calculate the nth Fibonacci number. The base cases are when `n` is 0 or 1",
+   "completion": "```\n\nThis implementation uses a recursive approach to calculate the nth Fibonacci number. It starts with the base cases of 0 and 1, and",
    "stopped_on_eos": false
   },
   {
    "prompt": "Rust is a systems programming language that",
    "max_tokens": 32,
-   "completion": " provides a set of rules for writing programs. It is a low-level language that is designed to be used in embedded systems, embedded systems programming, and embedded",
+   "completion": " provides a set of rules for creating and manipulating strings. It is a low-level language that is designed to be used in applications that require a high degree of",
    "stopped_on_eos": false
   },
   {
    "prompt": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nWhat is the boiling point of water at sea level?<|im_end|>\n<|im_start|>assistant\n",
    "max_tokens": 32,
-   "completion": "At sea level, the boiling point of water is approximately 100°C (212°F). However, this is a reference point,",
+   "completion": "At sea level, the boiling point of water is approximately 212°F (100°C). However, this is a reference point,",
    "stopped_on_eos": false
   }
  ]

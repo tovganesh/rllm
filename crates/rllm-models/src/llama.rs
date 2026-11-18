@@ -158,6 +158,18 @@ impl<B: Backend> LlamaModel<B> {
         k_caches: &mut [Tensor],
         v_caches: &mut [Tensor],
     ) -> Result<Tensor> {
+        // Run the whole pass on a Rayon worker: the many small parallel kernels inside
+        // then use work-stealing instead of each injecting into the pool from outside
+        // and blocking the caller.
+        rayon::scope(|_| self.forward_inner(batch, k_caches, v_caches))
+    }
+
+    fn forward_inner(
+        &self,
+        batch: &ForwardBatch<'_>,
+        k_caches: &mut [Tensor],
+        v_caches: &mut [Tensor],
+    ) -> Result<Tensor> {
         let num_rows = batch.tokens.len();
         let h = self.config.hidden_size;
         let head_dim = self.config.head_dim();
