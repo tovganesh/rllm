@@ -53,11 +53,12 @@ pub fn gemv_f32(mat: &[f32], vec: &[f32], out: &mut [f32], n: usize, k: usize) {
     debug_assert_eq!(vec.len(), k);
     debug_assert_eq!(out.len(), n);
 
-    if n >= 64 {
-        out.par_chunks_mut(16)
+    let rows = super::gemv_rows_per_task(k * 4);
+    if n > rows {
+        out.par_chunks_mut(rows)
             .enumerate()
             .for_each(|(chunk_idx, out_chunk)| {
-                let row_start = chunk_idx * 16;
+                let row_start = chunk_idx * rows;
                 for (i, val) in out_chunk.iter_mut().enumerate() {
                     let row = row_start + i;
                     let mat_row = &mat[row * k..(row + 1) * k];

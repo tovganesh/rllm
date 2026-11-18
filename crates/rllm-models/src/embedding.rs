@@ -185,6 +185,11 @@ impl<B: Backend> BertEmbeddingModel<B> {
     ///
     /// Returns an error if `token_ids` is empty or contains an ID outside the vocabulary.
     pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
+        // See `LlamaModel::forward`: run inside the Rayon pool.
+        rayon::scope(|_| self.embed_inner(token_ids))
+    }
+
+    fn embed_inner(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
         if token_ids.is_empty() {
             return Err(RllmError::BackendError("embed: input must contain at least one token".to_string()));
         }

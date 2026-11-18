@@ -1,6 +1,6 @@
 {
  "model": "SmolLM2-135M-Instruct-F16.requant.gguf",
- "generator": "llama-completion greedy (--temp 0 --top-k 1), -n 32",
+ "generator": "llama-completion greedy on CPU (--temp 0 --top-k 1 -ngl 0), -n 32",
  "cases": [
   {
    "prompt": "The capital of France is",

@@ -41,7 +41,7 @@ flowchart TD
 
     subgraph ComputeLayer ["Backends"]
         Trait["Backend trait (rllm-core) ✅"]
-        CPU["rllm-backend-cpu ✅ (NEON; AVX2/AVX-512 📋)"]
+        CPU["rllm-backend-cpu ✅ (NEON SDOT, Accelerate; AVX2/AVX-512 📋)"]
         Metal["rllm-backend-metal ⛔"]
         CUDA["rllm-backend-cuda 📋"]
     end
@@ -95,12 +95,13 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 - `Backend` is an object-safe trait with: `matmul`, `rms_norm`, `rope`, `swiglu`, `softmax`, `embedding`, `paged_attention`, `gemv_quantized`.
 - `DType` declares `F32, F16, BF16, I32, I8, Q4_0, Q4_K, Q8_0`. Only `F32` compute and `Q4_0`/`Q8_0` GEMV are implemented.
 
-### 4.2 CPU Backend (`rllm-backend-cpu`) — ✅ / 🟡
+### 4.2 CPU Backend (`rllm-backend-cpu`) — ✅
 
-- F32 dot product with ARM NEON FMA on `aarch64`; 4-way unrolled scalar elsewhere.
-- GEMV parallelised over output rows with Rayon. GEMM is a naive row-parallel loop (🟡; tiling/packing planned).
-- Q4_0 (32 elements / 18 bytes) and Q8_0 (32 / 34 bytes) GEMV operate directly on quantized blocks without dequantizing the full matrix. Inner loops are scalar.
-- PagedAttention decode: per-head logits over a block table, softmax, weighted V accumulation; GQA supported.
+- **Quantized linear layers** (`ops/qdot.rs`): for decode and small batches, activations are quantized once per call to Q8 blocks (f16-rounded scale, like llama.cpp's `quantize_row_q8_0`) and multiplied with Q8_0 / Q4_0 weight blocks in integer arithmetic. On aarch64 with the `dotprod` extension (runtime-detected) the inner products use `SDOT`, emitted via inline assembly because `vdotq_s32` is only stable from Rust 1.98; elsewhere a scalar loop is used.
+- **Batched products** (≥ 32 rows, i.e. prefill): quantized weights are dequantized and multiplied with F32 activations by `ops/blas.rs::sgemm_nt`, which calls Accelerate's `cblas_sgemm` on macOS and a portable row-parallel kernel elsewhere. This matches llama.cpp's CPU behaviour.
+- **Parallelism:** the forward pass runs inside the Rayon pool (`rayon::scope`), so inner kernels use work-stealing. Element-wise kernels below 16 Ki elements run on one thread; matrix-vector products split into ~128 KiB weight slabs (`RLLM_TASK_BYTES`). `threads::init_thread_pool` defaults to the number of performance cores on Apple Silicon.
+- **PagedAttention:** one work item per (row, KV head) computes every query head of the GQA group in one pass over that head's cached keys and values, walking the block table block by block. One row per prompt token gives causal prefill; one row per sequence gives batched decode.
+- F32 dot products use NEON FMA on aarch64. RMSNorm, LayerNorm, RoPE, SwiGLU, GELU and softmax are scalar / auto-vectorised.
 
 ### 4.3 Models (`rllm-models`) — ✅
 

@@ -7,18 +7,50 @@
 
 ---
 
-## 1. Real-model measurements (preliminary)
+## 1. Real-model measurements
 
-**Correctness first.** For SmolLM2-135M-Instruct, rllm's greedy output matches llama.cpp token-for-token (4 prompts × 32 tokens) in F16, Q8_0, Q4_0, Q4_K_M and Q5_K_M, and its tokenizer matches `llama-tokenize` on a 23-case corpus (`crates/rllm-models/tests/real_model.rs`).
+### Correctness
 
-**Throughput.** Apple M4 (10 cores), macOS, CPU only, SmolLM2-135M-Instruct Q8_0, 41-token chat prompt, 60 generated tokens:
+Checked against llama.cpp on SmolLM2-135M-Instruct (`crates/rllm-models/tests/real_model.rs`):
 
-| Engine | Prefill (tok/s) | Decode (tok/s) |
-| :--- | ---: | ---: |
-| rllm (`rllm generate --temperature 0`, 3 runs) | ~280–340 | ~66–75 |
-| llama.cpp (`llama-bench -ngl 0 -p 41 -n 60`, 4 threads, BLAS) | ~2,900 | ~360 |
+| Check | Result |
+| :--- | :--- |
+| Tokenizer vs `llama-tokenize` (23 cases) | identical |
+| Greedy decode vs `llama-completion -ngl 0` (Q8_0, 4 prompts × 32 tokens) | identical |
+| Perplexity vs `llama-perplexity -ngl 0` (LICENSE text, 16 × 128-token chunks) | F16 −0.00%, Q8_0 +0.35%, Q4_0 −0.59%, Q4_K_M +0.22%, Q5_K_M +0.09% |
+| Teacher-forced: llama.cpp's greedy tokens vs rllm's argmax, all formats | every token is rllm's argmax or within 0.25 (8/16-bit) / 0.5 (4/5-bit) logits |
 
-rllm is roughly 9× slower at prefill and 5× slower at decode. The main reasons are scalar quantized dot products (llama.cpp uses SIMD int8 dot products on quantized activations), no tiled GEMM for prefill, and F32 KV cache. These are P3 items. Treat these figures as a single-machine snapshot, not a formal benchmark.
+Exact token parity across engines is only expected where both use the same arithmetic. llama.cpp quantizes activations to Q8 for decode and small batches but uses F32 BLAS for batches of 32+ tokens, and its Metal backend never quantizes activations; rllm follows the CPU behaviour. Near-tied tokens can flip between these paths, so perplexity is the primary cross-engine check.
+
+### Throughput
+
+Apple M4 (4 performance + 6 efficiency cores), macOS, CPU only, 4 threads for both engines, SmolLM2-135M-Instruct. llama.cpp: `llama-bench -ngl 0 -p 128,512 -n 128 -r 3` (BLAS via Accelerate). rllm: prefill = `rllm perplexity --ctx {128,512}` (one forward pass per chunk), decode = `rllm generate --raw --max-tokens 128`, median of 3. Tokens/s:
+
+| Weights | llama.cpp pp128 | rllm pp128 | llama.cpp pp512 | rllm pp512 | llama.cpp tg128 | rllm tg128 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q8_0 | 1,918 | **2,252** | 1,308 | **1,888** | **399** | 340 |
+| Q4_0 | 1,969 | **2,232** | 1,318 | **1,903** | **568** | 368 |
+| Q4_K_M | 1,378 | **2,232** | 1,108 | **1,876** | **364** | ~320 ¹ |
+| Q5_K_M | 1,469 | **2,302** | 1,214 | **1,891** | **423** | ~320 ¹ |
+| F16 | 1,162 | **2,161** | 1,257 | **1,874** | **132** | 94 |
+
+¹ After the load-time Q8_0 conversion of K-quant weights (previously 135 tok/s); measured in separate runs in the same session.
+
+Progress during P3 on the 41-token chat prompt (Q8_0): prefill 340 → ~1,050 tok/s (and ~1,900 tok/s at 512 tokens), decode 70 → ~340 tok/s.
+
+**What changed and why it mattered** (profiled with macOS `sample`):
+1. *Int8 decode kernels.* Activations are quantized to Q8 once per matrix-vector product and multiplied with Q8_0 / Q4_0 weights using the ARM `SDOT` instruction (16 int8 multiply-adds per instruction), as llama.cpp does.
+2. *Accelerate GEMM for batches of 32+ rows.* Weights are dequantized and multiplied with `cblas_sgemm`, which runs on Apple's matrix units.
+3. *Parallel overhead.* Small element-wise kernels no longer split across threads, matrix-vector products split into ~128 KiB tasks, the forward pass runs inside the Rayon pool (inner kernels use work-stealing instead of injecting jobs and blocking), and the default thread count is the number of performance cores. On this machine 4 threads beat 10 by ~1.6× in decode, because every synchronisation waits for the slowest (efficiency) core.
+4. *Grouped-query attention.* All query heads sharing a KV head are processed in one pass over the cache, reading keys and values once instead of `num_heads / num_kv_heads` times.
+5. *K-quant weights converted to Q8_0 at load* instead of F32 (2.4× faster decode, ~4× less memory; perplexity within 0.25% of llama.cpp).
+
+**Remaining gaps:** decode is 15–35% behind llama.cpp (it repacks Q4_0 weights for wider SIMD kernels and uses native K-quant kernels and an F16 KV cache). Non-Apple platforms have no vendor BLAS (portable GEMM fallback) and x86 has no SIMD int8 kernels yet (portable scalar fallback). Measurements from this single machine are snapshots, not a formal benchmark; background load affects them noticeably.
+
+### Tuning knobs
+
+- `--threads N` / `RAYON_NUM_THREADS` — worker threads (default: performance cores on Apple Silicon, otherwise all cores).
+- `RLLM_TASK_BYTES` — weight bytes per parallel task in matrix-vector products (default 131072).
 
 ---
 
@@ -66,9 +98,11 @@ Once a real model runs correctly:
 
 ```bash
 # Real model (see README for the download command)
+cargo run --release -p rllm-cli -- perplexity --model models/SmolLM2-135M-Instruct-Q8_0.gguf --file LICENSE --ctx 512
 cargo run --release -p rllm-cli -- generate --model models/SmolLM2-135M-Instruct-Q8_0.gguf \
-  --prompt "What is the boiling point of water at sea level?" --temperature 0 --max-tokens 60
-llama-bench -m models/SmolLM2-135M-Instruct-Q8_0.gguf -ngl 0 -p 41 -n 60
+  --raw --prompt "Once upon a time" --temperature 0 --max-tokens 128
+llama-bench -m models/SmolLM2-135M-Instruct-Q8_0.gguf -ngl 0 -p 128,512 -n 128
+llama-perplexity -m models/SmolLM2-135M-Instruct-Q8_0.gguf -f LICENSE -c 128 -ngl 0
 
 # Synthetic presets
 cargo run --release -p rllm-cli -- bench --preset tiny --batch-size 4

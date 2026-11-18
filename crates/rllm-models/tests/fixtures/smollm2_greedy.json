@@ -1,11 +1,11 @@
 {
  "model": "SmolLM2-135M-Instruct-Q8_0.gguf",
- "generator": "llama-completion greedy (--temp 0 --top-k 1), -n 32",
+ "generator": "llama-completion greedy on CPU (--temp 0 --top-k 1 -ngl 0), -n 32",
  "cases": [
   {
    "prompt": "The capital of France is",
    "max_tokens": 32,
-   "completion": " Paris. Paris is the largest city in France and the capital of the French department of department FRANCE. It is located in the northern part of the country",
+   "completion": " Paris. Paris is the largest city in France and the second most populous city in the European Union. Paris is known for its iconic landmarks such as the Eiffel",
    "stopped_on_eos": false
   },
   {

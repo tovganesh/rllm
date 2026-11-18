@@ -17,6 +17,7 @@ use crate::llama::{LlamaAttention, LlamaDecoderLayer, LlamaMlp, LlamaModel};
 use rllm_backend_cpu::ops::quant::{
     convert_bf16, convert_f16, dequantize_q4_0, dequantize_q4_1, dequantize_q4_k,
     dequantize_q5_0, dequantize_q5_1, dequantize_q5_k, dequantize_q6_k, dequantize_q8_0,
+    quantize_f32_to_q8_0,
 };
 use rllm_backend_cpu::ops::rope::precompute_rope_freqs_scaled;
 use rllm_core::{
@@ -33,11 +34,25 @@ use std::sync::Arc;
 use tracing::info;
 
 /// Options controlling how a GGUF model is loaded.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LoadOptions {
     /// Cap on the context window (and RoPE table size). Defaults to the model's
     /// `context_length`.
     pub max_context: Option<usize>,
+    /// Convert linear weights stored in formats without a native kernel (K-quants,
+    /// Q4_1, Q5_0, Q5_1) to Q8_0 at load instead of F32. Q8_0 uses ~8.5 bits per
+    /// weight versus 32 for F32 and runs on the integer decode kernels; its rounding
+    /// error is far below the original 4–6-bit quantization error. Default: true.
+    pub requantize_to_q8_0: bool,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self {
+            max_context: None,
+            requantize_to_q8_0: true,
+        }
+    }
 }
 
 impl LlamaConfig {
@@ -124,7 +139,8 @@ impl<B: Backend> LlamaModel<B> {
         let kv_dim = config.num_key_value_heads * head_dim;
         let inter = config.intermediate_size;
 
-        let weight = |name: &str, shape: &[usize]| load_tensor(gguf, name, shape, true);
+        let requant = opts.requantize_to_q8_0;
+        let weight = |name: &str, shape: &[usize]| load_weight(gguf, name, shape, requant);
         let norm = |name: &str| load_tensor(gguf, name, &[h], false);
 
         let embed_tokens = weight("token_embd.weight", &[config.vocab_size, h])?;
@@ -192,6 +208,24 @@ impl<B: Backend> LlamaModel<B> {
             sin_table,
         })
     }
+}
+
+/// Loads a linear / embedding weight. Q8_0 and Q4_0 stay as stored; F32, F16 and BF16
+/// become F32; other quantized formats become Q8_0 (or F32 when `requantize` is off).
+pub(crate) fn load_weight(g: &MappedGguf, name: &str, shape: &[usize], requantize: bool) -> Result<Tensor> {
+    let ty = g
+        .tensor_info(name)
+        .ok_or_else(|| RllmError::ModelError(format!("Missing tensor '{name}'")))?
+        .ggml_type;
+    let lossy_format = !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q8_0 | GgmlType::Q4_0);
+    let in_features = *shape.last().unwrap_or(&0);
+    if !(requantize && lossy_format && in_features.is_multiple_of(32)) {
+        return load_tensor(g, name, shape, true);
+    }
+    let dense = load_tensor(g, name, shape, false)?.to_vec::<f32>()?;
+    let mut bytes = vec![0u8; dense.len() / 32 * 34];
+    quantize_f32_to_q8_0(&dense, &mut bytes);
+    Ok(Tensor::new(Shape::new(shape.to_vec()), DType::Q8_0, Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(bytes))))
 }
 
 /// Loads one tensor, checking its shape. With `keep_quantized`, Q8_0 / Q4_0 payloads

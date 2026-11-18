@@ -18,6 +18,7 @@ pub fn rms_norm_f32(
 
     out.par_chunks_mut(hidden_dim)
         .zip(x.par_chunks(hidden_dim))
+        .with_min_len((super::ELEMENTWISE_GRAIN / hidden_dim.max(1)).max(1))
         .for_each(|(out_row, x_row)| {
             let mut sum_sq = 0.0f32;
             for &val in x_row {
@@ -48,6 +49,7 @@ pub fn layer_norm_f32(
 
     out.par_chunks_mut(hidden_dim)
         .zip(x.par_chunks(hidden_dim))
+        .with_min_len((super::ELEMENTWISE_GRAIN / hidden_dim.max(1)).max(1))
         .for_each(|(out_row, x_row)| {
             let mean: f32 = x_row.iter().sum::<f32>() / hidden_dim as f32;
             let var: f32 = x_row
