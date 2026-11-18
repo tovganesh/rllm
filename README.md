@@ -49,7 +49,7 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | :--- | :---: | :--- |
 | Paged KV block allocator with ref-counts | ✅ | |
 | Radix-tree prefix cache | ✅ | Ref-counted block ownership with LRU leaf eviction; reused prefixes skip prefill. |
-| Continuous batching (iteration-level) | 🟡 | `step()` mixes prefill of new sequences with decode of running ones and preempts (recompute) under KV pressure; still driven synchronously by request handlers rather than a dedicated engine loop. |
+| Continuous batching (iteration-level) | ✅ | A dedicated engine thread steps the scheduler; each step mixes prefill of new sequences with decode of running ones, and preempts (recompute) under KV pressure. Requests receive tokens and a terminal event over their own channel; disconnecting cancels the sequence and frees its KV blocks. 8 concurrent requests run 2.8× faster than sequential on SmolLM2-135M. |
 | Sampler (temperature, top-k, top-p, repetition penalty) | ✅ | |
 | Speculative decoding | 📋 | |
 
@@ -70,8 +70,9 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 
 | Component | Status | Notes |
 | :--- | :---: | :--- |
-| Axum HTTP server (`/health`, `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/rag/index`, `/v1/rag/query`) | 🟡 | With `--model <file.gguf>`, chat completions use the model's chat template and tokenizer, stop at end-of-turn tokens and report `finish_reason` / usage; errors use OpenAI's error format. With `--embedding-model <bert.gguf>`, `/v1/embeddings` and RAG use a real embedding model. |
-| SSE streaming | 📋 | `stream: true` is rejected with 400 for now. |
+| Axum HTTP server (`/health`, `/metrics`, `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/rag/index`, `/v1/rag/query`) | ✅ | With `--model <file.gguf>`, chat completions use the model's chat template and tokenizer, stop at end-of-turn tokens and report `finish_reason` / usage; errors use OpenAI's error format. With `--embedding-model <bert.gguf>`, `/v1/embeddings` and RAG use a real embedding model. |
+| SSE streaming | ✅ | OpenAI `chat.completion.chunk` events, `stream_options.include_usage`, `data: [DONE]`; streamed text is identical to non-streamed text. |
+| Limits & operations | ✅ | Queue cap with HTTP 429 + `Retry-After` (`--max-waiting`), `max_tokens` cap (`--max-tokens-limit`), parameter validation, 2 MiB body limit, Prometheus `/metrics`, graceful shutdown on SIGTERM/Ctrl-C. No authentication or rate limiting per client. |
 | gRPC | 📋 | |
 | Separate inference / RAG containers (Docker, Compose) | ✅ | Both run synthetic models. |
 
@@ -87,7 +88,7 @@ Remaining limitations:
 2. **CPU only, and slower than llama.cpp.** On an Apple M4 (CPU, SmolLM2-135M Q8_0) rllm prefills ~340 tok/s and decodes ~70 tok/s versus llama.cpp's ~2,900 and ~360. See [BENCHMARKS](docs/BENCHMARKS.md).
 3. **Non-Q8_0/Q4_0 weights are expanded to F32 at load**, so a Q4_K_M file uses about 8× its file size in RAM.
 4. **Small models rarely write `[n]` citations.** SmolLM2-135M answers correctly from the sources but usually without citation markers; the response then carries a warning. Dense thresholds are calibrated only for bge-small-en-v1.5 and all-MiniLM-L6-v2. The reranker is lexical, not a neural cross-encoder.
-5. **No streaming responses; request handlers run generation in blocking tasks** rather than a dedicated engine loop.
+5. **No authentication, per-client rate limiting or TLS** — put rllm behind a reverse proxy for anything exposed. A single engine thread serves one model per process.
 6. **The prefix cache only records completed sequences** and shares whole blocks only (no copy-on-write of partial blocks).
 
 ---
@@ -96,7 +97,7 @@ Remaining limitations:
 
 - **P0 — Correctness:** ✅ done — projection layout, causal prefill, per-token RoPE, prefix-cache block ownership, aligned storage, input bounds, numerical reference tests.
 - **P1 — Real models:** ✅ done — GGUF loading, BPE and WordPiece tokenizers, chat templates, `rllm generate`, real-model chat completions, BERT embedding models, LLM-generated RAG answers with verified citations.
-- **P2 — Serving:** dedicated engine loop with per-request channels, SSE streaming, preemption, cancellation, request limits, structured errors, metrics.
+- **P2 — Serving:** ✅ done — dedicated engine thread with per-request channels, SSE streaming, cancellation on disconnect, queue/`max_tokens`/body limits with 429s, structured errors, Prometheus metrics, graceful shutdown.
 - **P3 — Performance & backends:** tiled GEMM, SIMD quantized kernels, Q4_K, F16 KV cache, Metal pipeline dispatch, CUDA behind a feature flag; re-benchmark against a real model.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the target design and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for benchmark status.
@@ -157,6 +158,13 @@ cargo run --release -p rllm-cli -- serve --service inference --addr 127.0.0.1:80
   --model models/SmolLM2-135M-Instruct-Q8_0.gguf
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
+
+# Streaming (server-sent events); Ctrl-C on the client cancels generation
+curl -N localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":true,"stream_options":{"include_usage":true}}'
+
+# Prometheus metrics (queue, KV cache, tokens, TTFT, per-route requests)
+curl -s localhost:8000/metrics
 ```
 
 ### Question answering over your documents (RAG)

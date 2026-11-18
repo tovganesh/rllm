@@ -7,7 +7,7 @@
 use crate::block_allocator::BlockAllocator;
 use crate::prefix_cache::PrefixCache;
 use crate::sampler::Sampler;
-use crate::sequence::{FinishReason, Sequence, SequenceStatus};
+use crate::sequence::{FinishReason, Sequence, SequenceEvent, SequenceStatus};
 use parking_lot::Mutex;
 use rllm_core::{
     backend::{Backend, BlockTable},
@@ -18,7 +18,9 @@ use rllm_core::{
 };
 use rllm_models::{ForwardBatch, LlamaModel};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Configuration options for the continuous batching scheduler.
@@ -56,6 +58,42 @@ struct EngineState {
     num_preemptions: u64,
 }
 
+/// Monotonic counters describing scheduler activity (exported on `/metrics`).
+#[derive(Debug, Default)]
+pub struct SchedulerMetrics {
+    /// Sequences accepted by `submit_sequence`.
+    pub sequences_submitted: AtomicU64,
+    /// Sequences finished because a stop token was generated.
+    pub finished_stop: AtomicU64,
+    /// Sequences finished because of `max_tokens`, the context window or KV capacity.
+    pub finished_length: AtomicU64,
+    /// Sequences aborted because their owner went away.
+    pub finished_abort: AtomicU64,
+    /// Sequences failed by an engine error.
+    pub failed: AtomicU64,
+    /// Prompt tokens run through the model (prefill, including recomputation).
+    pub prefill_tokens: AtomicU64,
+    /// Prompt tokens served from the prefix cache instead of being recomputed.
+    pub cached_prompt_tokens: AtomicU64,
+    /// Tokens generated.
+    pub generated_tokens: AtomicU64,
+    /// Forward passes executed.
+    pub forward_passes: AtomicU64,
+    /// Total time spent in forward passes, in microseconds.
+    pub forward_time_us: AtomicU64,
+}
+
+impl SchedulerMetrics {
+    fn record_finish(&self, reason: FinishReason) {
+        let c = match reason {
+            FinishReason::Stop => &self.finished_stop,
+            FinishReason::Length => &self.finished_length,
+            FinishReason::Abort => &self.finished_abort,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Continuous batching inference engine that coordinates model execution and KV-cache blocks.
 ///
 /// Every [`step`](Self::step) runs one forward pass over:
@@ -71,6 +109,9 @@ pub struct ContinuousBatchScheduler<B: Backend> {
     pub model: Arc<LlamaModel<B>>,
     waiting: Mutex<VecDeque<Sequence>>,
     state: Mutex<EngineState>,
+    next_id: AtomicU64,
+    /// Activity counters.
+    pub metrics: SchedulerMetrics,
 }
 
 impl<B: Backend> ContinuousBatchScheduler<B> {
@@ -114,16 +155,19 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
                 v_caches,
                 num_preemptions: 0,
             }),
+            next_id: AtomicU64::new(1),
+            metrics: SchedulerMetrics::default(),
         })
     }
 
-    /// Submits a new sequence for generation.
-    ///
-    /// # Errors
-    ///
-    /// Rejects sequences with an empty prompt, a prompt that does not fit in the model's
-    /// context window, or a prompt that could never fit in the KV-cache pool.
-    pub fn submit_sequence(&self, mut seq: Sequence) -> Result<()> {
+    /// Returns a fresh sequence ID, unique within this scheduler.
+    pub fn next_sequence_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Checks that a sequence can be scheduled: non-empty prompt that fits in the
+    /// context window and the KV pool, with token IDs inside the vocabulary.
+    pub fn validate(&self, seq: &Sequence) -> Result<()> {
         let prompt_len = seq.prompt_tokens.len();
         let max_pos = self.model.config.max_position_embeddings;
         if prompt_len == 0 {
@@ -152,7 +196,20 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
                 bad, self.model.config.vocab_size
             )));
         }
+        if seq.sampling_params.max_tokens == 0 {
+            return Err(RllmError::BackendError("max_tokens must be >= 1".to_string()));
+        }
+        Ok(())
+    }
 
+    /// Submits a new sequence for generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects sequences that fail [`validate`](Self::validate).
+    pub fn submit_sequence(&self, mut seq: Sequence) -> Result<()> {
+        self.validate(&seq)?;
+        self.metrics.sequences_submitted.fetch_add(1, Ordering::Relaxed);
         seq.status = SequenceStatus::Waiting;
         seq.num_computed_tokens = 0;
         seq.block_table = BlockTable {
@@ -183,6 +240,22 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
             num_preemptions,
         } = &mut *state;
 
+        // 0. Drop sequences whose owner has gone away (client disconnects).
+        waiting.retain(|seq| {
+            if seq.is_cancelled() {
+                self.metrics.record_finish(FinishReason::Abort);
+                false
+            } else {
+                true
+            }
+        });
+        for seq in running.iter_mut() {
+            if seq.is_cancelled() {
+                seq.status = SequenceStatus::Finished(FinishReason::Abort);
+            }
+        }
+        self.retire_finished(running, allocator, prefix_cache);
+
         // 1. Make room for one more token in every running (decoding) sequence,
         //    preempting the most recently admitted sequences if the pool is exhausted.
         let mut i = 0;
@@ -198,6 +271,8 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
                 warn!("Sequence {} exceeds KV cache capacity; finishing with Length", seq.id);
                 seq.status = SequenceStatus::Finished(FinishReason::Length);
                 allocator.free_table(&mut seq.block_table);
+                self.metrics.record_finish(FinishReason::Length);
+                seq.notify_finished();
                 break;
             }
             // Preempt the newest sequence (possibly this one) and retry.
@@ -246,6 +321,7 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
                 );
             }
             prefill_tokens += to_compute;
+            self.metrics.cached_prompt_tokens.fetch_add(cached_tokens as u64, Ordering::Relaxed);
             seq.status = SequenceStatus::Running;
             running.push(seq);
         }
@@ -268,6 +344,11 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
             logits_rows.push(tokens.len() - 1);
         }
 
+        let decode_rows = running.iter().filter(|s| s.total_tokens() - s.num_computed_tokens == 1 && !s.output_tokens.is_empty()).count();
+        self.metrics
+            .prefill_tokens
+            .fetch_add((tokens.len() - decode_rows) as u64, Ordering::Relaxed);
+        let started = Instant::now();
         let logits = self.model.forward(
             &ForwardBatch {
                 tokens: &tokens,
@@ -278,6 +359,10 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
             k_caches,
             v_caches,
         )?;
+        self.metrics.forward_passes.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .forward_time_us
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         // 4. Sample the next token of every sequence.
         let vocab_size = self.model.config.vocab_size;
@@ -294,22 +379,47 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
             }
             generated.push((seq.id, token));
         }
+        self.metrics.generated_tokens.fetch_add(generated.len() as u64, Ordering::Relaxed);
 
-        // 5. Retire finished sequences: hand their computed full blocks to the prefix
-        //    cache (which takes its own reference), then release the sequence's references.
+        // 5. Retire finished sequences.
+        self.retire_finished(running, allocator, prefix_cache);
+
+        Ok(generated)
+    }
+
+    /// Retires finished sequences: hands their computed full blocks to the prefix cache
+    /// (which takes its own reference), releases the sequences' references and sends
+    /// the terminal `Finished` event.
+    fn retire_finished(&self, running: &mut Vec<Sequence>, allocator: &mut BlockAllocator, prefix_cache: &mut PrefixCache) {
         running.retain_mut(|seq| {
-            if !matches!(seq.status, SequenceStatus::Finished(_)) {
-                return true;
-            }
+            let SequenceStatus::Finished(reason) = seq.status else { return true };
             let computed = &seq.all_tokens()[..seq.num_computed_tokens];
             for bid in prefix_cache.insert_prefix(computed, &seq.block_table.block_ids) {
                 allocator.inc_ref(bid);
             }
             allocator.free_table(&mut seq.block_table);
+            self.metrics.record_finish(reason);
+            seq.notify_finished();
             false
         });
+    }
 
-        Ok(generated)
+    /// Fails every waiting and running sequence with `message` and frees their blocks.
+    /// Used by the engine loop when a step returns an error.
+    pub fn fail_all(&self, message: &str) {
+        let mut state = self.state.lock();
+        let mut waiting = self.waiting.lock();
+        let EngineState { running, allocator, .. } = &mut *state;
+        for mut seq in running.drain(..).chain(waiting.drain(..)) {
+            allocator.free_table(&mut seq.block_table);
+            seq.notify_error(message);
+            self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether any sequence is waiting or running.
+    pub fn has_work(&self) -> bool {
+        self.num_running() + self.num_waiting() > 0
     }
 
     /// Submits `seq` and drives [`step`](Self::step) until **that** sequence finishes,
@@ -330,12 +440,13 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
             self.step()?;
             loop {
                 match rx.try_recv() {
-                    Ok(tok) => {
+                    Ok(SequenceEvent::Token(tok)) => {
                         on_token(tok);
                         out.push(tok);
                     }
+                    Ok(SequenceEvent::Finished(_)) => return Ok(out),
+                    Ok(SequenceEvent::Error(e)) => return Err(RllmError::SchedulerError(e)),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    // The sequence was retired and its sender dropped: generation is done.
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(out),
                 }
             }

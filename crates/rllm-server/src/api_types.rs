@@ -26,10 +26,62 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     /// Nucleus sampling cutoff ($0.0 < p \le 1.0$).
     pub top_p: Option<f32>,
-    /// Maximum number of output tokens to generate.
+    /// Maximum number of output tokens to generate (`max_completion_tokens` accepted too).
+    #[serde(alias = "max_completion_tokens")]
     pub max_tokens: Option<usize>,
     /// Whether to stream server-sent events (SSE).
     pub stream: Option<bool>,
+    /// Streaming options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// Options for streamed responses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamOptions {
+    /// Send a final chunk with token usage before `[DONE]`.
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+/// Incremental message content in a streamed chunk.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatDelta {
+    /// Set on the first chunk only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Newly generated text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// One choice inside a streamed chunk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatChunkChoice {
+    /// Choice index.
+    pub index: usize,
+    /// Incremental content.
+    pub delta: ChatDelta,
+    /// Set on the final content chunk.
+    pub finish_reason: Option<String>,
+}
+
+/// A `chat.completion.chunk` SSE payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionChunk {
+    /// Completion identifier (same for every chunk of a response).
+    pub id: String,
+    /// Always `"chat.completion.chunk"`.
+    pub object: String,
+    /// Unix timestamp.
+    pub created: u64,
+    /// Model name.
+    pub model: String,
+    /// Choices (empty in the final usage chunk).
+    pub choices: Vec<ChatChunkChoice>,
+    /// Token usage, only in the final chunk when `stream_options.include_usage` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// A single choice/candidate in a chat completion response.

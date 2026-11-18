@@ -1,22 +1,29 @@
 //! Route handlers for OpenAI-compatible REST and RAG endpoints.
 
 use crate::api_types::{
-    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, EmbeddingData,
-    EmbeddingRequest, EmbeddingResponse, RagIndexRequest, RagIndexResponse, RagQueryRequest,
-    Usage,
+    ChatChoice, ChatChunkChoice, ChatCompletionChunk, ChatCompletionRequest,
+    ChatCompletionResponse, ChatDelta, ChatMessage, EmbeddingData, EmbeddingRequest,
+    EmbeddingResponse, RagIndexRequest, RagIndexResponse, RagQueryRequest, Usage,
 };
+use crate::metrics::ServerMetrics;
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{header, HeaderValue, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json, Response,
+    },
 };
+use futures_util::stream::{self, Stream};
+use std::convert::Infallible;
+use std::time::Instant;
 use rllm_backend_cpu::CpuBackend;
-use rllm_models::{BpeTokenizer, ChatTemplate, TextEmbedder};
+use rllm_models::{BpeTokenizer, ChatTemplate, StreamDecoder, TextEmbedder};
 use rllm_rag::{grounded_messages, unrelated_response, verify_citations, RagEngine, RagResponse};
-use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, Sequence};
+use rllm_scheduler::{EngineHandle, FinishReason, GenerationStream, SamplingParams, SequenceEvent, SubmitError};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 
 /// Operating service mode for containerized or standalone deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,10 +36,34 @@ pub enum ServiceMode {
     Rag,
 }
 
+/// Request limits enforced by the server.
+#[derive(Debug, Clone)]
+pub struct ServerLimits {
+    /// Largest accepted `max_tokens`.
+    pub max_tokens: usize,
+    /// `max_tokens` used when a request does not set it.
+    pub default_max_tokens: usize,
+    /// Largest accepted request body in bytes.
+    pub max_body_bytes: usize,
+    /// Largest number of inputs in one `/v1/embeddings` request.
+    pub max_embedding_inputs: usize,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_tokens: 4096,
+            default_max_tokens: 256,
+            max_body_bytes: 2 * 1024 * 1024,
+            max_embedding_inputs: 256,
+        }
+    }
+}
+
 /// Global shared application state across HTTP request handlers.
 pub struct AppState {
-    /// Optional local scheduler for in-process LLM generation.
-    pub scheduler: Option<Arc<ContinuousBatchScheduler<CpuBackend>>>,
+    /// Engine running the local LLM (`None` when inference is not served here).
+    pub engine: Option<EngineHandle<CpuBackend>>,
     /// Tokenizer of the loaded model. `None` for synthetic models, which fall back to
     /// placeholder token IDs.
     pub tokenizer: Option<Arc<BpeTokenizer>>,
@@ -48,12 +79,16 @@ pub struct AppState {
     pub model_name: String,
     /// Active service operating mode.
     pub mode: ServiceMode,
+    /// Request limits.
+    pub limits: ServerLimits,
+    /// HTTP-level metrics.
+    pub metrics: Arc<ServerMetrics>,
 }
 
 /// Health and cluster status handler (`GET /health`).
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let running = state.scheduler.as_ref().map(|s| s.num_running()).unwrap_or(0);
-    let waiting = state.scheduler.as_ref().map(|s| s.num_waiting()).unwrap_or(0);
+    let running = state.engine.as_ref().map(|e| e.scheduler().num_running()).unwrap_or(0);
+    let waiting = state.engine.as_ref().map(|e| e.scheduler().num_waiting()).unwrap_or(0);
 
     Json(serde_json::json!({
         "status": "healthy",
@@ -84,6 +119,17 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn from_submit(e: SubmitError, metrics: &ServerMetrics) -> Self {
+        match e {
+            SubmitError::Invalid(msg) => Self::new(StatusCode::BAD_REQUEST, msg),
+            SubmitError::Overloaded { .. } => {
+                metrics.rejected_overloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Self::new(StatusCode::TOO_MANY_REQUESTS, e.to_string())
+            }
+            SubmitError::ShutDown => Self::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -96,7 +142,11 @@ impl IntoResponse for ApiError {
         let body = Json(serde_json::json!({
             "error": { "message": self.message, "type": kind }
         }));
-        (self.status, body).into_response()
+        let mut resp = (self.status, body).into_response();
+        if self.status == StatusCode::TOO_MANY_REQUESTS {
+            resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        resp
     }
 }
 
@@ -112,32 +162,42 @@ pub async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
 ///
 /// With a real model loaded, the conversation is rendered with the model's chat
 /// template and tokenized with its tokenizer, and generation stops at the model's
-/// end-of-turn tokens. Streaming (`stream: true`) is not supported yet.
+/// end-of-turn tokens. `stream: true` returns server-sent `chat.completion.chunk`
+/// events terminated by `data: [DONE]`. Disconnecting cancels generation.
 pub async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Json<ChatCompletionResponse>, ApiError> {
-    let scheduler = state.scheduler.clone().ok_or_else(|| {
-        error!("Chat completions requested but inference scheduler is not enabled in this container");
+) -> Result<Response, ApiError> {
+    let start = Instant::now();
+    let engine = state.engine.clone().ok_or_else(|| {
         ApiError::new(StatusCode::NOT_IMPLEMENTED, "inference is not enabled on this server")
     })?;
-    if req.stream == Some(true) {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "stream=true is not supported yet"));
-    }
     if req.messages.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "messages must not be empty"));
     }
 
-    let mut sampling = SamplingParams::default();
+    let mut sampling = SamplingParams {
+        max_tokens: state.limits.default_max_tokens,
+        ..SamplingParams::default()
+    };
     if let Some(t) = req.temperature {
+        if !(0.0..=2.0).contains(&t) {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "temperature must be between 0 and 2"));
+        }
         sampling.temperature = t;
     }
     if let Some(p) = req.top_p {
+        if !(p > 0.0 && p <= 1.0) {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "top_p must be in (0, 1]"));
+        }
         sampling.top_p = p;
     }
     if let Some(max_t) = req.max_tokens {
-        if max_t == 0 {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "max_tokens must be >= 1"));
+        if max_t == 0 || max_t > state.limits.max_tokens {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("max_tokens must be between 1 and {}", state.limits.max_tokens),
+            ));
         }
         sampling.max_tokens = max_t;
     }
@@ -170,58 +230,229 @@ pub async fn chat_completions_handler(
         }
     };
 
-    let seq_id = rand::random::<u64>();
-    let prompt_len = prompt_tokens.len();
     let stop_tokens = sampling.stop_tokens.clone();
-    let seq = Sequence::new(seq_id, prompt_tokens, sampling, scheduler.config.block_size, None);
-
-    let mut generated = tokio::task::spawn_blocking(move || scheduler.generate(seq, |_| {}))
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| match e {
-            // Prompt validation failures (too long, bad token IDs) are client errors.
-            rllm_core::error::RllmError::BackendError(msg) if msg.contains("Prompt") || msg.contains("Token ID") => {
-                ApiError::new(StatusCode::BAD_REQUEST, msg)
-            }
-            other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-
-    let finish_reason = if generated.last().is_some_and(|t| stop_tokens.contains(t)) {
-        generated.pop();
-        "stop"
-    } else {
-        // max_tokens reached, or the context window / KV capacity ran out.
-        "length"
-    };
-    let completion_tokens = generated.len() + usize::from(finish_reason == "stop");
-
-    let content = match &state.tokenizer {
-        Some(tokenizer) => tokenizer.decode(&generated, true),
-        None => rllm_models::Tokenizer::default().decode(&generated),
-    };
-
-    Ok(Json(ChatCompletionResponse {
-        id: format!("chatcmpl-{}", seq_id),
-        object: "chat.completion".to_string(),
-        created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+    let generation = engine
+        .submit(prompt_tokens, sampling)
+        .map_err(|e| ApiError::from_submit(e, &state.metrics))?;
+    let ctx = CompletionContext {
+        id: format!("chatcmpl-{}", generation.id),
+        created: unix_now(),
         model: state.model_name.clone(),
+        tokenizer: state.tokenizer.clone(),
+        stop_tokens,
+        metrics: state.metrics.clone(),
+        start,
+    };
+
+    if req.stream == Some(true) {
+        let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
+        let sse = Sse::new(chat_stream(generation, ctx, include_usage)).keep_alive(KeepAlive::default());
+        return Ok(sse.into_response());
+    }
+
+    let (content, finish_reason, completion_tokens, prompt_len) = collect_completion(generation, &ctx).await?;
+    Ok(Json(ChatCompletionResponse {
+        id: ctx.id,
+        object: "chat.completion".to_string(),
+        created: ctx.created,
+        model: ctx.model,
         choices: vec![ChatChoice {
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content,
             },
-            finish_reason: finish_reason.to_string(),
+            finish_reason,
         }],
         usage: Usage {
             prompt_tokens: prompt_len,
             completion_tokens,
             total_tokens: prompt_len + completion_tokens,
         },
-    }))
+    })
+    .into_response())
+}
+
+/// Per-request data shared by the streaming and non-streaming paths.
+struct CompletionContext {
+    id: String,
+    created: u64,
+    model: String,
+    tokenizer: Option<Arc<BpeTokenizer>>,
+    stop_tokens: Vec<u32>,
+    metrics: Arc<ServerMetrics>,
+    start: Instant,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn finish_reason_str(r: FinishReason) -> &'static str {
+    match r {
+        FinishReason::Stop => "stop",
+        FinishReason::Length | FinishReason::Abort => "length",
+    }
+}
+
+/// Text of one generated token for models without a BPE tokenizer.
+fn legacy_token_text(tok: u32) -> String {
+    format!("{} ", rllm_models::Tokenizer::default().decode(&[tok]))
+}
+
+/// Runs a request to completion: `(content, finish_reason, completion_tokens, prompt_tokens)`.
+async fn collect_completion(
+    mut generation: GenerationStream,
+    ctx: &CompletionContext,
+) -> Result<(String, String, usize, usize), ApiError> {
+    let mut tokens = Vec::new();
+    let reason = loop {
+        match generation.next().await {
+            Some(SequenceEvent::Token(t)) => {
+                if tokens.is_empty() {
+                    ctx.metrics.observe_ttft(ctx.start);
+                }
+                tokens.push(t);
+            }
+            Some(SequenceEvent::Finished(r)) => break r,
+            Some(SequenceEvent::Error(e)) => return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
+            None => return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "generation ended unexpectedly")),
+        }
+    };
+    let completion_tokens = tokens.len();
+    if reason == FinishReason::Stop && tokens.last().is_some_and(|t| ctx.stop_tokens.contains(t)) {
+        tokens.pop();
+    }
+    let content = match &ctx.tokenizer {
+        Some(t) => t.decode(&tokens, true),
+        None => tokens.iter().map(|&t| legacy_token_text(t)).collect::<String>().trim().to_string(),
+    };
+    Ok((content, finish_reason_str(reason).to_string(), completion_tokens, generation.prompt_tokens))
+}
+
+enum StreamPhase {
+    Start,
+    Generating,
+    Usage(Usage),
+    Done,
+    Closed,
+}
+
+struct ChatStreamState {
+    generation: GenerationStream,
+    ctx: CompletionContext,
+    decoder: StreamDecoder,
+    include_usage: bool,
+    completion_tokens: usize,
+    phase: StreamPhase,
+}
+
+impl ChatStreamState {
+    fn chunk(&self, delta: ChatDelta, finish_reason: Option<&str>) -> Event {
+        let chunk = ChatCompletionChunk {
+            id: self.ctx.id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created: self.ctx.created,
+            model: self.ctx.model.clone(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta,
+                finish_reason: finish_reason.map(str::to_string),
+            }],
+            usage: None,
+        };
+        Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+    }
+}
+
+/// SSE event stream for a streamed chat completion.
+fn chat_stream(
+    generation: GenerationStream,
+    ctx: CompletionContext,
+    include_usage: bool,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    let state = ChatStreamState {
+        generation,
+        ctx,
+        decoder: StreamDecoder::default(),
+        include_usage,
+        completion_tokens: 0,
+        phase: StreamPhase::Start,
+    };
+    stream::unfold(state, |mut st| async move {
+        loop {
+            match std::mem::replace(&mut st.phase, StreamPhase::Closed) {
+                StreamPhase::Start => {
+                    st.phase = StreamPhase::Generating;
+                    let ev = st.chunk(ChatDelta { role: Some("assistant".to_string()), content: None }, None);
+                    return Some((Ok(ev), st));
+                }
+                StreamPhase::Generating => match st.generation.next().await {
+                    Some(SequenceEvent::Token(t)) => {
+                        st.phase = StreamPhase::Generating;
+                        if st.completion_tokens == 0 {
+                            st.ctx.metrics.observe_ttft(st.ctx.start);
+                        }
+                        st.completion_tokens += 1;
+                        if st.ctx.stop_tokens.contains(&t) {
+                            continue;
+                        }
+                        let text = match &st.ctx.tokenizer {
+                            Some(tok) => st.decoder.push(tok, t, true),
+                            None => legacy_token_text(t),
+                        };
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let ev = st.chunk(ChatDelta { role: None, content: Some(text) }, None);
+                        return Some((Ok(ev), st));
+                    }
+                    Some(SequenceEvent::Finished(reason)) => {
+                        let tail = st.decoder.finish();
+                        let usage = Usage {
+                            prompt_tokens: st.generation.prompt_tokens,
+                            completion_tokens: st.completion_tokens,
+                            total_tokens: st.generation.prompt_tokens + st.completion_tokens,
+                        };
+                        st.phase = if st.include_usage { StreamPhase::Usage(usage) } else { StreamPhase::Done };
+                        let delta = ChatDelta { role: None, content: (!tail.is_empty()).then_some(tail) };
+                        let ev = st.chunk(delta, Some(finish_reason_str(reason)));
+                        return Some((Ok(ev), st));
+                    }
+                    Some(SequenceEvent::Error(e)) => {
+                        st.phase = StreamPhase::Done;
+                        let body = serde_json::json!({ "error": { "message": e, "type": "server_error" } });
+                        return Some((Ok(Event::default().data(body.to_string())), st));
+                    }
+                    None => {
+                        st.phase = StreamPhase::Done;
+                        continue;
+                    }
+                },
+                StreamPhase::Usage(usage) => {
+                    st.phase = StreamPhase::Done;
+                    let chunk = ChatCompletionChunk {
+                        id: st.ctx.id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created: st.ctx.created,
+                        model: st.ctx.model.clone(),
+                        choices: Vec::new(),
+                        usage: Some(usage),
+                    };
+                    let ev = Event::default().data(serde_json::to_string(&chunk).unwrap_or_default());
+                    return Some((Ok(ev), st));
+                }
+                StreamPhase::Done => {
+                    st.phase = StreamPhase::Closed;
+                    return Some((Ok(Event::default().data("[DONE]")), st));
+                }
+                StreamPhase::Closed => return None,
+            }
+        }
+    })
 }
 
 /// OpenAI-compatible dense vector embeddings handler (`POST /v1/embeddings`).
@@ -232,8 +463,11 @@ pub async fn embeddings_handler(
     let embedder = state.embedder.clone().ok_or_else(|| {
         ApiError::new(StatusCode::NOT_IMPLEMENTED, "no embedding model is loaded on this server")
     })?;
-    if req.input.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "input must not be empty"));
+    if req.input.is_empty() || req.input.len() > state.limits.max_embedding_inputs {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("input must contain between 1 and {} texts", state.limits.max_embedding_inputs),
+        ));
     }
     let model = embedder.name.clone();
     let inputs = req.input;
@@ -345,6 +579,7 @@ pub async fn rag_query_handler(
         top_p: Some(sampling.top_p),
         max_tokens: Some(sampling.max_tokens),
         stream: Some(false),
+        stream_options: None,
     };
     let endpoint = format!("{}/v1/chat/completions", remote_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
