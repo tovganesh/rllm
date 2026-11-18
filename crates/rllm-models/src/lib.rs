@@ -8,18 +8,24 @@
 //! - Binary GGUF format parser for edge block-quantized weights.
 //! - Named weight storage and mapping dictionary.
 
+pub mod bpe;
+pub mod chat;
 pub mod config;
 pub mod embedding;
 pub mod gguf;
 pub mod init;
 pub mod llama;
+pub mod loader;
 pub mod tokenizer;
 pub mod weights;
 
+pub use bpe::{BpeTokenizer, StreamDecoder};
+pub use chat::{ChatMessage, ChatTemplate};
 pub use config::{BertConfig, LlamaConfig};
 pub use embedding::BertEmbeddingModel;
-pub use gguf::{GgufFile, GgufTensorInfo};
+pub use gguf::{GgmlType, GgufFile, GgufTensorInfo, GgufValue, MappedGguf};
 pub use llama::{ForwardBatch, LlamaModel};
+pub use loader::{GgufBundle, LoadOptions};
 pub use tokenizer::{
     Tokenizer, ASSISTANT_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, SYSTEM_TOKEN_ID,
     UNK_TOKEN_ID, USER_TOKEN_ID,

@@ -5,3 +5,5 @@ target/
 *.log
 *.swp
 *.swo
+models/
+*.gguf

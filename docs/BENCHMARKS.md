@@ -3,11 +3,26 @@
 > [!IMPORTANT]
 > **Previously published end-to-end numbers have been withdrawn.** They were measured on synthetic (constant) weights, with no prompt prefill and with correctness bugs in the decode path that have since been fixed. They do not describe the behaviour of a real model and should not be cited.
 >
-> Benchmarks will be re-run once `rllm` can load and correctly execute a real model (roadmap items P0 and P1), and will be reported alongside a reference engine (e.g. llama.cpp) on the same hardware.
+> Real-model measurements now start in section 1; the synthetic `bench` command is described in section 2.
 
 ---
 
-## 1. What the `bench` command measures today
+## 1. Real-model measurements (preliminary)
+
+**Correctness first.** For SmolLM2-135M-Instruct, rllm's greedy output matches llama.cpp token-for-token (4 prompts × 32 tokens) in F16, Q8_0, Q4_0, Q4_K_M and Q5_K_M, and its tokenizer matches `llama-tokenize` on a 23-case corpus (`crates/rllm-models/tests/real_model.rs`).
+
+**Throughput.** Apple M4 (10 cores), macOS, CPU only, SmolLM2-135M-Instruct Q8_0, 41-token chat prompt, 60 generated tokens:
+
+| Engine | Prefill (tok/s) | Decode (tok/s) |
+| :--- | ---: | ---: |
+| rllm (`rllm generate --temperature 0`, 3 runs) | ~280–340 | ~66–75 |
+| llama.cpp (`llama-bench -ngl 0 -p 41 -n 60`, 4 threads, BLAS) | ~2,900 | ~360 |
+
+rllm is roughly 9× slower at prefill and 5× slower at decode. The main reasons are scalar quantized dot products (llama.cpp uses SIMD int8 dot products on quantized activations), no tiled GEMM for prefill, and F32 KV cache. These are P3 items. Treat these figures as a single-machine snapshot, not a formal benchmark.
+
+---
+
+## 2. What the `bench` command measures today
 
 `rllm-cli bench` runs four sections. Their current validity:
 
@@ -20,7 +35,7 @@
 
 ---
 
-## 2. Presets
+## 3. Presets
 
 The presets are synthetic configurations used for sizing. They are **not** the published configurations of any real model.
 
@@ -34,7 +49,7 @@ Run `cargo run --release -p rllm-cli -- bench --preset <name>` to print the exac
 
 ---
 
-## 3. Planned methodology
+## 4. Planned methodology
 
 Once a real model runs correctly:
 
@@ -47,9 +62,15 @@ Once a real model runs correctly:
 
 ---
 
-## 4. Reproduce
+## 5. Reproduce
 
 ```bash
+# Real model (see README for the download command)
+cargo run --release -p rllm-cli -- generate --model models/SmolLM2-135M-Instruct-Q8_0.gguf \
+  --prompt "What is the boiling point of water at sea level?" --temperature 0 --max-tokens 60
+llama-bench -m models/SmolLM2-135M-Instruct-Q8_0.gguf -ngl 0 -p 41 -n 60
+
+# Synthetic presets
 cargo run --release -p rllm-cli -- bench --preset tiny --batch-size 4
 cargo run --release -p rllm-cli -- bench --preset edge-4gb --batch-size 4 --prompt-tokens 64 --generate-tokens 16
 ```

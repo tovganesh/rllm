@@ -230,3 +230,16 @@ fn generation_stops_at_context_window() {
     let out = run_to_completion(&s);
     assert_eq!(out[&1].len(), 128 - 120, "stops when the sequence fills max_position_embeddings");
 }
+
+#[test]
+fn generate_returns_when_its_own_sequence_finishes() {
+    let m = model();
+    let s = scheduler(64, 4);
+    // A long-running sequence shares the scheduler with the one we wait for.
+    s.submit_sequence(seq(99, &[1, 2, 3], 40)).unwrap();
+    let mut streamed = Vec::new();
+    let out = s.generate(seq(1, &PROMPT_A, 5), |t| streamed.push(t)).unwrap();
+    assert_eq!(out, reference_greedy(&m, &PROMPT_A, 5));
+    assert_eq!(streamed, out);
+    assert_eq!(s.num_running(), 1, "the other sequence is still running");
+}

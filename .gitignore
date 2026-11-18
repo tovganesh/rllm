@@ -7,3 +7,7 @@
 .vscode/
 *.log
 
+
+# Local model weights (downloaded, never committed)
+models/
+*.gguf

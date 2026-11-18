@@ -312,6 +312,36 @@ impl<B: Backend> ContinuousBatchScheduler<B> {
         Ok(generated)
     }
 
+    /// Submits `seq` and drives [`step`](Self::step) until **that** sequence finishes,
+    /// calling `on_token` for each token it generates. Other sequences in the scheduler
+    /// keep making progress during the same steps.
+    ///
+    /// Returns all generated tokens, including a final stop token if one was sampled.
+    ///
+    /// This blocks the calling thread; call it from a blocking context (e.g.
+    /// `tokio::task::spawn_blocking`) when used inside an async runtime.
+    pub fn generate(&self, mut seq: Sequence, mut on_token: impl FnMut(u32)) -> Result<Vec<u32>> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        seq.sender = Some(tx);
+        self.submit_sequence(seq)?;
+
+        let mut out = Vec::new();
+        loop {
+            self.step()?;
+            loop {
+                match rx.try_recv() {
+                    Ok(tok) => {
+                        on_token(tok);
+                        out.push(tok);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    // The sequence was retired and its sender dropped: generation is done.
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(out),
+                }
+            }
+        }
+    }
+
     /// Number of sequences currently awaiting scheduler admission in the queue.
     pub fn num_waiting(&self) -> usize {
         self.waiting.lock().len()

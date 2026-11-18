@@ -53,6 +53,12 @@ impl Backend for MetalBackend {
         ))
     }
 
+    fn linear(&self, _x: &Tensor, _w: &Tensor) -> Result<Tensor> {
+        Err(RllmError::BackendError(
+            "Metal linear pipeline stub".to_string(),
+        ))
+    }
+
     fn rms_norm(&self, _x: &Tensor, _weight: &Tensor, _eps: f32) -> Result<Tensor> {
         Err(RllmError::BackendError(
             "Metal rms_norm pipeline stub".to_string(),

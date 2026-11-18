@@ -27,6 +27,13 @@ pub trait Backend: Send + Sync + 'static {
     /// Supports 2D GEMM and 1D vector GEMV.
     fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor>;
 
+    /// Linear layer without bias: `y[..., out] = x[..., in] · Wᵀ`.
+    ///
+    /// `w` is stored `[out_features, in_features]` and may be F32 or a block-quantized
+    /// type supported by the backend (Q8_0 / Q4_0 on CPU). Quantized weights are used
+    /// directly, without materialising an F32 copy.
+    fn linear(&self, x: &Tensor, w: &Tensor) -> Result<Tensor>;
+
     /// Root Mean Square Normalization (RMSNorm):
     /// $$y_i = \frac{x_i}{\sqrt{\frac{1}{d} \sum_{j=1}^d x_j^2 + \epsilon}} \cdot w_i$$
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor>;
@@ -56,7 +63,8 @@ pub trait Backend: Send + Sync + 'static {
     /// Numerically stable softmax along the last dimension.
     fn softmax(&self, x: &Tensor) -> Result<Tensor>;
 
-    /// Embedding table lookup: gathers embedding rows for a slice of input token IDs.
+    /// Embedding table lookup: gathers rows of `table` (`[vocab, hidden]`, F32 or a
+    /// supported quantized type) for the given token IDs into an F32 `[ids.len(), hidden]`.
     fn embedding(&self, table: &Tensor, ids: &[u32]) -> Result<Tensor>;
 
     /// PagedAttention kernel.

@@ -10,9 +10,13 @@ mod benchmark;
 use benchmark::{run_comprehensive_benchmark, BenchmarkOptions};
 use clap::{Parser, Subcommand};
 use rllm_backend_cpu::CpuBackend;
-use rllm_models::{BertConfig, BertEmbeddingModel, LlamaConfig, LlamaModel};
+use rllm_models::{
+    BertConfig, BertEmbeddingModel, ChatMessage, GgufBundle, LlamaConfig, LlamaModel, LoadOptions,
+    StreamDecoder,
+};
 use rllm_rag::RagEngine;
-use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, SchedulerConfig};
+use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, SchedulerConfig, Sequence};
+use std::io::Write;
 use rllm_server::{run_server, AppState};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -42,11 +46,59 @@ enum Commands {
         #[arg(long, env = "INFERENCE_URL")]
         inference_url: Option<String>,
 
+        /// Path to a GGUF model file, or a synthetic preset: 'edge-4gb', '1b', 'tiny'
         #[arg(long, default_value = "edge-4gb")]
         model: String,
 
         #[arg(long, default_value_t = 32)]
         max_batch_size: usize,
+
+        /// Cap on the model context window (GGUF models)
+        #[arg(long, default_value_t = 4096)]
+        max_context: usize,
+
+        /// Total KV-cache capacity in tokens, shared by all concurrent sequences
+        #[arg(long, default_value_t = 16384)]
+        kv_cache_tokens: usize,
+    },
+
+    /// Generate text from a GGUF model
+    Generate {
+        /// Path to a GGUF model file (LLaMA architecture, byte-level BPE tokenizer)
+        #[arg(long)]
+        model: std::path::PathBuf,
+
+        /// User prompt (or raw text with --raw)
+        #[arg(long)]
+        prompt: String,
+
+        /// Optional system message (chat mode only)
+        #[arg(long)]
+        system: Option<String>,
+
+        /// Feed the prompt as raw text instead of applying the model's chat template
+        #[arg(long)]
+        raw: bool,
+
+        #[arg(long, default_value_t = 256)]
+        max_tokens: usize,
+
+        /// Sampling temperature; 0 selects greedy decoding
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+
+        #[arg(long, default_value_t = 0.9)]
+        top_p: f32,
+
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+
+        #[arg(long, default_value_t = 1.0)]
+        repetition_penalty: f32,
+
+        /// Cap on the model context window
+        #[arg(long, default_value_t = 4096)]
+        max_context: usize,
     },
 
     /// Run high-throughput inference performance benchmark
@@ -95,6 +147,8 @@ async fn main() -> anyhow::Result<()> {
             inference_url,
             model,
             max_batch_size,
+            max_context,
+            kv_cache_tokens,
         } => {
             use rllm_server::ServiceMode;
             let mode = match service.to_lowercase().as_str() {
@@ -107,17 +161,36 @@ async fn main() -> anyhow::Result<()> {
             let backend = Arc::new(CpuBackend);
 
             // 1. Initialize inference scheduler if mode is All or Inference
+            let mut tokenizer = None;
+            let mut chat_template = None;
+            let mut model_name = model.clone();
             let scheduler = if mode == ServiceMode::All || mode == ServiceMode::Inference {
-                let llama_cfg = match model.as_str() {
-                    "edge-4gb" => LlamaConfig::edge_4gb(),
-                    "1b" => LlamaConfig::llama_3_2_1b(),
-                    _ => LlamaConfig::tiny_test_config(),
+                let llama_model = if model.ends_with(".gguf") {
+                    let bundle = GgufBundle::load(
+                        &model,
+                        backend.clone(),
+                        &LoadOptions { max_context: Some(max_context) },
+                    )?;
+                    model_name = std::path::Path::new(&model)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or(model.clone());
+                    tokenizer = Some(Arc::new(bundle.tokenizer));
+                    chat_template = Some(Arc::new(bundle.chat_template));
+                    Arc::new(bundle.model)
+                } else {
+                    let llama_cfg = match model.as_str() {
+                        "edge-4gb" => LlamaConfig::edge_4gb(),
+                        "1b" => LlamaConfig::llama_3_2_1b(),
+                        _ => LlamaConfig::tiny_test_config(),
+                    };
+                    Arc::new(LlamaModel::new_random(llama_cfg, backend.clone())?)
                 };
-                let llama_model = Arc::new(LlamaModel::new_random(llama_cfg, backend.clone())?);
+                let block_size = 16;
                 let sched_cfg = SchedulerConfig {
                     max_batch_size,
-                    block_size: 16,
-                    total_blocks: 1024,
+                    block_size,
+                    total_blocks: kv_cache_tokens.div_ceil(block_size).max(1),
                     ..SchedulerConfig::default()
                 };
                 Some(Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?))
@@ -157,9 +230,11 @@ async fn main() -> anyhow::Result<()> {
 
             let state = Arc::new(AppState {
                 scheduler,
+                tokenizer,
+                chat_template,
                 rag_engine,
                 inference_url: inference_url.clone(),
-                model_name: model,
+                model_name,
                 mode,
             });
 
@@ -178,6 +253,32 @@ async fn main() -> anyhow::Result<()> {
             }
 
             run_server(addr, state).await?;
+        }
+
+        Commands::Generate {
+            model,
+            prompt,
+            system,
+            raw,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            max_context,
+        } => {
+            run_generate(GenerateArgs {
+                model,
+                prompt,
+                system,
+                raw,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                max_context,
+            })?;
         }
 
         Commands::Bench {
@@ -245,8 +346,10 @@ async fn main() -> anyhow::Result<()> {
 
             println!("\n🔍 Executing RAG Query: \"{}\"", query);
             let start = Instant::now();
-            let mut sampling = SamplingParams::default();
-            sampling.max_tokens = 32;
+            let sampling = SamplingParams {
+                max_tokens: 32,
+                ..SamplingParams::default()
+            };
 
             let resp = rag_engine
                 .query_with_threshold(&query, top_k, sampling, min_relevance)
@@ -280,5 +383,92 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+struct GenerateArgs {
+    model: std::path::PathBuf,
+    prompt: String,
+    system: Option<String>,
+    raw: bool,
+    max_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    repetition_penalty: f32,
+    max_context: usize,
+}
+
+/// `rllm generate`: load a GGUF model and stream a completion to stdout.
+fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
+    let load_start = Instant::now();
+    let bundle = GgufBundle::load(
+        &args.model,
+        Arc::new(CpuBackend),
+        &LoadOptions { max_context: Some(args.max_context) },
+    )?;
+    let load_time = load_start.elapsed();
+    let tokenizer = &bundle.tokenizer;
+
+    let prompt_text = if args.raw {
+        args.prompt.clone()
+    } else {
+        let mut messages = Vec::new();
+        if let Some(sys) = &args.system {
+            messages.push(ChatMessage::new("system", sys));
+        }
+        messages.push(ChatMessage::new("user", &args.prompt));
+        bundle.chat_template.render(&messages, true)?
+    };
+    let prompt_tokens = tokenizer.encode(&prompt_text, true, true);
+    let prompt_len = prompt_tokens.len();
+
+    let block_size = 16;
+    let needed = (prompt_len + args.max_tokens + 1).min(bundle.model.config.max_position_embeddings);
+    let scheduler = ContinuousBatchScheduler::new(
+        SchedulerConfig {
+            max_batch_size: 1,
+            block_size,
+            total_blocks: needed.div_ceil(block_size),
+            max_prefill_tokens: prompt_len.max(1),
+        },
+        Arc::new(bundle.model),
+    )?;
+
+    let sampling = SamplingParams {
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+        repetition_penalty: args.repetition_penalty,
+        max_tokens: args.max_tokens,
+        stop_tokens: tokenizer.stop_token_ids.clone(),
+    };
+    let seq = Sequence::new(1, prompt_tokens, sampling, block_size, None);
+
+    let mut decoder = StreamDecoder::default();
+    let mut stdout = std::io::stdout().lock();
+    let start = Instant::now();
+    let mut first_token_at = None;
+    let generated = scheduler.generate(seq, |tok| {
+        first_token_at.get_or_insert_with(|| start.elapsed());
+        let text = decoder.push(tokenizer, tok, true);
+        let _ = stdout.write_all(text.as_bytes());
+        let _ = stdout.flush();
+    })?;
+    let _ = writeln!(stdout, "{}", decoder.finish());
+    let total = start.elapsed();
+
+    let ttft = first_token_at.unwrap_or(total);
+    let decode_tokens = generated.len().saturating_sub(1);
+    let decode_secs = (total - ttft).as_secs_f64();
+    eprintln!(
+        "\n[rllm] load {:.2?} | prompt {} tokens, prefill {:.2?} ({:.1} tok/s) | generated {} tokens, decode {:.1} tok/s",
+        load_time,
+        prompt_len,
+        ttft,
+        prompt_len as f64 / ttft.as_secs_f64().max(1e-9),
+        generated.len(),
+        if decode_secs > 0.0 { decode_tokens as f64 / decode_secs } else { 0.0 },
+    );
     Ok(())
 }
