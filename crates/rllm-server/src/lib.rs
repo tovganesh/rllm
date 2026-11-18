@@ -80,7 +80,8 @@ mod tests {
                 SchedulerConfig {
                     max_batch_size: 4,
                     block_size: 4,
-                    total_blocks: 32,
+                    total_blocks: 512,
+                    ..SchedulerConfig::default()
                 },
                 llama_model,
             )

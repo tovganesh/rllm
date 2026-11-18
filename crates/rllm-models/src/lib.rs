@@ -11,6 +11,7 @@
 pub mod config;
 pub mod embedding;
 pub mod gguf;
+pub mod init;
 pub mod llama;
 pub mod tokenizer;
 pub mod weights;
@@ -18,7 +19,7 @@ pub mod weights;
 pub use config::{BertConfig, LlamaConfig};
 pub use embedding::BertEmbeddingModel;
 pub use gguf::{GgufFile, GgufTensorInfo};
-pub use llama::LlamaModel;
+pub use llama::{ForwardBatch, LlamaModel};
 pub use tokenizer::{
     Tokenizer, ASSISTANT_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, SYSTEM_TOKEN_ID,
     UNK_TOKEN_ID, USER_TOKEN_ID,
@@ -110,5 +111,19 @@ mod tests {
         assert_eq!(emb.len(), config.hidden_size);
         let norm_sq: f32 = emb.iter().map(|&v| v * v).sum();
         assert!((norm_sq - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_bert_embedding_truncates_long_input_and_rejects_empty() {
+        let backend = Arc::new(CpuBackend);
+        let config = BertConfig::tiny_test_config();
+        let model = BertEmbeddingModel::new_random(config.clone(), backend).unwrap();
+
+        let long: Vec<u32> = (0..config.max_position_embeddings as u32 * 3).map(|i| i % 500).collect();
+        let emb = model.embed(&long).unwrap();
+        assert_eq!(emb.len(), config.hidden_size);
+        assert!(emb.iter().all(|v| v.is_finite()));
+
+        assert!(model.embed(&[]).is_err());
     }
 }

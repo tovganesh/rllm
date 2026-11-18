@@ -58,9 +58,25 @@ impl BlockAllocator {
         Ok(block_id)
     }
 
-    /// Increments the reference count of a shared physical block (e.g. for prefix caching).
+    /// Increments the reference count of an **allocated** physical block (e.g. when a
+    /// sequence or the prefix cache starts sharing it).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the block is currently free: sharing a free block would let the
+    /// allocator hand it out again while it is still referenced.
     pub fn inc_ref(&mut self, block_id: usize) {
+        assert!(
+            self.ref_counts[block_id] > 0,
+            "inc_ref on free KV block {}",
+            block_id
+        );
         self.ref_counts[block_id] += 1;
+    }
+
+    /// Current reference count of a block (0 means free).
+    pub fn ref_count(&self, block_id: usize) -> usize {
+        self.ref_counts.get(block_id).copied().unwrap_or(0)
     }
 
     /// Decrements the reference count of a block, recycling it back into the free pool when it hits 0.
@@ -76,11 +92,12 @@ impl BlockAllocator {
         }
     }
 
-    /// Releases all blocks referenced in a sequence's [`BlockTable`].
-    pub fn free_table(&mut self, table: &BlockTable) {
+    /// Releases all blocks referenced in a sequence's [`BlockTable`] and empties it.
+    pub fn free_table(&mut self, table: &mut BlockTable) {
         for &block_id in &table.block_ids {
             self.free_block(block_id);
         }
+        table.block_ids.clear();
     }
 
     /// Ensures that the provided [`BlockTable`] contains sufficient physical blocks
@@ -94,7 +111,7 @@ impl BlockAllocator {
         table: &mut BlockTable,
         token_count: usize,
     ) -> Result<()> {
-        let needed_blocks = (token_count + self.block_size - 1) / self.block_size;
+        let needed_blocks = token_count.div_ceil(self.block_size);
         while table.block_ids.len() < needed_blocks {
             let block_id = self.allocate_block()?;
             table.block_ids.push(block_id);
@@ -105,3 +122,26 @@ impl BlockAllocator {
 
 /// Thread-safe shared block allocator wrapped in an `Arc<Mutex<BlockAllocator>>`.
 pub type SharedBlockAllocator = Arc<Mutex<BlockAllocator>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "inc_ref on free KV block")]
+    fn inc_ref_on_free_block_panics() {
+        let mut a = BlockAllocator::new(4, 2);
+        a.inc_ref(0);
+    }
+
+    #[test]
+    fn shared_block_is_freed_only_after_last_reference() {
+        let mut a = BlockAllocator::new(4, 2);
+        let b = a.allocate_block().unwrap();
+        a.inc_ref(b);
+        a.free_block(b);
+        assert_eq!(a.num_free_blocks(), 1);
+        a.free_block(b);
+        assert_eq!(a.num_free_blocks(), 2);
+    }
+}

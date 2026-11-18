@@ -11,15 +11,17 @@ use rllm_backend_cpu::{
     ops::{
         gemm::gemv_f32,
         norm::rms_norm_f32,
-        paged_attn::paged_attention_decode_single,
         quant::{gemv_q4_0_f32, quantize_f32_to_q4_0},
     },
     CpuBackend,
 };
 use rllm_core::{
-    backend::BlockTable,
+    backend::{Backend, BlockTable},
+    device::Device,
     dtype::DType,
     error::Result,
+    shape::Shape,
+    tensor::Tensor,
 };
 use rllm_models::{LlamaConfig, LlamaModel};
 use rllm_scheduler::{
@@ -151,6 +153,7 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
         max_batch_size: opts.batch_size,
         block_size: 16,
         total_blocks: 2048,
+        ..SchedulerConfig::default()
     };
     let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, model)?);
 
@@ -160,11 +163,13 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
 
     let prompt: Vec<u32> = (0..opts.prompt_tokens).map(|i| (i % 500 + 1) as u32).collect();
 
-    // Warmup iterations
+    // Warmup iterations use a different prompt so the measured batch does not hit
+    // the prefix cache.
+    let warmup_prompt: Vec<u32> = prompt.iter().map(|&t| t % 500 + 501).collect();
     for w in 0..opts.warmup {
         let seq = Sequence::new(
             (1000 + w) as u64,
-            prompt.clone(),
+            warmup_prompt.clone(),
             sampling.clone(),
             scheduler.config.block_size,
             None,
@@ -197,12 +202,13 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
         let gen = scheduler.step()?;
         let step_elapsed = step_start.elapsed().as_secs_f64() * 1000.0;
 
-        if ttft.is_none() && !gen.is_empty() {
-            ttft = Some(start_time.elapsed());
-        }
-
         if !gen.is_empty() {
-            step_latencies.push(step_elapsed);
+            if ttft.is_none() {
+                // First step performs prefill; it is reported as TTFT, not decode latency.
+                ttft = Some(start_time.elapsed());
+            } else {
+                step_latencies.push(step_elapsed);
+            }
             total_tokens += gen.len();
         }
 
@@ -299,29 +305,32 @@ fn benchmark_micro_kernels(config: &LlamaConfig) -> Result<()> {
     let num_heads_q = config.num_attention_heads;
     let num_heads_kv = config.num_key_value_heads;
 
-    let q = vec![1.0f32; num_heads_q * head_dim];
-    let k_cache = vec![1.0f32; num_blocks * num_heads_kv * block_size * head_dim];
-    let v_cache = vec![1.0f32; num_blocks * num_heads_kv * block_size * head_dim];
-    let block_table = BlockTable {
+    let q = Tensor::from_f32(
+        &vec![1.0f32; num_heads_q * head_dim],
+        Shape::new(vec![1, num_heads_q, head_dim]),
+        Device::Cpu,
+    )?;
+    let cache_shape = Shape::new(vec![num_blocks, num_heads_kv, block_size, head_dim]);
+    let numel = num_blocks * num_heads_kv * block_size * head_dim;
+    let k_cache = Tensor::from_f32(&vec![1.0f32; numel], cache_shape.clone(), Device::Cpu)?;
+    let v_cache = Tensor::from_f32(&vec![1.0f32; numel], cache_shape, Device::Cpu)?;
+    let block_tables = vec![BlockTable {
         block_size,
         block_ids: (0..num_blocks).collect(),
-    };
-    let mut attn_out = vec![0.0f32; num_heads_q * head_dim];
+    }];
+    let context_lens = vec![block_size * num_blocks];
+    let backend = CpuBackend;
 
     let start = Instant::now();
     for _ in 0..iters {
-        paged_attention_decode_single(
+        let _ = backend.paged_attention(
             &q,
             &k_cache,
             &v_cache,
-            &block_table,
-            block_size * num_blocks,
-            num_heads_q,
-            num_heads_kv,
-            head_dim,
+            &block_tables,
+            &context_lens,
             1.0 / (head_dim as f32).sqrt(),
-            &mut attn_out,
-        );
+        )?;
     }
     let attn_dur = start.elapsed() / (iters as u32);
     println!("   • PagedAttention (1024 ctx): {:.2?}", attn_dur);
@@ -345,6 +354,7 @@ fn run_batch_scaling_analysis(config: &LlamaConfig) -> Result<()> {
             max_batch_size: bs,
             block_size: 16,
             total_blocks: 1024,
+            ..SchedulerConfig::default()
         };
         let scheduler = ContinuousBatchScheduler::new(sched_cfg, model.clone())?;
 
@@ -398,6 +408,7 @@ fn run_prefix_cache_benchmark(config: &LlamaConfig) -> Result<()> {
         max_batch_size: 2,
         block_size: 16,
         total_blocks: 512,
+        ..SchedulerConfig::default()
     };
     let scheduler = ContinuousBatchScheduler::new(sched_cfg, model)?;
 

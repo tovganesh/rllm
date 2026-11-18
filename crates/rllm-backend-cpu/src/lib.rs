@@ -148,4 +148,37 @@ mod tests {
             assert!((val - 2.0).abs() < 1e-4);
         }
     }
+
+    #[test]
+    fn test_matmul_with_transposed_weight_view() {
+        // y = x · Wᵀ for W stored [out=3, in=2]; previously returned [3, 2, 2].
+        let backend = CpuBackend;
+        let x = Tensor::from_f32(&[1.0, 2.0, -1.0, 0.5], Shape::new(vec![2, 2]), Device::Cpu).unwrap();
+        let w = Tensor::from_f32(&[1., 0., 0., 1., 1., 1.], Shape::new(vec![3, 2]), Device::Cpu).unwrap();
+        let y = backend.matmul(&x, &w.transpose(0, 1).unwrap()).unwrap();
+        assert_eq!(y.dims(), &[2, 3]);
+        assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, -1.0, 0.5, -0.5]);
+
+        // Larger shapes exercise the parallel NT path against the materialised NN path.
+        let (m, k, n) = (7, 33, 19);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let wv: Vec<f32> = (0..n * k).map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0).collect();
+        let a = Tensor::from_f32(&a, Shape::new(vec![m, k]), Device::Cpu).unwrap();
+        let w = Tensor::from_f32(&wv, Shape::new(vec![n, k]), Device::Cpu).unwrap();
+        let wt = w.transpose(0, 1).unwrap();
+        let fast = backend.matmul(&a, &wt).unwrap().to_vec::<f32>().unwrap();
+        let slow = backend.matmul(&a, &wt.contiguous().unwrap()).unwrap().to_vec::<f32>().unwrap();
+        for (f, s) in fast.iter().zip(&slow) {
+            assert!((f - s).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_non_contiguous_views_are_materialised_or_rejected() {
+        let t = Tensor::from_f32(&[1., 2., 3., 4., 5., 6.], Shape::new(vec![2, 3]), Device::Cpu).unwrap();
+        let tt = t.transpose(0, 1).unwrap();
+        assert!(tt.as_f32_slice().is_err(), "strided view must not be read as contiguous");
+        assert_eq!(tt.to_vec::<f32>().unwrap(), vec![1., 4., 2., 5., 3., 6.]);
+        assert_eq!(tt.contiguous().unwrap().as_f32_slice().unwrap(), &[1., 4., 2., 5., 3., 6.]);
+    }
 }

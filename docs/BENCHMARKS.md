@@ -1,7 +1,7 @@
 # `rllm` Benchmarks
 
 > [!IMPORTANT]
-> **Previously published end-to-end numbers have been withdrawn.** They were measured on synthetic (constant) weights, with no prompt prefill and with known correctness bugs in the decode path (see the [README](../README.md#-known-issues)). They do not describe the behaviour of a real model and should not be cited.
+> **Previously published end-to-end numbers have been withdrawn.** They were measured on synthetic (constant) weights, with no prompt prefill and with correctness bugs in the decode path that have since been fixed. They do not describe the behaviour of a real model and should not be cited.
 >
 > Benchmarks will be re-run once `rllm` can load and correctly execute a real model (roadmap items P0 and P1), and will be reported alongside a reference engine (e.g. llama.cpp) on the same hardware.
 
@@ -15,8 +15,8 @@
 | :--- | :--- | :--- |
 | Memory footprint table | Arithmetic estimate from the preset's parameter count and KV-cache size | **Estimate only.** Not a measured RSS. The presets are not real model configurations. |
 | Micro-kernels (F32 GEMV, Q4_0 GEMV, RMSNorm, PagedAttention decode) | Times individual CPU kernels on random-shaped buffers | **Usable as relative kernel timings.** Kernels are un-tuned (scalar Q4_0 inner loop, no tiling), so absolute numbers are far from state of the art. |
-| End-to-end decode (TTFT, per-token latency, throughput, batch scaling) | Runs `ContinuousBatchScheduler::step` on a synthetic model | **Invalid.** No prefill is performed and projections compute the wrong product. |
-| Radix prefix cache (cold vs warm) | Submits the same prompt twice | **Invalid.** With no prefill there is no work for the cache to skip, so cold and warm timings are effectively equal. |
+| End-to-end decode (TTFT, per-token latency, throughput, batch scaling) | Runs `ContinuousBatchScheduler::step` on a synthetic model | **Mechanically correct, not citable.** Prefill and decode now compute the right thing (verified against a reference implementation), but on synthetic weights with an untiled GEMM. TTFT is the prefill step; decode latency excludes it. |
+| Radix prefix cache (cold vs warm) | Submits the same prompt twice | **Meaningful as a relative figure.** The warm run reuses cached KV blocks and only prefills the uncached tail. |
 
 ---
 

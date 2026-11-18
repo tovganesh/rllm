@@ -7,7 +7,7 @@
 A modular, multi-backend LLM inference engine and hybrid RAG platform written in Rust from the ground up.
 
 > [!WARNING]
-> **`rllm` is an early-stage prototype.** The crate structure, core data structures and several CPU kernels exist, but the engine **cannot yet load or run a real model**. All models are built with synthetic weights (`new_random`), and there are known correctness bugs in the decode path (see [Known Issues](#-known-issues)). Do not use it for anything beyond experimentation and development.
+> **`rllm` is an early-stage prototype.** The crate structure, core data structures and several CPU kernels exist, but the engine **cannot yet load or run a real model**. All models are built with synthetic weights (`new_random`); see [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
 
 ---
 
@@ -21,11 +21,11 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | :--- | :---: | :--- |
 | Tensor, `Shape`, `DType`, `Device`, `Backend` trait (`rllm-core`) | ✅ | Strided views exist, but CPU kernels assume contiguous inputs. |
 | CPU F32 kernels: GEMV, RMSNorm, LayerNorm, RoPE, SwiGLU, GELU, softmax | ✅ | GEMV/dot use ARM NEON on `aarch64`, scalar elsewhere; Rayon-parallel. |
-| CPU GEMM | 🟡 | Naive row-parallel triple loop; not cache-tiled. |
+| CPU GEMM | 🟡 | Row-parallel; `A·Wᵀ` uses contiguous dot products, `A·B` a row-streaming AXPY loop. Not cache-tiled. |
 | Q4_0 / Q8_0 quantized GEMV (no full dequantization) | ✅ | Scalar inner loop; not yet SIMD. |
 | Q4_K, F16, BF16 compute | 📋 | Declared in `DType` only. |
 | AVX2 / AVX-512 kernels | 📋 | |
-| PagedAttention decode kernel (CPU) | ✅ | Single-token decode only. |
+| PagedAttention kernel (CPU) | ✅ | Causal prefill and batched decode; parallel over (row, head). |
 | Metal backend | ⛔ | MSL shader source exists; every `Backend` method returns an error. |
 | CUDA backend | 📋 | No crate yet. |
 
@@ -33,7 +33,7 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 
 | Component | Status | Notes |
 | :--- | :---: | :--- |
-| LLaMA-style decoder (GQA, RoPE, SwiGLU) | 🟡 | Decode-only forward pass with synthetic weights. No prefill. |
+| LLaMA-style decoder (GQA, RoPE, SwiGLU) | 🟡 | Mixed prefill + decode forward pass, verified against a reference implementation. Synthetic (seeded) weights only. |
 | BERT-style embedding encoder | 🟡 | Synthetic weights; single-head attention. |
 | GGUF parser | 🟡 | Parses header, metadata and tensor descriptors; **does not load tensor data or build a model**. |
 | Safetensors loader | 📋 | |
@@ -45,8 +45,8 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | Component | Status | Notes |
 | :--- | :---: | :--- |
 | Paged KV block allocator with ref-counts | ✅ | |
-| Radix-tree prefix cache | 🟡 | Matching/insertion works; block ownership is broken (see Known Issues). |
-| Continuous batching (iteration-level) | 🟡 | `step()` batches running sequences; driven synchronously by request handlers rather than a dedicated engine loop. No preemption. |
+| Radix-tree prefix cache | ✅ | Ref-counted block ownership with LRU leaf eviction; reused prefixes skip prefill. |
+| Continuous batching (iteration-level) | 🟡 | `step()` mixes prefill of new sequences with decode of running ones and preempts (recompute) under KV pressure; still driven synchronously by request handlers rather than a dedicated engine loop. |
 | Sampler (temperature, top-k, top-p, repetition penalty) | ✅ | |
 | Speculative decoding | 📋 | |
 
@@ -73,24 +73,23 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 
 ---
 
-## 🐞 Known Issues
+## 🐞 Known Issues & Limitations
 
-These are tracked as the first ("P0") items on the roadmap:
+The P0 correctness issues found in the initial review (stride-ignoring matmul on transposed weights, missing prefill, per-batch RoPE, prefix-cache block ownership, unbounded inputs, unaligned storage) have been fixed and are covered by numerical reference tests (`crates/rllm-models/tests/reference_forward.rs`, `crates/rllm-scheduler/tests/scheduler_behaviour.rs`).
 
-1. **Weight projections compute the wrong product.** Models call `matmul(x, W.transpose(0, 1))`, but CPU `matmul` ignores strides, so transposed views are read as if contiguous.
-2. **No prefill.** The scheduler only feeds the last prompt token to the model; the KV cache for earlier prompt positions is never populated.
-3. **Prefix cache does not own its blocks.** Blocks are returned to the free pool while the radix tree still references them, so a later sequence can be given a block that is already in use.
-4. **RoPE is applied once per sequence to the whole batch** in `LlamaModel::forward_decode`, rotating every sequence `batch_size` times.
-5. **Unbounded inputs can panic.** Inputs longer than `max_position_embeddings` index out of bounds; with `panic = "abort"` in the release profile this terminates the server.
-6. **Storage alignment.** `CpuStorage` is a `Vec<u8>` reinterpreted as `&[f32]`, which is not guaranteed to be correctly aligned.
+Remaining limitations:
 
-The existing unit tests use uniform constant weights and therefore do not detect issues 1 and 4.
+1. **No real model can be loaded yet.** All weights are synthetic; GGUF tensor loading and a real tokenizer are the next milestone (P1).
+2. **HTTP chat and embeddings endpoints do not tokenize input text** (placeholder token IDs).
+3. **Request handlers drive the scheduler synchronously** instead of a dedicated engine loop; concurrent requests contend on one lock.
+4. **The prefix cache only records completed sequences** and shares whole blocks only (no copy-on-write of partial blocks).
+5. **Prefill uses an untiled GEMM**, so time-to-first-token is slow for long prompts.
 
 ---
 
 ## 🗺️ Roadmap
 
-- **P0 — Correctness:** fix projection layout, add prefill with causal masking, per-sequence RoPE, prefix-cache block ownership, aligned storage, input bounds; add numerical reference tests.
+- **P0 — Correctness:** ✅ done — projection layout, causal prefill, per-token RoPE, prefix-cache block ownership, aligned storage, input bounds, numerical reference tests.
 - **P1 — Real models:** GGUF tensor loading (mmap), LLaMA weight mapping, a real BPE tokenizer and chat templates, a real embedding model, LLM-generated grounded answers.
 - **P2 — Serving:** dedicated engine loop with per-request channels, SSE streaming, preemption, cancellation, request limits, structured errors, metrics.
 - **P3 — Performance & backends:** tiled GEMM, SIMD quantized kernels, Q4_K, F16 KV cache, Metal pipeline dispatch, CUDA behind a feature flag; re-benchmark against a real model.

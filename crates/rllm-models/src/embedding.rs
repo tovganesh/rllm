@@ -5,7 +5,7 @@ use rllm_backend_cpu::ops::activations::gelu_f32;
 use rllm_backend_cpu::ops::norm::layer_norm_f32;
 use rllm_core::{
     backend::Backend,
-    error::Result,
+    error::{Result, RllmError},
     shape::Shape,
     tensor::Tensor,
 };
@@ -99,7 +99,20 @@ impl<B: Backend> BertEmbeddingModel<B> {
 
     /// Forward pass generating a normalized embedding vector for input token IDs.
     /// Performs mean-pooling over sequence tokens followed by L2 normalization.
+    ///
+    /// Inputs longer than `max_position_embeddings` are truncated, as is standard for
+    /// encoder embedding models.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `token_ids` is empty or contains an ID outside the vocabulary.
     pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
+        if token_ids.is_empty() {
+            return Err(RllmError::BackendError(
+                "embed: input must contain at least one token".to_string(),
+            ));
+        }
+        let token_ids = &token_ids[..token_ids.len().min(self.config.max_position_embeddings)];
         let seq_len = token_ids.len();
         let h = self.config.hidden_size;
 
