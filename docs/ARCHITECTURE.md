@@ -27,13 +27,13 @@ flowchart TD
     subgraph SchedulerLayer ["Scheduling (rllm-scheduler)"]
         Batcher["Continuous batching 🟡"]
         Paged["Paged KV block allocator ✅"]
-        Radix["Radix prefix cache 🟡"]
+        Radix["Radix prefix cache ✅"]
         SpecDec["Speculative decoding 📋"]
     end
 
     subgraph ModelLayer ["Models (rllm-models)"]
         Weights["GGUF header parser 🟡 · tensor loading 📋 · Safetensors 📋"]
-        Llama["LLaMA-style decoder 🟡 (decode only, synthetic weights)"]
+        Llama["LLaMA-style decoder 🟡 (prefill + decode, synthetic weights)"]
         Embed["BERT-style encoder 🟡 (synthetic weights)"]
         Tok["Tokenizer 🟡 (word list, not BPE)"]
     end
@@ -89,7 +89,8 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 ### 4.1 Tensor & Backend Abstraction (`rllm-core`) — ✅
 
 - `Tensor` holds a shape, strides, dtype, device, byte offset and a `Storage` (`Cpu`, `Metal`, `Cuda`). Only `Cpu` storage holds data; `Metal`/`Cuda` variants are placeholders.
-- `reshape` and `transpose` are zero-copy views. **CPU kernels currently read storage as contiguous and ignore strides** — see Known Issues.
+- `reshape` and `transpose` are zero-copy views. `as_f32_slice` rejects non-contiguous views; `contiguous()` materialises them. CPU `matmul` recognises a transposed contiguous weight (`W.transpose(0, 1)`) and computes `A·Wᵀ` with row dot products without copying.
+- `CpuStorage` is 64-byte aligned.
 - `Backend` is an object-safe trait with: `matmul`, `rms_norm`, `rope`, `swiglu`, `softmax`, `embedding`, `paged_attention`, `gemv_quantized`.
 - `DType` declares `F32, F16, BF16, I32, I8, Q4_0, Q4_K, Q8_0`. Only `F32` compute and `Q4_0`/`Q8_0` GEMV are implemented.
 
@@ -102,7 +103,8 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 
 ### 4.3 Models (`rllm-models`) — 🟡
 
-- `LlamaModel::forward_decode` runs one token per sequence through embedding → N × (RMSNorm, QKV, RoPE, KV write, PagedAttention, O-proj, RMSNorm, SwiGLU MLP) → final norm → LM head. There is **no prefill** (multi-token) forward.
+- `LlamaModel::forward` takes a flattened batch of rows, each with its own token, absolute position and block table: embedding → N × (RMSNorm, QKV, per-row RoPE, KV write for every row, causal PagedAttention, O-proj, RMSNorm, SwiGLU MLP) → final norm → LM head for selected rows only. All prompt tokens of a sequence = causal prefill; one token per sequence = batched decode; both can be mixed. `forward_decode` is a convenience wrapper.
+- Numerical tests compare it against a naive dense reference implementation.
 - `BertEmbeddingModel::embed` runs a simplified encoder with mean pooling and L2 normalisation.
 - Both models are constructed only via `new_random` (constant / patterned weights).
 - `GgufFile::read_from_bytes` parses magic, version, metadata KV pairs and tensor descriptors, and computes the aligned data offset. It does not read tensor payloads or map them onto model layers.
@@ -111,8 +113,8 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 ### 4.4 Scheduling (`rllm-scheduler`) — 🟡
 
 - **Paged KV cache:** per-layer K/V tensors of shape `[total_blocks, num_kv_heads, block_size, head_dim]`; `BlockAllocator` hands out block IDs from a free list with reference counts.
-- **Radix prefix cache:** a token trie that records a physical block ID at every `block_size` boundary; `match_prefix` returns the longest fully cached block-aligned prefix. Target design: the cache holds its own reference to cached blocks, evicts LRU, and copy-on-write protects shared partial blocks. **Today it holds no reference** (Known Issue 3).
-- **Continuous batching:** `step()` admits waiting sequences while blocks are available, ensures capacity for the next token, runs one batched decode, samples, and retires finished sequences. Target design: a dedicated engine loop that performs prefill for newly admitted sequences, supports preemption, and serves requests through per-sequence channels.
+- **Radix prefix cache:** a token trie that records a physical block ID at every `block_size` boundary; `match_prefix` returns the longest fully cached block-aligned prefix. The cache holds one allocator reference per cached block, so cached blocks are never on the free list; when the pool is exhausted, least-recently-used leaf blocks not used by any sequence are evicted. Matching happens at admission and always leaves at least one token to compute. Only full blocks are shared (no copy-on-write of partial blocks yet).
+- **Continuous batching:** `step()` admits waiting sequences while blocks are available, ensures capacity for the next token, runs one batched decode, samples, and retires finished sequences. Each step prefills newly admitted sequences (subject to `max_prefill_tokens`) together with decoding running ones; under KV pressure the newest sequence is preempted and later recomputed. Target design: a dedicated engine loop serving requests through per-sequence channels.
 - **Sampler:** greedy, temperature, top-k, top-p, repetition penalty.
 
 ### 4.5 RAG (`rllm-rag`)
@@ -137,4 +139,4 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 
 ## 5. Known Issues
 
-See the [README](../README.md#-known-issues). In short: stride-ignoring matmul on transposed weights, no prefill, per-batch RoPE applied repeatedly, prefix-cache block ownership, unbounded input lengths, and unaligned `f32` views over byte storage.
+See the [README](../README.md#-known-issues--limitations). The P0 correctness issues are fixed; the main remaining gap is that no real model or tokenizer can be loaded yet.
