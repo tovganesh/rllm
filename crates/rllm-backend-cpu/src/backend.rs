@@ -1,12 +1,13 @@
 use crate::ops::{
     activations::swiglu_f32,
-    gemm::gemm_f32,
+    gemm::{gemm_f32, gemm_nt_f32},
     norm::rms_norm_f32,
-    paged_attn::paged_attention_decode_single,
+    paged_attn::paged_attention_head,
     quant::{gemv_q4_0_f32, gemv_q8_0_f32},
     rope::rope_f32,
     softmax::softmax_inplace,
 };
+use rayon::prelude::*;
 use rllm_core::{
     backend::{Backend, BlockTable},
     device::Device,
@@ -24,40 +25,51 @@ impl Backend for CpuBackend {
         Device::Cpu
     }
 
+    /// Matrix multiplication `A[..., M, K] · B[K, N]`.
+    ///
+    /// Leading dimensions of `A` are flattened into rows. `B` must be rank 2 and may be
+    /// either contiguous or a transposed view of a contiguous `[N, K]` matrix (the
+    /// usual `weight.transpose(0, 1)` pattern), which dispatches to a dot-product kernel
+    /// without copying. Any other strided operand is materialised first.
     fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         let a_dims = a.dims();
         let b_dims = b.dims();
 
-        if a_dims.len() < 2 || b_dims.len() < 2 {
-            return Err(RllmError::BackendError(
-                "Matmul requires tensors of rank >= 2".to_string(),
-            ));
+        if a_dims.len() < 2 || b_dims.len() != 2 {
+            return Err(RllmError::BackendError(format!(
+                "Matmul requires A of rank >= 2 and B of rank 2, got {:?} x {:?}",
+                a_dims, b_dims
+            )));
         }
 
-        let m = a_dims[a_dims.len() - 2];
-        let k_a = a_dims[a_dims.len() - 1];
-        let k_b = b_dims[b_dims.len() - 2];
-        let n = b_dims[b_dims.len() - 1];
-
-        if k_a != k_b {
+        let k = a_dims[a_dims.len() - 1];
+        let (k_b, n) = (b_dims[0], b_dims[1]);
+        if k != k_b {
             return Err(RllmError::ShapeMismatch {
-                expected: vec![m, k_a],
-                got: vec![k_b, n],
+                expected: vec![k, n],
+                got: b_dims.to_vec(),
             });
         }
+        let m = a.numel() / k.max(1);
 
+        let a = a.contiguous()?;
         let a_slice = a.as_f32_slice()?;
-        let b_slice = b.as_f32_slice()?;
 
-        let mut out_dims = a_dims[..a_dims.len() - 2].to_vec();
-        out_dims.push(m);
+        let mut out_dims = a_dims[..a_dims.len() - 1].to_vec();
         out_dims.push(n);
-        let out_shape = Shape::new(out_dims);
-
-        let mut out = Tensor::zeros(out_shape, DType::F32, Device::Cpu)?;
+        let mut out = Tensor::zeros(Shape::new(out_dims), DType::F32, Device::Cpu)?;
         let out_slice = out.as_mut_f32_slice()?;
 
-        gemm_f32(a_slice, b_slice, out_slice, m, k_a, n);
+        // B is a transposed view of a contiguous [N, K] matrix: strides == [1, K].
+        let is_transposed_contiguous = b.strides() == [1, k] && (n > 1 || k > 1);
+        if b.is_contiguous() {
+            gemm_f32(a_slice, b.as_f32_slice()?, out_slice, m, k, n);
+        } else if is_transposed_contiguous {
+            gemm_nt_f32(a_slice, b.storage_f32_slice()?, out_slice, m, k, n);
+        } else {
+            let b = b.contiguous()?;
+            gemm_f32(a_slice, b.as_f32_slice()?, out_slice, m, k, n);
+        }
         Ok(out)
     }
 
@@ -80,30 +92,37 @@ impl Backend for CpuBackend {
         &self,
         q: &mut Tensor,
         k: &mut Tensor,
-        freqs_cos: &Tensor,
-        freqs_sin: &Tensor,
+        cos_table: &Tensor,
+        sin_table: &Tensor,
+        positions: &[usize],
     ) -> Result<()> {
-        let q_dims = q.dims();
-        let _k_dims = k.dims();
+        let head_dim = *q.dims().last().ok_or_else(|| {
+            RllmError::BackendError("RoPE query tensor cannot be scalar".to_string())
+        })?;
+        let num_tokens = positions.len();
+        let per_token = num_tokens * head_dim;
+        if num_tokens == 0 || !q.numel().is_multiple_of(per_token) || !k.numel().is_multiple_of(per_token) {
+            return Err(RllmError::BackendError(format!(
+                "RoPE: q {:?} / k {:?} not divisible into {} tokens of head_dim {}",
+                q.dims(), k.dims(), num_tokens, head_dim
+            )));
+        }
+        let num_heads_q = q.numel() / (num_tokens * head_dim);
+        let num_heads_k = k.numel() / (num_tokens * head_dim);
 
-        let head_dim = *q_dims.last().unwrap();
-        let num_heads_q = q.numel() / head_dim;
-        let num_heads_k = k.numel() / head_dim;
+        let half_dim = head_dim / 2;
+        let cos_slice = cos_table.as_f32_slice()?;
+        let sin_slice = sin_table.as_f32_slice()?;
+        let max_positions = cos_slice.len() / half_dim.max(1);
+        if let Some(&bad) = positions.iter().find(|&&p| p >= max_positions) {
+            return Err(RllmError::BackendError(format!(
+                "RoPE position {} exceeds table size {}",
+                bad, max_positions
+            )));
+        }
 
-        let cos_slice = freqs_cos.as_f32_slice()?;
-        let sin_slice = freqs_sin.as_f32_slice()?;
-        let q_slice = q.as_mut_f32_slice()?;
-        let k_slice = k.as_mut_f32_slice()?;
-
-        rope_f32(
-            q_slice,
-            k_slice,
-            num_heads_q,
-            num_heads_k,
-            head_dim,
-            cos_slice,
-            sin_slice,
-        );
+        rope_f32(q.as_mut_f32_slice()?, num_heads_q, head_dim, positions, cos_slice, sin_slice);
+        rope_f32(k.as_mut_f32_slice()?, num_heads_k, head_dim, positions, cos_slice, sin_slice);
         Ok(())
     }
 
@@ -166,40 +185,70 @@ impl Backend for CpuBackend {
         context_lens: &[usize],
         scale: f32,
     ) -> Result<Tensor> {
-        let batch_size = block_tables.len();
-        let q_dims = q.dims(); // [batch_size, num_heads_q, head_dim]
-        let num_heads_q = q_dims[1];
-        let head_dim = q_dims[2];
-
+        let q_dims = q.dims(); // [num_rows, num_heads_q, head_dim]
+        if q_dims.len() != 3 {
+            return Err(RllmError::BackendError(format!(
+                "paged_attention expects q of rank 3, got {:?}",
+                q_dims
+            )));
+        }
+        let (num_rows, num_heads_q, head_dim) = (q_dims[0], q_dims[1], q_dims[2]);
         let k_dims = k_cache.dims(); // [num_blocks, num_heads_kv, block_size, head_dim]
         let num_heads_kv = k_dims[1];
+        if block_tables.len() != num_rows || context_lens.len() != num_rows {
+            return Err(RllmError::BackendError(format!(
+                "paged_attention: {} query rows but {} block tables / {} context lengths",
+                num_rows,
+                block_tables.len(),
+                context_lens.len()
+            )));
+        }
+        if num_heads_kv == 0 || num_heads_q % num_heads_kv != 0 {
+            return Err(RllmError::BackendError(format!(
+                "paged_attention: {} query heads not divisible by {} KV heads",
+                num_heads_q, num_heads_kv
+            )));
+        }
+        for (bt, &len) in block_tables.iter().zip(context_lens) {
+            if len == 0 || bt.block_ids.len() * bt.block_size < len {
+                return Err(RllmError::BackendError(format!(
+                    "paged_attention: context length {} not covered by {} blocks of {}",
+                    len,
+                    bt.block_ids.len(),
+                    bt.block_size
+                )));
+            }
+        }
+        let heads_per_group = num_heads_q / num_heads_kv;
 
         let mut out = Tensor::zeros(q.shape().clone(), DType::F32, Device::Cpu)?;
-
         let q_slice = q.as_f32_slice()?;
         let k_slice = k_cache.as_f32_slice()?;
         let v_slice = v_cache.as_f32_slice()?;
         let out_slice = out.as_mut_f32_slice()?;
 
-        let q_stride = num_heads_q * head_dim;
-
-        for b in 0..batch_size {
-            let q_b = &q_slice[b * q_stride..(b + 1) * q_stride];
-            let out_b = &mut out_slice[b * q_stride..(b + 1) * q_stride];
-
-            paged_attention_decode_single(
-                q_b,
-                k_slice,
-                v_slice,
-                &block_tables[b],
-                context_lens[b],
-                num_heads_q,
-                num_heads_kv,
-                head_dim,
-                scale,
-                out_b,
-            );
-        }
+        // Parallelise over every (row, head) pair so both decode (many sequences)
+        // and prefill (many tokens of one sequence) use all cores.
+        out_slice
+            .par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(idx, out_head)| {
+                let row = idx / num_heads_q;
+                let head = idx % num_heads_q;
+                let q_head = &q_slice[idx * head_dim..(idx + 1) * head_dim];
+                paged_attention_head(
+                    q_head,
+                    k_slice,
+                    v_slice,
+                    &block_tables[row],
+                    context_lens[row],
+                    head / heads_per_group,
+                    num_heads_kv,
+                    head_dim,
+                    scale,
+                    out_head,
+                );
+            });
 
         Ok(out)
     }

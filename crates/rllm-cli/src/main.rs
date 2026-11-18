@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
                     max_batch_size,
                     block_size: 16,
                     total_blocks: 1024,
+                    ..SchedulerConfig::default()
                 };
                 Some(Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?))
             } else {
@@ -140,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
                         max_batch_size: 2,
                         block_size: 16,
                         total_blocks: 64,
+                        ..SchedulerConfig::default()
                     };
                     Arc::new(ContinuousBatchScheduler::new(sched_cfg, dummy_model)?)
                 };
@@ -210,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 max_batch_size: 4,
                 block_size: 16,
                 total_blocks: 512,
+                ..SchedulerConfig::default()
             };
             let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?);
             let rag_engine = RagEngine::new(bert_model, scheduler, bert_cfg.hidden_size);

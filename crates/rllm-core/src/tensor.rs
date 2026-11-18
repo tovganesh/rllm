@@ -139,8 +139,49 @@ impl Tensor {
         })
     }
 
-    /// Copies elements to a standard owned `Vec<T>`.
+    /// Byte offset of the first element within the underlying storage.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Returns a contiguous row-major copy of this tensor, or a cheap clone if it is
+    /// already contiguous. Only F32 tensors can be materialised from strided views.
+    pub fn contiguous(&self) -> Result<Self> {
+        if self.is_contiguous() {
+            return Ok(self.clone());
+        }
+        if self.dtype != DType::F32 {
+            return Err(RllmError::DTypeMismatch {
+                expected: "f32".to_string(),
+                actual: self.dtype.to_string(),
+            });
+        }
+        let src = self.storage.as_cpu()?.as_slice::<f32>();
+        let base = self.offset / 4;
+        let dims = self.shape.dims();
+        let numel = self.numel();
+        let mut out = Vec::with_capacity(numel);
+        let mut idx = vec![0usize; dims.len()];
+        for _ in 0..numel {
+            let src_off: usize = idx.iter().zip(&self.strides).map(|(i, s)| i * s).sum();
+            out.push(src[base + src_off]);
+            // Increment the multi-dimensional index (row-major order).
+            for d in (0..dims.len()).rev() {
+                idx[d] += 1;
+                if idx[d] < dims[d] {
+                    break;
+                }
+                idx[d] = 0;
+            }
+        }
+        Self::from_f32(&out, self.shape.clone(), self.device)
+    }
+
+    /// Copies elements to a standard owned `Vec<T>` in logical row-major order.
     pub fn to_vec<T: Copy>(&self) -> Result<Vec<T>> {
+        if !self.is_contiguous() {
+            return self.contiguous()?.to_vec();
+        }
         let cpu_storage = self.storage.as_cpu()?;
         let slice: &[T] = cpu_storage.as_slice();
         let numel = self.numel();
@@ -153,21 +194,40 @@ impl Tensor {
         Ok(slice[start..start + numel].to_vec())
     }
 
-    /// Returns a direct read-only slice reference to the contiguous F32 data.
-    pub fn as_f32_slice(&self) -> Result<&[f32]> {
+    /// Returns the `numel()` F32 values starting at this tensor's offset **in storage
+    /// order**, ignoring strides. Kernels that understand a specific strided layout
+    /// (e.g. a transposed weight) use this; everything else should use
+    /// [`Tensor::as_f32_slice`], which enforces contiguity.
+    pub fn storage_f32_slice(&self) -> Result<&[f32]> {
         if self.dtype != DType::F32 {
             return Err(RllmError::DTypeMismatch {
                 expected: "f32".to_string(),
                 actual: self.dtype.to_string(),
             });
         }
-        let cpu = self.storage.as_cpu()?;
-        let all: &[f32] = cpu.as_slice();
+        let all: &[f32] = self.storage.as_cpu()?.as_slice();
         let offset = self.offset / 4;
-        Ok(&all[offset..offset + self.numel()])
+        all.get(offset..offset + self.numel()).ok_or_else(|| {
+            RllmError::BackendError("Tensor slice bounds out of range for storage".to_string())
+        })
+    }
+
+    /// Returns a direct read-only slice reference to the contiguous F32 data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not F32 or is a non-contiguous (strided) view;
+    /// call [`Tensor::contiguous`] first in that case.
+    pub fn as_f32_slice(&self) -> Result<&[f32]> {
+        self.ensure_contiguous()?;
+        self.storage_f32_slice()
     }
 
     /// Returns a direct mutable slice reference to the contiguous F32 data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not F32 or is a non-contiguous (strided) view.
     pub fn as_mut_f32_slice(&mut self) -> Result<&mut [f32]> {
         if self.dtype != DType::F32 {
             return Err(RllmError::DTypeMismatch {
@@ -175,10 +235,25 @@ impl Tensor {
                 actual: self.dtype.to_string(),
             });
         }
+        self.ensure_contiguous()?;
         let offset = self.offset / 4;
         let numel = self.numel();
         let cpu = self.storage.as_cpu_mut()?;
         let all: &mut [f32] = cpu.as_mut_slice();
-        Ok(&mut all[offset..offset + numel])
+        all.get_mut(offset..offset + numel).ok_or_else(|| {
+            RllmError::BackendError("Tensor slice bounds out of range for storage".to_string())
+        })
+    }
+
+    fn ensure_contiguous(&self) -> Result<()> {
+        if self.is_contiguous() {
+            Ok(())
+        } else {
+            Err(RllmError::BackendError(format!(
+                "Expected a contiguous tensor but got shape {:?} with strides {:?}; call .contiguous() first",
+                self.shape.dims(),
+                self.strides
+            )))
+        }
     }
 }

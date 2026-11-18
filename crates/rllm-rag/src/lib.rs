@@ -132,6 +132,7 @@ mod tests {
                     max_batch_size: 2,
                     block_size: 16,
                     total_blocks: 64,
+                    ..SchedulerConfig::default()
                 },
                 llama_model,
             )
@@ -185,6 +186,7 @@ mod tests {
                     max_batch_size: 2,
                     block_size: 16,
                     total_blocks: 64,
+                    ..SchedulerConfig::default()
                 },
                 llama_model,
             )

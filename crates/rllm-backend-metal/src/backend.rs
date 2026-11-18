@@ -63,8 +63,9 @@ impl Backend for MetalBackend {
         &self,
         _q: &mut Tensor,
         _k: &mut Tensor,
-        _freqs_cos: &Tensor,
-        _freqs_sin: &Tensor,
+        _cos_table: &Tensor,
+        _sin_table: &Tensor,
+        _positions: &[usize],
     ) -> Result<()> {
         Err(RllmError::BackendError(
             "Metal rope pipeline stub".to_string(),

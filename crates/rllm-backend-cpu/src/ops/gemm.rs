@@ -72,7 +72,10 @@ pub fn gemv_f32(mat: &[f32], vec: &[f32], out: &mut [f32], n: usize, k: usize) {
     }
 }
 
-/// GEMM: General matrix multiplication `[M, K] * [K, N] -> [M, N]` parallelized across rows with Rayon.
+/// GEMM: `C[M, N] = A[M, K] · B[K, N]` with both operands row-major.
+///
+/// Parallelised over rows of `C`. The inner loop is an AXPY over a contiguous row of
+/// `B`, so memory is streamed sequentially (no column-strided access).
 pub fn gemm_f32(
     a: &[f32],
     b: &[f32],
@@ -85,25 +88,56 @@ pub fn gemm_f32(
     debug_assert_eq!(b.len(), k * n);
     debug_assert_eq!(c.len(), m * n);
 
-    if m == 1 {
-        for j in 0..n {
-            let mut sum = 0.0f32;
-            for p in 0..k {
-                sum += a[p] * b[p * n + j];
-            }
-            c[j] = sum;
-        }
-        return;
-    }
-
-    c.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| {
+    let row = |i: usize, c_row: &mut [f32]| {
+        c_row.fill(0.0);
         let a_row = &a[i * k..(i + 1) * k];
-        for j in 0..n {
-            let mut sum = 0.0f32;
-            for p in 0..k {
-                sum += a_row[p] * b[p * n + j];
+        for (p, &a_ip) in a_row.iter().enumerate() {
+            if a_ip == 0.0 {
+                continue;
             }
-            c_row[j] = sum;
+            let b_row = &b[p * n..(p + 1) * n];
+            for (c_ij, &b_pj) in c_row.iter_mut().zip(b_row) {
+                *c_ij += a_ip * b_pj;
+            }
         }
-    });
+    };
+
+    if m == 1 {
+        row(0, c);
+    } else {
+        c.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| row(i, c_row));
+    }
+}
+
+/// GEMM with transposed right operand: `C[M, N] = A[M, K] · W[N, K]ᵀ`.
+///
+/// This is the natural layout for linear layers whose weights are stored
+/// `[out_features, in_features]`: every output element is a dot product of two
+/// contiguous rows. Parallelised over output columns for small `M` (decode) and over
+/// rows of `C` otherwise.
+pub fn gemm_nt_f32(
+    a: &[f32],
+    w: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(w.len(), n * k);
+    debug_assert_eq!(c.len(), m * n);
+
+    if m < 4 {
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            gemv_f32(w, a_row, &mut c[i * n..(i + 1) * n], n, k);
+        }
+    } else {
+        c.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| {
+            let a_row = &a[i * k..(i + 1) * k];
+            for (j, c_ij) in c_row.iter_mut().enumerate() {
+                *c_ij = dot_f32(a_row, &w[j * k..(j + 1) * k]);
+            }
+        });
+    }
 }

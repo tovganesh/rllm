@@ -51,7 +51,8 @@ rllm-server = { path = "crates/rllm-server" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Keep the default `panic = "unwind"`: a panic inside one request handler must not
+# abort the whole server process.
 
 [profile.dev]
 opt-level = 1

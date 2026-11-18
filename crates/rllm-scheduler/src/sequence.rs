@@ -46,6 +46,9 @@ pub struct Sequence {
     pub sampling_params: SamplingParams,
     /// Optional Tokio channel sender for streaming tokens back to the HTTP client.
     pub sender: Option<UnboundedSender<u32>>,
+    /// Number of leading tokens whose keys/values are already in the KV cache
+    /// (from prefix-cache reuse or earlier forward passes).
+    pub num_computed_tokens: usize,
 }
 
 impl Sequence {
@@ -68,12 +71,29 @@ impl Sequence {
             },
             sampling_params,
             sender,
+            num_computed_tokens: 0,
         }
     }
 
     /// Total number of tokens in the sequence (prompt tokens + generated tokens).
     pub fn total_tokens(&self) -> usize {
         self.prompt_tokens.len() + self.output_tokens.len()
+    }
+
+    /// Token at logical position `pos` (prompt tokens followed by output tokens).
+    pub fn token_at(&self, pos: usize) -> u32 {
+        if pos < self.prompt_tokens.len() {
+            self.prompt_tokens[pos]
+        } else {
+            self.output_tokens[pos - self.prompt_tokens.len()]
+        }
+    }
+
+    /// All tokens of the sequence: prompt followed by generated output.
+    pub fn all_tokens(&self) -> Vec<u32> {
+        let mut t = self.prompt_tokens.clone();
+        t.extend_from_slice(&self.output_tokens);
+        t
     }
 
     /// Retrieves the most recent token (last generated token, or last prompt token).

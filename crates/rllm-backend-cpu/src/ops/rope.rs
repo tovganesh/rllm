@@ -1,44 +1,32 @@
 //! Rotary Positional Embeddings (RoPE) for queries and keys.
 
-/// Applies Rotary Positional Embeddings to queries `q` and keys `k` in-place.
+/// Applies Rotary Positional Embeddings in place to `x` laid out as
+/// `[num_tokens, num_heads, head_dim]`, using row `positions[t]` of the
+/// `[max_positions, head_dim / 2]` cosine / sine tables for token `t`.
+///
+/// Adjacent element pairs `(x[2i], x[2i+1])` are rotated by angle `pos * freq_i`.
 pub fn rope_f32(
-    q: &mut [f32],
-    k: &mut [f32],
-    num_heads_q: usize,
-    num_heads_k: usize,
+    x: &mut [f32],
+    num_heads: usize,
     head_dim: usize,
-    cos: &[f32],
-    sin: &[f32],
+    positions: &[usize],
+    cos_table: &[f32],
+    sin_table: &[f32],
 ) {
     let half_dim = head_dim / 2;
-    debug_assert_eq!(cos.len(), half_dim);
-    debug_assert_eq!(sin.len(), half_dim);
+    let token_stride = num_heads * head_dim;
+    debug_assert_eq!(x.len(), positions.len() * token_stride);
 
-    // Apply to Q
-    for h in 0..num_heads_q {
-        let head_start = h * head_dim;
-        let head = &mut q[head_start..head_start + head_dim];
-        for i in 0..half_dim {
-            let v0 = head[2 * i];
-            let v1 = head[2 * i + 1];
-            let c = cos[i];
-            let s = sin[i];
-            head[2 * i] = v0 * c - v1 * s;
-            head[2 * i + 1] = v0 * s + v1 * c;
-        }
-    }
-
-    // Apply to K
-    for h in 0..num_heads_k {
-        let head_start = h * head_dim;
-        let head = &mut k[head_start..head_start + head_dim];
-        for i in 0..half_dim {
-            let v0 = head[2 * i];
-            let v1 = head[2 * i + 1];
-            let c = cos[i];
-            let s = sin[i];
-            head[2 * i] = v0 * c - v1 * s;
-            head[2 * i + 1] = v0 * s + v1 * c;
+    for (token, &pos) in x.chunks_exact_mut(token_stride).zip(positions) {
+        let cos = &cos_table[pos * half_dim..(pos + 1) * half_dim];
+        let sin = &sin_table[pos * half_dim..(pos + 1) * half_dim];
+        for head in token.chunks_exact_mut(head_dim) {
+            for i in 0..half_dim {
+                let v0 = head[2 * i];
+                let v1 = head[2 * i + 1];
+                head[2 * i] = v0 * cos[i] - v1 * sin[i];
+                head[2 * i + 1] = v0 * sin[i] + v1 * cos[i];
+            }
         }
     }
 }

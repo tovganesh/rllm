@@ -31,9 +31,23 @@ pub trait Backend: Send + Sync + 'static {
     /// $$y_i = \frac{x_i}{\sqrt{\frac{1}{d} \sum_{j=1}^d x_j^2 + \epsilon}} \cdot w_i$$
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor>;
 
-    /// Rotary Positional Embedding (RoPE):
-    /// Rotates pairs of elements $(x_{2i}, x_{2i+1})$ using precomputed $\cos$ and $\sin$ frequencies.
-    fn rope(&self, q: &mut Tensor, k: &mut Tensor, freqs_cos: &Tensor, freqs_sin: &Tensor) -> Result<()>;
+    /// Rotary Positional Embedding (RoPE), applied in place.
+    ///
+    /// Rotates adjacent pairs $(x_{2i}, x_{2i+1})$ of every head of every token using the
+    /// row of the precomputed tables selected by that token's position.
+    ///
+    /// * `q` — `[num_tokens, num_heads_q, head_dim]`
+    /// * `k` — `[num_tokens, num_heads_kv, head_dim]`
+    /// * `cos_table`, `sin_table` — `[max_positions, head_dim / 2]`
+    /// * `positions` — absolute position of each of the `num_tokens` rows
+    fn rope(
+        &self,
+        q: &mut Tensor,
+        k: &mut Tensor,
+        cos_table: &Tensor,
+        sin_table: &Tensor,
+        positions: &[usize],
+    ) -> Result<()>;
 
     /// SwiGLU activation function:
     /// $$\text{SwiGLU}(x_{\text{gate}}, x_{\text{up}}) = (x_{\text{gate}} \cdot \sigma(x_{\text{gate}})) \cdot x_{\text{up}}$$
@@ -45,8 +59,12 @@ pub trait Backend: Send + Sync + 'static {
     /// Embedding table lookup: gathers embedding rows for a slice of input token IDs.
     fn embedding(&self, table: &Tensor, ids: &[u32]) -> Result<Tensor>;
 
-    /// PagedAttention decoding kernel:
-    /// Computes multi-head attention for query vectors against non-contiguous physical KV blocks.
+    /// PagedAttention kernel.
+    ///
+    /// Each row `i` of `q` (`[num_rows, num_heads_q, head_dim]`) attends to the first
+    /// `context_lens[i]` positions of the sequence described by `block_tables[i]`.
+    /// Passing one row per prompt token with `context_lens[i] = position + 1` yields
+    /// causal prefill attention; one row per sequence yields batched decode.
     fn paged_attention(
         &self,
         q: &Tensor,
