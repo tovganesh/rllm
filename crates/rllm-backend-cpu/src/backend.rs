@@ -3,7 +3,7 @@ use crate::ops::{
     gemm::{gemm_f32, gemm_nt_f32},
     norm::rms_norm_f32,
     paged_attn::paged_attention_head,
-    quant::{gemv_q4_0_f32, gemv_q8_0_f32},
+    quant::{dequantize_q4_0, dequantize_q8_0, gemv_q4_0_f32, gemv_q8_0_f32, linear_quantized_f32},
     rope::rope_f32,
     softmax::softmax_inplace,
 };
@@ -69,6 +69,73 @@ impl Backend for CpuBackend {
         } else {
             let b = b.contiguous()?;
             gemm_f32(a_slice, b.as_f32_slice()?, out_slice, m, k, n);
+        }
+        Ok(out)
+    }
+
+    fn linear(&self, x: &Tensor, w: &Tensor) -> Result<Tensor> {
+        let w_dims = w.dims();
+        let x_dims = x.dims();
+        if w_dims.len() != 2 || x_dims.is_empty() {
+            return Err(RllmError::BackendError(format!(
+                "linear expects W of rank 2 and x of rank >= 1, got W {:?}, x {:?}",
+                w_dims, x_dims
+            )));
+        }
+        let (n, k) = (w_dims[0], w_dims[1]);
+        if *x_dims.last().unwrap() != k {
+            return Err(RllmError::ShapeMismatch {
+                expected: vec![k],
+                got: vec![*x_dims.last().unwrap()],
+            });
+        }
+
+        if w.dtype() == DType::F32 {
+            // Flatten leading dims of x into rows, then A·Wᵀ via the NT kernel.
+            let m = x.numel() / k.max(1);
+            let x2 = x.contiguous()?.reshape(Shape::new(vec![m, k]))?;
+            let y = self.matmul(&x2, &w.transpose(0, 1)?)?;
+            let mut out_dims = x_dims[..x_dims.len() - 1].to_vec();
+            out_dims.push(n);
+            return y.reshape(Shape::new(out_dims));
+        }
+
+        let gemv: fn(&[u8], &[f32], &mut [f32], usize, usize) = match w.dtype() {
+            DType::Q8_0 => gemv_q8_0_f32,
+            DType::Q4_0 => gemv_q4_0_f32,
+            other => {
+                return Err(RllmError::UnsupportedOp {
+                    op: "linear",
+                    dtype: other.to_string(),
+                    device: "cpu".to_string(),
+                })
+            }
+        };
+        if k % 32 != 0 {
+            return Err(RllmError::QuantizationError(format!(
+                "linear: in_features {} is not a multiple of the 32-element block size",
+                k
+            )));
+        }
+        let w_bytes = w.dtype().storage_bytes(n * k);
+        let all = w.storage().as_cpu()?.as_bytes();
+        let w_bytes = all.get(w.offset()..w.offset() + w_bytes).ok_or_else(|| {
+            RllmError::BackendError("quantized weight storage too small".to_string())
+        })?;
+
+        let x = x.contiguous()?;
+        let x_slice = x.as_f32_slice()?;
+        let mut out_dims = x_dims[..x_dims.len() - 1].to_vec();
+        out_dims.push(n);
+        let mut out = Tensor::zeros(Shape::new(out_dims), DType::F32, Device::Cpu)?;
+        let out_slice = out.as_mut_f32_slice()?;
+        let m = x_slice.len() / k;
+        if m == 1 {
+            // Decode: a single GEMV on the quantized blocks.
+            gemv(w_bytes, x_slice, out_slice, n, k);
+        } else {
+            // Prefill: stream the weight once for all rows.
+            linear_quantized_f32(w.dtype() == DType::Q8_0, w_bytes, x_slice, out_slice, m, n, k);
         }
         Ok(out)
     }
@@ -152,27 +219,52 @@ impl Backend for CpuBackend {
 
     fn embedding(&self, table: &Tensor, ids: &[u32]) -> Result<Tensor> {
         let t_dims = table.dims();
-        let vocab_size = t_dims[0];
-        let hidden_dim = t_dims[1];
+        if t_dims.len() != 2 {
+            return Err(RllmError::BackendError(format!(
+                "embedding table must be rank 2, got {:?}",
+                t_dims
+            )));
+        }
+        let (vocab_size, hidden_dim) = (t_dims[0], t_dims[1]);
+        if let Some(&bad) = ids.iter().find(|&&id| id as usize >= vocab_size) {
+            return Err(RllmError::BackendError(format!(
+                "Token ID {} exceeds vocabulary size {}",
+                bad, vocab_size
+            )));
+        }
 
-        let table_slice = table.as_f32_slice()?;
         let out_shape = Shape::new(vec![ids.len(), hidden_dim]);
         let mut out = Tensor::zeros(out_shape, DType::F32, Device::Cpu)?;
         let out_slice = out.as_mut_f32_slice()?;
 
-        for (i, &id) in ids.iter().enumerate() {
-            let id = id as usize;
-            if id >= vocab_size {
-                return Err(RllmError::BackendError(format!(
-                    "Token ID {} exceeds vocabulary size {}",
-                    id, vocab_size
-                )));
+        match table.dtype() {
+            DType::F32 => {
+                let table_slice = table.as_f32_slice()?;
+                for (dst, &id) in out_slice.chunks_exact_mut(hidden_dim).zip(ids) {
+                    let id = id as usize;
+                    dst.copy_from_slice(&table_slice[id * hidden_dim..(id + 1) * hidden_dim]);
+                }
             }
-            let src = &table_slice[id * hidden_dim..(id + 1) * hidden_dim];
-            let dst = &mut out_slice[i * hidden_dim..(i + 1) * hidden_dim];
-            dst.copy_from_slice(src);
+            dtype @ (DType::Q8_0 | DType::Q4_0) => {
+                let row_bytes = dtype.storage_bytes(hidden_dim);
+                let bytes = &table.storage().as_cpu()?.as_bytes()[table.offset()..];
+                for (dst, &id) in out_slice.chunks_exact_mut(hidden_dim).zip(ids) {
+                    let row = &bytes[id as usize * row_bytes..(id as usize + 1) * row_bytes];
+                    if dtype == DType::Q8_0 {
+                        dequantize_q8_0(row, dst);
+                    } else {
+                        dequantize_q4_0(row, dst);
+                    }
+                }
+            }
+            other => {
+                return Err(RllmError::UnsupportedOp {
+                    op: "embedding",
+                    dtype: other.to_string(),
+                    device: "cpu".to_string(),
+                })
+            }
         }
-
         Ok(out)
     }
 

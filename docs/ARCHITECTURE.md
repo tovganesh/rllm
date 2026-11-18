@@ -32,10 +32,10 @@ flowchart TD
     end
 
     subgraph ModelLayer ["Models (rllm-models)"]
-        Weights["GGUF header parser 🟡 · tensor loading 📋 · Safetensors 📋"]
-        Llama["LLaMA-style decoder 🟡 (prefill + decode, synthetic weights)"]
+        Weights["GGUF loader ✅ · Safetensors 📋"]
+        Llama["LLaMA-architecture decoder ✅ (GGUF)"]
         Embed["BERT-style encoder 🟡 (synthetic weights)"]
-        Tok["Tokenizer 🟡 (word list, not BPE)"]
+        Tok["Byte-level BPE tokenizer ✅ · chat templates ✅"]
     end
 
     subgraph ComputeLayer ["Backends"]
@@ -101,14 +101,16 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 - Q4_0 (32 elements / 18 bytes) and Q8_0 (32 / 34 bytes) GEMV operate directly on quantized blocks without dequantizing the full matrix. Inner loops are scalar.
 - PagedAttention decode: per-head logits over a block table, softmax, weighted V accumulation; GQA supported.
 
-### 4.3 Models (`rllm-models`) — 🟡
+### 4.3 Models (`rllm-models`) — ✅ decoder · 🟡 embedder
 
 - `LlamaModel::forward` takes a flattened batch of rows, each with its own token, absolute position and block table: embedding → N × (RMSNorm, QKV, per-row RoPE, KV write for every row, causal PagedAttention, O-proj, RMSNorm, SwiGLU MLP) → final norm → LM head for selected rows only. All prompt tokens of a sequence = causal prefill; one token per sequence = batched decode; both can be mixed. `forward_decode` is a convenience wrapper.
 - Numerical tests compare it against a naive dense reference implementation.
-- `BertEmbeddingModel::embed` runs a simplified encoder with mean pooling and L2 normalisation.
-- Both models are constructed only via `new_random` (constant / patterned weights).
-- `GgufFile::read_from_bytes` parses magic, version, metadata KV pairs and tensor descriptors, and computes the aligned data offset. It does not read tensor payloads or map them onto model layers.
-- `Tokenizer` is a fixed English/technical word list with ASCII fallback; it is a placeholder until a real BPE tokenizer is integrated.
+- **GGUF loading.** `MappedGguf` memory-maps the file and parses typed metadata and tensor descriptors. `LlamaConfig::from_gguf` reads `llama.*` hyper-parameters; `LlamaModel::from_gguf` maps `token_embd`, `blk.N.{attn_q,attn_k,attn_v,attn_output,attn_norm,ffn_gate,ffn_up,ffn_down,ffn_norm}`, `output_norm` and `output` (falling back to tied embeddings) onto layers, and applies `rope_freqs` factors when present. Linear weights in Q8_0 / Q4_0 stay quantized and go through `Backend::linear`; F16, BF16, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K and Q6_K are dequantized to F32 at load. `GgufBundle::load` returns the model, tokenizer and chat template from one file.
+- **Tokenizer.** `BpeTokenizer` implements llama.cpp-compatible byte-level BPE from `tokenizer.ggml.{tokens,token_type,merges,pre}`: special-token splitting, per-model pre-tokenizer regexes applied in sequence, rank-ordered merges, and streaming UTF-8 decode (`StreamDecoder`). Stop tokens come from EOS/EOT metadata plus known end-of-turn markers.
+- **Chat templates.** `ChatTemplate` renders the model's Jinja `tokenizer.chat_template` with minijinja (Python-compatible methods, `raise_exception`, `bos_token`, `eos_token`), falling back to ChatML.
+- **Verification.** Besides the dense reference test, `tests/real_model.rs` compares tokenization and greedy generation with llama.cpp fixtures for SmolLM2-135M in five weight formats.
+- `BertEmbeddingModel::embed` runs a simplified encoder with mean pooling and L2 normalisation, still with synthetic weights (P1b).
+- The legacy word-list `Tokenizer` remains for the RAG pipeline and synthetic models until P1b.
 
 ### 4.4 Scheduling (`rllm-scheduler`) — 🟡
 

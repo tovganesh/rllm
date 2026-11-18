@@ -11,11 +11,11 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use rllm_backend_cpu::CpuBackend;
+use rllm_models::{BpeTokenizer, ChatTemplate};
 use rllm_rag::{extract_grounded_quote, RagEngine};
 use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, Sequence};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::{error, info};
 
 /// Operating service mode for containerized or standalone deployment.
@@ -33,6 +33,11 @@ pub enum ServiceMode {
 pub struct AppState {
     /// Optional local scheduler for in-process LLM generation.
     pub scheduler: Option<Arc<ContinuousBatchScheduler<CpuBackend>>>,
+    /// Tokenizer of the loaded model. `None` for synthetic models, which fall back to
+    /// placeholder token IDs.
+    pub tokenizer: Option<Arc<BpeTokenizer>>,
+    /// Chat template of the loaded model (used together with `tokenizer`).
+    pub chat_template: Option<Arc<ChatTemplate>>,
     /// Optional local RAG engine for hybrid retrieval and document indexing.
     pub rag_engine: Option<Arc<RagEngine<CpuBackend>>>,
     /// Optional remote inference URL (e.g., `http://rllm-inference:8000`) for decoupled RAG.
@@ -63,27 +68,63 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     }))
 }
 
+/// Error returned by API handlers, serialised in OpenAI's error format.
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let kind = if self.status.is_client_error() {
+            "invalid_request_error"
+        } else {
+            "server_error"
+        };
+        let body = Json(serde_json::json!({
+            "error": { "message": self.message, "type": kind }
+        }));
+        (self.status, body).into_response()
+    }
+}
+
+/// OpenAI-compatible model listing (`GET /v1/models`).
+pub async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "object": "list",
+        "data": [{ "id": state.model_name, "object": "model", "owned_by": "rllm" }]
+    }))
+}
+
 /// OpenAI-compatible chat completion handler (`POST /v1/chat/completions`).
+///
+/// With a real model loaded, the conversation is rendered with the model's chat
+/// template and tokenized with its tokenizer, and generation stops at the model's
+/// end-of-turn tokens. Streaming (`stream: true`) is not supported yet.
 pub async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let scheduler = state.scheduler.as_ref().ok_or_else(|| {
+) -> Result<Json<ChatCompletionResponse>, ApiError> {
+    let scheduler = state.scheduler.clone().ok_or_else(|| {
         error!("Chat completions requested but inference scheduler is not enabled in this container");
-        StatusCode::NOT_IMPLEMENTED
+        ApiError::new(StatusCode::NOT_IMPLEMENTED, "inference is not enabled on this server")
     })?;
-
-    let mut prompt = String::new();
-    for msg in &req.messages {
-        prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
+    if req.stream == Some(true) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "stream=true is not supported yet"));
     }
-    prompt.push_str("assistant: ");
-
-    let prompt_tokens: Vec<u32> = prompt
-        .split_whitespace()
-        .enumerate()
-        .map(|(i, _)| ((i % 500) + 1) as u32)
-        .collect();
+    if req.messages.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "messages must not be empty"));
+    }
 
     let mut sampling = SamplingParams::default();
     if let Some(t) = req.temperature {
@@ -93,58 +134,71 @@ pub async fn chat_completions_handler(
         sampling.top_p = p;
     }
     if let Some(max_t) = req.max_tokens {
+        if max_t == 0 {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "max_tokens must be >= 1"));
+        }
         sampling.max_tokens = max_t;
     }
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let seq_id = rand::random::<u64>();
-    let prompt_len = prompt_tokens.len();
-
-    let seq = Sequence::new(
-        seq_id,
-        prompt_tokens,
-        sampling,
-        scheduler.config.block_size,
-        Some(tx),
-    );
-
-    scheduler
-        .submit_sequence(seq)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let mut generated_tokens = Vec::new();
-
-    // Drive generation step loop
-    loop {
-        scheduler
-            .step()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        while let Ok(token) = rx.try_recv() {
-            generated_tokens.push(token);
+    let prompt_tokens: Vec<u32> = match (&state.tokenizer, &state.chat_template) {
+        (Some(tokenizer), Some(template)) => {
+            let messages: Vec<rllm_models::ChatMessage> = req
+                .messages
+                .iter()
+                .map(|m| rllm_models::ChatMessage::new(&m.role, &m.content))
+                .collect();
+            let prompt = template
+                .render(&messages, true)
+                .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+            sampling.stop_tokens = tokenizer.stop_token_ids.clone();
+            tokenizer.encode(&prompt, true, true)
         }
-
-        if scheduler.num_running() == 0 && scheduler.num_waiting() == 0 {
-            break;
+        // Synthetic model without a tokenizer: placeholder token IDs.
+        _ => {
+            let mut prompt = String::new();
+            for msg in &req.messages {
+                prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
+            }
+            prompt.push_str("assistant: ");
+            prompt
+                .split_whitespace()
+                .enumerate()
+                .map(|(i, _)| ((i % 500) + 1) as u32)
+                .collect()
         }
-    }
-
-    let completion_text = if !generated_tokens.is_empty() {
-        let tokenizer = rllm_models::Tokenizer::default();
-        let decoded = tokenizer.decode(&generated_tokens);
-        if !decoded.is_empty() && decoded.chars().any(|c| c.is_alphabetic()) {
-            decoded
-        } else {
-            format!(
-                "Response generated by rllm engine ({} tokens)",
-                generated_tokens.len()
-            )
-        }
-    } else {
-        "No tokens generated".to_string()
     };
 
-    let resp = ChatCompletionResponse {
+    let seq_id = rand::random::<u64>();
+    let prompt_len = prompt_tokens.len();
+    let stop_tokens = sampling.stop_tokens.clone();
+    let seq = Sequence::new(seq_id, prompt_tokens, sampling, scheduler.config.block_size, None);
+
+    let mut generated = tokio::task::spawn_blocking(move || scheduler.generate(seq, |_| {}))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| match e {
+            // Prompt validation failures (too long, bad token IDs) are client errors.
+            rllm_core::error::RllmError::BackendError(msg) if msg.contains("Prompt") || msg.contains("Token ID") => {
+                ApiError::new(StatusCode::BAD_REQUEST, msg)
+            }
+            other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+
+    let finish_reason = if generated.last().is_some_and(|t| stop_tokens.contains(t)) {
+        generated.pop();
+        "stop"
+    } else {
+        // max_tokens reached, or the context window / KV capacity ran out.
+        "length"
+    };
+    let completion_tokens = generated.len() + usize::from(finish_reason == "stop");
+
+    let content = match &state.tokenizer {
+        Some(tokenizer) => tokenizer.decode(&generated, true),
+        None => rllm_models::Tokenizer::default().decode(&generated),
+    };
+
+    Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", seq_id),
         object: "chat.completion".to_string(),
         created: std::time::SystemTime::now()
@@ -156,18 +210,16 @@ pub async fn chat_completions_handler(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content: completion_text,
+                content,
             },
-            finish_reason: "stop".to_string(),
+            finish_reason: finish_reason.to_string(),
         }],
         usage: Usage {
             prompt_tokens: prompt_len,
-            completion_tokens: generated_tokens.len(),
-            total_tokens: prompt_len + generated_tokens.len(),
+            completion_tokens,
+            total_tokens: prompt_len + completion_tokens,
         },
-    };
-
-    Ok(Json(resp))
+    }))
 }
 
 /// OpenAI-compatible dense vector embeddings handler (`POST /v1/embeddings`).

@@ -181,4 +181,29 @@ mod tests {
         assert_eq!(tt.to_vec::<f32>().unwrap(), vec![1., 4., 2., 5., 3., 6.]);
         assert_eq!(tt.contiguous().unwrap().as_f32_slice().unwrap(), &[1., 4., 2., 5., 3., 6.]);
     }
+
+    #[test]
+    fn test_quantized_linear_batched_matches_per_row_gemv() {
+        let backend = CpuBackend;
+        let (m, n, k) = (5, 24, 64);
+        let wf: Vec<f32> = (0..n * k).map(|i| ((i * 31 % 113) as f32 - 56.0) / 40.0).collect();
+        let mut q4 = vec![0u8; n * (k / 32) * 18];
+        for r in 0..n {
+            quantize_f32_to_q4_0(&wf[r * k..(r + 1) * k], &mut q4[r * (k / 32) * 18..(r + 1) * (k / 32) * 18]);
+        }
+        let w = Tensor::new(Shape::new(vec![n, k]), DType::Q4_0, Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(q4)));
+        let xs: Vec<f32> = (0..m * k).map(|i| ((i * 17 % 37) as f32 - 18.0) / 9.0).collect();
+        let batched = backend
+            .linear(&Tensor::from_f32(&xs, Shape::new(vec![m, k]), Device::Cpu).unwrap(), &w)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        for i in 0..m {
+            let row = Tensor::from_f32(&xs[i * k..(i + 1) * k], Shape::new(vec![1, k]), Device::Cpu).unwrap();
+            let single = backend.linear(&row, &w).unwrap().to_vec::<f32>().unwrap();
+            for j in 0..n {
+                assert!((batched[i * n + j] - single[j]).abs() < 1e-3, "row {i} col {j}");
+            }
+        }
+    }
 }

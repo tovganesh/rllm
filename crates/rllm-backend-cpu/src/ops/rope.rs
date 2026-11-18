@@ -31,23 +31,37 @@ pub fn rope_f32(
     }
 }
 
-/// Precomputes RoPE cosine and sine frequency tables up to `max_seq_len`.
+/// Precomputes RoPE cosine and sine tables `[max_seq_len, head_dim / 2]`.
 /// $$\text{freq}_i = \frac{1}{\theta^{2i/d}}$$
-pub fn precompute_rope_freqs(
+pub fn precompute_rope_freqs(head_dim: usize, max_seq_len: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
+    precompute_rope_freqs_scaled(head_dim, max_seq_len, theta, None)
+}
+
+/// Like [`precompute_rope_freqs`], with optional per-frequency divisors
+/// (`rope_freqs.weight` in LLaMA 3.1+ GGUF files): angle = `pos * freq_i / factor_i`.
+///
+/// Angles are computed in f64 so that large positions keep full precision.
+pub fn precompute_rope_freqs_scaled(
     head_dim: usize,
     max_seq_len: usize,
     theta: f32,
+    freq_factors: Option<&[f32]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let half_dim = head_dim / 2;
     let mut cos_table = Vec::with_capacity(max_seq_len * half_dim);
     let mut sin_table = Vec::with_capacity(max_seq_len * half_dim);
+    let freqs: Vec<f64> = (0..half_dim)
+        .map(|i| {
+            let f = 1.0f64 / (theta as f64).powf((2 * i) as f64 / head_dim as f64);
+            f / freq_factors.map_or(1.0, |ff| ff[i] as f64)
+        })
+        .collect();
 
     for pos in 0..max_seq_len {
-        for i in 0..half_dim {
-            let freq = 1.0f32 / theta.powf((2 * i) as f32 / head_dim as f32);
-            let val = pos as f32 * freq;
-            cos_table.push(val.cos());
-            sin_table.push(val.sin());
+        for &freq in &freqs {
+            let (s, c) = (pos as f64 * freq).sin_cos();
+            cos_table.push(c as f32);
+            sin_table.push(s as f32);
         }
     }
 

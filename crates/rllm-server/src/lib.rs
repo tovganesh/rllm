@@ -25,7 +25,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                 "/v1/chat/completions",
                 post(routes::chat_completions_handler),
             )
-            .route("/v1/embeddings", post(routes::embeddings_handler));
+            .route("/v1/embeddings", post(routes::embeddings_handler))
+            .route("/v1/models", get(routes::models_handler));
     }
 
     // Mount RAG endpoints if mode is All or Rag
@@ -96,6 +97,8 @@ mod tests {
 
         Arc::new(AppState {
             scheduler: Some(scheduler),
+            tokenizer: None,
+            chat_template: None,
             rag_engine: Some(rag_engine),
             inference_url: None,
             model_name: "rllm-tiny-test".to_string(),

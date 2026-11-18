@@ -218,9 +218,9 @@ impl<B: Backend> LlamaModel<B> {
                 self.backend
                     .rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
-            let mut q = self.backend.matmul(&normed, &layer.self_attn.q_proj.transpose(0, 1)?)?;
-            let mut k = self.backend.matmul(&normed, &layer.self_attn.k_proj.transpose(0, 1)?)?;
-            let v = self.backend.matmul(&normed, &layer.self_attn.v_proj.transpose(0, 1)?)?;
+            let mut q = self.backend.linear(&normed, &layer.self_attn.q_proj)?;
+            let mut k = self.backend.linear(&normed, &layer.self_attn.k_proj)?;
+            let v = self.backend.linear(&normed, &layer.self_attn.v_proj)?;
 
             q = q.reshape(Shape::new(vec![num_rows, num_q_heads, head_dim]))?;
             k = k.reshape(Shape::new(vec![num_rows, num_kv_heads, head_dim]))?;
@@ -274,7 +274,7 @@ impl<B: Backend> LlamaModel<B> {
             let attn_flat = attn_out.reshape(Shape::new(vec![num_rows, h]))?;
             let attn_proj = self
                 .backend
-                .matmul(&attn_flat, &layer.self_attn.o_proj.transpose(0, 1)?)?;
+                .linear(&attn_flat, &layer.self_attn.o_proj)?;
             add_inplace(&mut hidden, &attn_proj)?;
 
             // Post-attention RMSNorm + SwiGLU MLP
@@ -285,14 +285,14 @@ impl<B: Backend> LlamaModel<B> {
             )?;
             let gate = self
                 .backend
-                .matmul(&ffn_normed, &layer.mlp.gate_proj.transpose(0, 1)?)?;
+                .linear(&ffn_normed, &layer.mlp.gate_proj)?;
             let up = self
                 .backend
-                .matmul(&ffn_normed, &layer.mlp.up_proj.transpose(0, 1)?)?;
+                .linear(&ffn_normed, &layer.mlp.up_proj)?;
             let act = self.backend.swiglu(&gate, &up)?;
             let ffn_out = self
                 .backend
-                .matmul(&act, &layer.mlp.down_proj.transpose(0, 1)?)?;
+                .linear(&act, &layer.mlp.down_proj)?;
             add_inplace(&mut hidden, &ffn_out)?;
         }
 
@@ -317,7 +317,7 @@ impl<B: Backend> LlamaModel<B> {
             .backend
             .rms_norm(&selected, &self.norm, self.config.rms_norm_eps)?;
         self.backend
-            .matmul(&final_normed, &self.lm_head.transpose(0, 1)?)
+            .linear(&final_normed, &self.lm_head)
     }
 }
 

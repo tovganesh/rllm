@@ -1,0 +1,30 @@
+{
+ "model": "SmolLM2-135M-Instruct-Q4_0.requant.gguf",
+ "generator": "llama-completion greedy (--temp 0 --top-k 1), -n 32",
+ "cases": [
+  {
+   "prompt": "The capital of France is",
+   "max_tokens": 32,
+   "completion": " the capital of the 20th arrondissement, the 20th arrondissement is the 20th arrondissement",
+   "stopped_on_eos": false
+  },
+  {
+   "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+   "max_tokens": 32,
+   "completion": "\ndef fibonacci(n):\n    if n <= 0:\n        return \"Input should be a positive integer\"\n    elif n == 1:\n       ",
+   "stopped_on_eos": false
+  },
+  {
+   "prompt": "Rust is a systems programming language that",
+   "max_tokens": 32,
+   "completion": " is used to write and run operating systems, but it is also used to write and run other systems programming languages. It is a C-like language that is",
+   "stopped_on_eos": false
+  },
+  {
+   "prompt": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nWhat is the boiling point of water at sea level?<|im_end|>\n<|im_start|>assistant\n",
+   "max_tokens": 32,
+   "completion": "At sea level, the boiling point of water is approximately 212 degrees Fahrenheit (100 degrees Celsius). This is because the pressure at sea level",
+   "stopped_on_eos": false
+  }
+ ]
+}

@@ -1,4 +1,8 @@
-//! Direct quantized matrix-vector kernels (Q4_0, Q8_0) for edge and mobile execution.
+//! Direct quantized matrix-vector kernels (Q4_0, Q8_0) for edge and mobile execution,
+//! and dequantization of ggml block formats.
+
+// Block-size slicing with `chunks_exact(BLOCK_BYTES)` mirrors the ggml layouts directly.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 use half::f16;
 use rayon::prelude::*;
@@ -159,5 +163,268 @@ pub fn quantize_f32_to_q4_0(src: &[f32], dst: &mut [u8]) {
             let q1 = ((x1 + 8.5).clamp(0.0, 15.0) as u8) & 0x0F;
             out_block[2 + i] = q0 | (q1 << 4);
         }
+    }
+}
+
+// ───────────────────────── dequantization (ggml block formats) ─────────────────────────
+
+#[inline]
+fn f16_at(b: &[u8], off: usize) -> f32 {
+    f16::from_le_bytes([b[off], b[off + 1]]).to_f32()
+}
+
+/// Dequantizes `Q4_0` blocks (32 values / 18 bytes) into `out`.
+pub fn dequantize_q4_0(src: &[u8], out: &mut [f32]) {
+    for (block, y) in src.chunks_exact(18).zip(out.chunks_exact_mut(QK4_0)) {
+        let d = f16_at(block, 0);
+        for i in 0..16 {
+            let byte = block[2 + i];
+            y[i] = ((byte & 0x0F) as i32 - 8) as f32 * d;
+            y[i + 16] = ((byte >> 4) as i32 - 8) as f32 * d;
+        }
+    }
+}
+
+/// Dequantizes `Q8_0` blocks (32 values / 34 bytes) into `out`.
+pub fn dequantize_q8_0(src: &[u8], out: &mut [f32]) {
+    for (block, y) in src.chunks_exact(34).zip(out.chunks_exact_mut(QK8_0)) {
+        let d = f16_at(block, 0);
+        for i in 0..32 {
+            y[i] = block[2 + i] as i8 as f32 * d;
+        }
+    }
+}
+
+/// Dequantizes `Q4_1` blocks (32 values / 20 bytes: scale, min, 16 nibble bytes).
+pub fn dequantize_q4_1(src: &[u8], out: &mut [f32]) {
+    for (block, y) in src.chunks_exact(20).zip(out.chunks_exact_mut(32)) {
+        let (d, m) = (f16_at(block, 0), f16_at(block, 2));
+        for i in 0..16 {
+            let byte = block[4 + i];
+            y[i] = (byte & 0x0F) as f32 * d + m;
+            y[i + 16] = (byte >> 4) as f32 * d + m;
+        }
+    }
+}
+
+/// Dequantizes `Q5_0` blocks (32 values / 22 bytes: scale, 32 high bits, 16 nibble bytes).
+pub fn dequantize_q5_0(src: &[u8], out: &mut [f32]) {
+    for (block, y) in src.chunks_exact(22).zip(out.chunks_exact_mut(32)) {
+        let d = f16_at(block, 0);
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        for j in 0..16 {
+            let xh0 = (((qh >> j) << 4) & 0x10) as u8;
+            let xh1 = ((qh >> (j + 12)) & 0x10) as u8;
+            let q = block[6 + j];
+            y[j] = (((q & 0x0F) | xh0) as i32 - 16) as f32 * d;
+            y[j + 16] = (((q >> 4) | xh1) as i32 - 16) as f32 * d;
+        }
+    }
+}
+
+/// Dequantizes `Q5_1` blocks (32 values / 24 bytes: scale, min, 32 high bits, 16 nibble bytes).
+pub fn dequantize_q5_1(src: &[u8], out: &mut [f32]) {
+    for (block, y) in src.chunks_exact(24).zip(out.chunks_exact_mut(32)) {
+        let (d, m) = (f16_at(block, 0), f16_at(block, 2));
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        for j in 0..16 {
+            let xh0 = (((qh >> j) << 4) & 0x10) as u8;
+            let xh1 = ((qh >> (j + 12)) & 0x10) as u8;
+            let q = block[8 + j];
+            y[j] = ((q & 0x0F) | xh0) as f32 * d + m;
+            y[j + 16] = ((q >> 4) | xh1) as f32 * d + m;
+        }
+    }
+}
+
+/// Number of values in one K-quant super-block.
+pub const QK_K: usize = 256;
+
+/// Unpacks the 6-bit scale and min for sub-block `j` of a Q4_K / Q5_K super-block.
+#[inline]
+fn scale_min_k4(j: usize, q: &[u8]) -> (f32, f32) {
+    if j < 4 {
+        ((q[j] & 63) as f32, (q[j + 4] & 63) as f32)
+    } else {
+        (
+            ((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4)) as f32,
+            ((q[j + 4] >> 4) | ((q[j] >> 6) << 4)) as f32,
+        )
+    }
+}
+
+/// Dequantizes `Q4_K` super-blocks (256 values / 144 bytes) into `out`.
+pub fn dequantize_q4_k(src: &[u8], out: &mut [f32]) {
+    for (block, y) in src.chunks_exact(144).zip(out.chunks_exact_mut(QK_K)) {
+        let d = f16_at(block, 0);
+        let dmin = f16_at(block, 2);
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        for (chunk, j) in (0..QK_K).step_by(64).enumerate() {
+            let (sc1, m1) = scale_min_k4(2 * chunk, scales);
+            let (sc2, m2) = scale_min_k4(2 * chunk + 1, scales);
+            let q = &qs[chunk * 32..chunk * 32 + 32];
+            for l in 0..32 {
+                y[j + l] = d * sc1 * (q[l] & 0x0F) as f32 - dmin * m1;
+                y[j + 32 + l] = d * sc2 * (q[l] >> 4) as f32 - dmin * m2;
+            }
+        }
+    }
+}
+
+/// Dequantizes `Q5_K` super-blocks (256 values / 176 bytes) into `out`.
+pub fn dequantize_q5_k(src: &[u8], out: &mut [f32]) {
+    for (block, y) in src.chunks_exact(176).zip(out.chunks_exact_mut(QK_K)) {
+        let d = f16_at(block, 0);
+        let dmin = f16_at(block, 2);
+        let scales = &block[4..16];
+        let qh = &block[16..48];
+        let qs = &block[48..176];
+        let (mut u1, mut u2) = (1u8, 2u8);
+        for (chunk, j) in (0..QK_K).step_by(64).enumerate() {
+            let (sc1, m1) = scale_min_k4(2 * chunk, scales);
+            let (sc2, m2) = scale_min_k4(2 * chunk + 1, scales);
+            let ql = &qs[chunk * 32..chunk * 32 + 32];
+            for l in 0..32 {
+                let hi1 = if qh[l] & u1 != 0 { 16 } else { 0 };
+                let hi2 = if qh[l] & u2 != 0 { 16 } else { 0 };
+                y[j + l] = d * sc1 * ((ql[l] & 0x0F) + hi1) as f32 - dmin * m1;
+                y[j + 32 + l] = d * sc2 * ((ql[l] >> 4) + hi2) as f32 - dmin * m2;
+            }
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
+/// Dequantizes `Q6_K` super-blocks (256 values / 210 bytes) into `out`.
+pub fn dequantize_q6_k(src: &[u8], out: &mut [f32]) {
+    for (block, y) in src.chunks_exact(210).zip(out.chunks_exact_mut(QK_K)) {
+        let ql_all = &block[0..128];
+        let qh_all = &block[128..192];
+        let sc_all = &block[192..208];
+        let d = f16_at(block, 208);
+        for half in 0..2 {
+            let ql = &ql_all[half * 64..];
+            let qh = &qh_all[half * 32..];
+            let sc = &sc_all[half * 8..];
+            let y = &mut y[half * 128..];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+                y[l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                y[l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+            }
+        }
+    }
+}
+
+/// Converts little-endian IEEE half-precision values to F32.
+pub fn convert_f16(src: &[u8], out: &mut [f32]) {
+    for (b, y) in src.chunks_exact(2).zip(out.iter_mut()) {
+        *y = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    }
+}
+
+/// Converts little-endian bfloat16 values to F32.
+pub fn convert_bf16(src: &[u8], out: &mut [f32]) {
+    for (b, y) in src.chunks_exact(2).zip(out.iter_mut()) {
+        *y = f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16);
+    }
+}
+
+/// Batched quantized linear: `out[M, N] = act[M, K] · W[N, K]ᵀ` for a `Q8_0` or `Q4_0`
+/// weight. Parallelised over weight rows; each weight row is dequantized once into a
+/// small buffer and reused for all `M` activation rows, so the weight matrix is streamed
+/// from memory once regardless of `M`.
+pub fn linear_quantized_f32(
+    dtype_q8: bool,
+    weight_bytes: &[u8],
+    act: &[f32],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let (block_elems, block_bytes) = if dtype_q8 { (QK8_0, 34) } else { (QK4_0, 18) };
+    let row_bytes = (k / block_elems) * block_bytes;
+    debug_assert_eq!(weight_bytes.len(), n * row_bytes);
+    debug_assert_eq!(act.len(), m * k);
+    debug_assert_eq!(out.len(), m * n);
+
+    const ROWS_PER_TASK: usize = 8;
+    // Compute the transposed result [N, M] so each task owns a contiguous output slab.
+    let mut out_t = vec![0f32; n * m];
+    out_t
+        .par_chunks_mut(ROWS_PER_TASK * m)
+        .enumerate()
+        .for_each(|(task, slab)| {
+            let mut w_row = vec![0f32; k];
+            for (r, out_row) in slab.chunks_mut(m).enumerate() {
+                let j = task * ROWS_PER_TASK + r;
+                let bytes = &weight_bytes[j * row_bytes..(j + 1) * row_bytes];
+                if dtype_q8 {
+                    dequantize_q8_0(bytes, &mut w_row);
+                } else {
+                    dequantize_q4_0(bytes, &mut w_row);
+                }
+                for (i, o) in out_row.iter_mut().enumerate() {
+                    *o = crate::ops::gemm::dot_f32(&w_row, &act[i * k..(i + 1) * k]);
+                }
+            }
+        });
+    for j in 0..n {
+        for i in 0..m {
+            out[i * n + j] = out_t[j * m + i];
+        }
+    }
+}
+
+#[cfg(test)]
+mod dequant_tests {
+    use super::*;
+
+    #[test]
+    fn q4_0_and_q8_0_dequant_match_dot_kernels() {
+        let x: Vec<f32> = (0..64).map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0).collect();
+        let act: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1).sin()).collect();
+
+        let mut q4 = vec![0u8; 2 * 18];
+        quantize_f32_to_q4_0(&x, &mut q4);
+        let mut deq = vec![0f32; 64];
+        dequantize_q4_0(&q4, &mut deq);
+        let dense: f32 = deq.iter().zip(&act).map(|(a, b)| a * b).sum();
+        assert!((dense - dot_q4_0_f32(&q4, &act)).abs() < 1e-4);
+        // Quantisation error is bounded by half a step of the block scale.
+        for (a, b) in x.iter().zip(&deq) {
+            assert!((a - b).abs() <= 2.0 / 8.0 + 1e-3);
+        }
+
+        let mut q8 = vec![0u8; 2 * 34];
+        for (b, chunk) in x.chunks(32).enumerate() {
+            let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let d = amax / 127.0;
+            q8[b * 34..b * 34 + 2].copy_from_slice(&f16::from_f32(d).to_le_bytes());
+            for (i, v) in chunk.iter().enumerate() {
+                q8[b * 34 + 2 + i] = (v / d).round() as i8 as u8;
+            }
+        }
+        dequantize_q8_0(&q8, &mut deq);
+        let dense: f32 = deq.iter().zip(&act).map(|(a, b)| a * b).sum();
+        assert!((dense - dot_q8_0_f32(&q8, &act)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn half_precision_conversions() {
+        let mut out = [0f32; 2];
+        convert_f16(&[0x00, 0x3C, 0x00, 0xC0], &mut out); // 1.0, -2.0
+        assert_eq!(out, [1.0, -2.0]);
+        convert_bf16(&[0x80, 0x3F, 0x40, 0xC0], &mut out); // 1.0, -3.0
+        assert_eq!(out, [1.0, -3.0]);
     }
 }
