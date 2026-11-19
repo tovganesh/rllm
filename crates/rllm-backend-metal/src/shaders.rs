@@ -294,6 +294,225 @@ kernel void mv_q6_k(LINEAR_ARGS, uint tg [[threadgroup_position_in_grid]],
     }
 }
 
+// ── small-batch matrix-vector: 2..8 activation rows share each decoded weight chunk ──
+// Same thread layout as the single-row kernels (2 simdgroups x 4 weight rows), but each
+// lane decodes a chunk of 8 weight values once and applies it to all `m <= NR`
+// activation rows, so weights are read and unpacked once per call rather than once per
+// row. A format describes its lane layout: `LPB` lanes per block of `BV` values, each
+// lane owning `C` chunks of 8 values; `dec` returns chunk `c` dequantized and its
+// offset within the activation row.
+struct MvF32  { enum : uint { BV = 32, LPB = 4, C = 1 }; };
+struct MvF16  { enum : uint { BV = 32, LPB = 4, C = 1 }; };
+struct MvQ8   { enum : uint { BV = 32, LPB = 4, C = 1 }; };
+struct MvQ4   { enum : uint { BV = 32, LPB = 2, C = 2 }; };
+struct MvQ4K  { enum : uint { BV = 256, LPB = 8, C = 4 }; };
+struct MvQ6K  { enum : uint { BV = 256, LPB = 8, C = 4 }; };
+
+inline uint mv_xoff(uint ib, uint il, uint c, MvF32) { return ib * 32 + il * 8; }
+inline uint mv_xoff(uint ib, uint il, uint c, MvF16) { return ib * 32 + il * 8; }
+inline uint mv_xoff(uint ib, uint il, uint c, MvQ8)  { return ib * 32 + il * 8; }
+inline uint mv_xoff(uint ib, uint il, uint c, MvQ4)  { return ib * 32 + c * 16 + il * 8; }
+inline uint mv_xoff(uint ib, uint il, uint c, MvQ4K) { return ib * 256 + (il / 2) * 64 + (c / 2) * 32 + (il % 2) * 16 + (c % 2) * 8; }
+inline uint mv_xoff(uint ib, uint il, uint c, MvQ6K) { return ib * 256 + (il / 4) * 128 + c * 32 + (il % 4) * 8; }
+
+inline uint mv_dec(device const uchar* w, uint row, uint nb, uint ib, uint il, uint c, thread float4& w0, thread float4& w1, MvF32) {
+    device const float4* r = (device const float4*)((device const float*)w + ((ulong)row * nb + ib) * 32 + il * 8);
+    w0 = r[0]; w1 = r[1];
+    return ib * 32 + il * 8;
+}
+inline uint mv_dec(device const uchar* w, uint row, uint nb, uint ib, uint il, uint c, thread float4& w0, thread float4& w1, MvF16) {
+    device const half4* r = (device const half4*)((device const half*)w + ((ulong)row * nb + ib) * 32 + il * 8);
+    w0 = float4(r[0]); w1 = float4(r[1]);
+    return ib * 32 + il * 8;
+}
+inline uint mv_dec(device const uchar* w, uint row, uint nb, uint ib, uint il, uint c, thread float4& w0, thread float4& w1, MvQ8) {
+    device const block_q8_0* b = (device const block_q8_0*)w + (ulong)row * nb + ib;
+    const float d = float(b->d);
+    device const char* q = b->qs + il * 8;
+    w0 = d * float4(q[0], q[1], q[2], q[3]);
+    w1 = d * float4(q[4], q[5], q[6], q[7]);
+    return ib * 32 + il * 8;
+}
+// Lane half `il` owns bytes il*8..il*8+8: low nibbles (c = 0) are values il*8.., high
+// nibbles (c = 1) values 16+il*8...
+inline uint mv_dec(device const uchar* w, uint row, uint nb, uint ib, uint il, uint c, thread float4& w0, thread float4& w1, MvQ4) {
+    device const block_q4_0* b = (device const block_q4_0*)w + (ulong)row * nb + ib;
+    const float d = float(b->d);
+    device const ushort* q = (device const ushort*)(b->qs + il * 8);  // 2-byte aligned
+    const uint2 v = uint2(uint(q[0]) | (uint(q[1]) << 16), uint(q[2]) | (uint(q[3]) << 16));
+    const uint sh = c * 4;
+    for (uint t = 0; t < 4; ++t) {
+        w0[t] = d * (float((v.x >> (8 * t + sh)) & 0x0F) - 8.0f);
+        w1[t] = d * (float((v.y >> (8 * t + sh)) & 0x0F) - 8.0f);
+    }
+    return ib * 32 + c * 16 + il * 8;
+}
+// Lane t = 2*cc + h covers bytes cc*32 + h*16 .. +16 of qs: chunk c = 2*nib + part takes
+// bytes part*8..part*8+8 of those, low (nib 0, sub-block 2cc) or high nibbles (2cc+1).
+inline uint mv_dec(device const uchar* w, uint row, uint nb, uint ib, uint il, uint c, thread float4& w0, thread float4& w1, MvQ4K) {
+    device const block_q4_K* b = (device const block_q4_K*)w + (ulong)row * nb + ib;
+    const uint cc = il / 2, h = il % 2, nib = c / 2, part = c % 2;
+    const float2 sm = scale_min_k4(2 * cc + nib, b->scales);
+    const float d = float(b->d) * sm.x, mn = float(b->dmin) * sm.y;
+    const uint2 v = *(device const uint2*)(b->qs + cc * 32 + h * 16 + part * 8);
+    const uint sh = nib * 4;
+    for (uint t = 0; t < 4; ++t) {
+        w0[t] = d * float((v.x >> (8 * t + sh)) & 0x0F) - mn;
+        w1[t] = d * float((v.y >> (8 * t + sh)) & 0x0F) - mn;
+    }
+    return ib * 256 + cc * 64 + nib * 32 + h * 16 + part * 8;
+}
+// Lane t covers half hf = t/4, positions l0..l0+8 (l0 = 8*(t%4)) of 32-value group g = c.
+inline uint mv_dec(device const uchar* w, uint row, uint nb, uint ib, uint il, uint c, thread float4& w0, thread float4& w1, MvQ6K) {
+    device const block_q6_K* b = (device const block_q6_K*)w + (ulong)row * nb + ib;
+    const uint hf = il / 4, l0 = (il % 4) * 8;
+    device const uchar* ql = b->ql + hf * 64 + (c & 1) * 32 + l0;
+    device const uchar* qh = b->qh + hf * 32 + l0;
+    const float d = float(b->d) * float(b->scales[hf * 8 + l0 / 16 + 2 * c]);
+    const uint lsh = (c >= 2) ? 4 : 0, hsh = 2 * c;
+    for (uint t = 0; t < 4; ++t) {
+        w0[t] = d * (float(((ql[t] >> lsh) & 0x0F) | (((qh[t] >> hsh) & 3) << 4)) - 32.0f);
+        w1[t] = d * (float(((ql[4 + t] >> lsh) & 0x0F) | (((qh[4 + t] >> hsh) & 3) << 4)) - 32.0f);
+    }
+    return ib * 256 + hf * 128 + c * 32 + l0;
+}
+
+template <typename F, uint NR>
+kernel void mvn(LINEAR_ARGS, uint tg [[threadgroup_position_in_grid]],
+                uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    const uint nb = k / F::BV;
+    const uint row0 = (tg * 2 + sg) * 4;
+    const uint il = lane % F::LPB;
+    float sums[NR][4];
+    for (uint mi = 0; mi < NR; ++mi)
+        for (uint r = 0; r < 4; ++r) sums[mi][r] = 0.0f;
+    for (uint ib = lane / F::LPB; ib < nb; ib += 32 / F::LPB) {
+        for (uint c = 0; c < F::C; ++c) {
+            const uint xo = mv_xoff(ib, il, c, F());
+            // Activations for this chunk are loaded once per group of (up to) 4 rows and
+            // reused for all 4 weight rows; more than 4 rows in registers spills.
+            for (uint g = 0; g < NR; g += 4) {
+                constexpr uint G = NR < 4 ? NR : 4;
+                float4 xa[G], xb[G];
+                for (uint i = 0; i < G; ++i) {
+                    const uint mr = min(g + i, m - 1);  // rows past m repeat the last (discarded)
+                    device const float4* xp = (device const float4*)(x + (ulong)mr * k + xo);
+                    xa[i] = xp[0];
+                    xb[i] = xp[1];
+                }
+                for (uint r = 0; r < 4; ++r) {
+                    const uint row = row0 + r;
+                    if (row < n) {
+                        float4 w0, w1;
+                        mv_dec(w, row, nb, ib, il, c, w0, w1, F());
+                        for (uint i = 0; i < G; ++i) sums[g + i][r] += dot(w0, xa[i]) + dot(w1, xb[i]);
+                    }
+                }
+            }
+        }
+    }
+    for (uint mi = 0; mi < NR; ++mi) {
+        if (mi >= m) break;
+        for (uint r = 0; r < 4; ++r) {
+            const float t = simd_sum(sums[mi][r]);
+            const uint row = row0 + r;
+            if (lane == 0 && row < n) {
+                device float* o = y + (ulong)mi * ldy + row;
+                *o = accumulate ? *o + t : t;
+            }
+        }
+    }
+}
+
+typedef decltype(mvn<MvF32, 2>) mvn_t;
+#define MVN(F, SUF, NR) template [[host_name("mv" #NR "_" SUF)]] kernel mvn_t mvn<F, NR>;
+#define MVN_ALL(F, SUF) MVN(F, SUF, 2) MVN(F, SUF, 4) MVN(F, SUF, 8)
+MVN_ALL(MvF32, "f32")
+MVN_ALL(MvF16, "f16")
+MVN_ALL(MvQ8, "q8_0")
+MVN_ALL(MvQ4, "q4_0")
+MVN_ALL(MvQ4K, "q4_k")
+MVN_ALL(MvQ6K, "q6_k")
+
+// ── small-batch GEMM: up to 8*NT activation rows on simdgroup matrices ──
+// Each simdgroup owns 8 weight rows. Per 32-value block, its 32 lanes dequantize the
+// 8x32 weight tile once (8 values each, as the tiled GEMM does) into threadgroup memory
+// as half, then multiply NT 8-token fragments of the half-precision activations, loaded
+// straight from device memory, with it. Unlike the tiled GEMM this needs no 64-token
+// tile and launches one threadgroup per 16 weight rows, so small batches fill the GPU.
+// Rows of `x` past `m` are read but only feed output rows that are never written, so
+// `x` needs 8*NT readable rows.
+// One step of `mms`: B blocks (32*B values) starting at block ib0.
+template <typename T, uint NT, uint B>
+inline void mms_step(device const uchar* w, device const half* x, uint row, uint k, uint ib0, uint lr, uint lq,
+                     threadgroup half* sw, thread simdgroup_float8x8* acc) {
+    constexpr uint KW = 32 * B;
+    // All weight loads of the tile are issued before any is used.
+    float wv[B][8];
+    for (uint b = 0; b < B; ++b) load8(w, row, k, ib0 + b, lq, wv[b], T());
+    for (uint b = 0; b < B; ++b)
+        for (uint j = 0; j < 8; ++j) sw[lr * KW + b * 32 + lq * 8 + j] = half(wv[b][j]);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    // acc[t] (tokens x rows) += X[t*8.., kk..] (row-major, from device) * W[rows, kk..]^T
+    // (transposed load from threadgroup memory).
+    for (uint kk = 0; kk < KW; kk += 8) {
+        simdgroup_half8x8 wt;
+        simdgroup_load(wt, sw + kk, KW, ulong2(0, 0), true);
+        for (uint t = 0; t < NT; ++t) {
+            simdgroup_half8x8 xm;
+            simdgroup_load(xm, x + (ulong)(t * 8) * k + ib0 * 32 + kk, k);
+            simdgroup_multiply_accumulate(acc[t], xm, wt, acc[t]);
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <typename T, uint NT, uint SG, uint BPI>
+kernel void mms(device const uchar* w [[buffer(0)]], device const half* x [[buffer(1)]],
+                device float* y [[buffer(2)]], constant uint& n [[buffer(3)]],
+                constant uint& k [[buffer(4)]], constant uint& m [[buffer(5)]],
+                constant uint& accumulate [[buffer(6)]], constant uint& ldy [[buffer(7)]],
+                uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sw_all[SG][8 * 32 * BPI];
+    threadgroup float so_all[SG][64];
+    threadgroup half* sw = sw_all[sg];
+    threadgroup float* so = so_all[sg];
+    const uint row0 = (tg * SG + sg) * 8;
+    if (row0 >= n) return;
+    const uint lr = lane / 4, lq = lane % 4;
+    const uint row = min(row0 + lr, n - 1);  // rows past n are computed and discarded
+    const uint nb = k / 32;
+    simdgroup_float8x8 acc[NT];
+    for (uint t = 0; t < NT; ++t) acc[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    uint ib = 0;
+    for (; ib + BPI <= nb; ib += BPI) mms_step<T, NT, BPI>(w, x, row, k, ib, lr, lq, sw, acc);
+    for (; ib < nb; ++ib) mms_step<T, NT, 1>(w, x, row, k, ib, lr, lq, sw, acc);
+    for (uint t = 0; t < NT; ++t) {
+        simdgroup_store(acc[t], so, 8);  // so[token * 8 + r]
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = lane; e < 64; e += 32) {
+            const uint r = e % 8, tok = t * 8 + e / 8;
+            if (tok < m && row0 + r < n) {
+                device float* o = y + (ulong)tok * ldy + row0 + r;
+                *o = accumulate ? *o + so[e] : so[e];
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// 2 simdgroups x 8 weight rows per threadgroup, 2 blocks per step (swept on an M4:
+// 1 or 4 simdgroups and 1, 4 or 8 blocks per step were up to 20% slower).
+typedef decltype(mms<WQ8, 1, 2, 2>) mms_t;
+#define MMS(TAG, SUF, NT) template [[host_name("mms" #NT "_" SUF)]] kernel mms_t mms<TAG, NT, 2, 2>;
+#define MMS_ALL(TAG, SUF) MMS(TAG, SUF, 1) MMS(TAG, SUF, 2) MMS(TAG, SUF, 4)
+MMS_ALL(WQ8, "q8_0")
+MMS_ALL(WQ4, "q4_0")
+MMS_ALL(WF16, "f16")
+MMS_ALL(WQ4K, "q4_k")
+MMS_ALL(WQ6K, "q6_k")
+
 constant constexpr uint BK = 32;
 
 // ── F32-weight tiled matrix-matrix (prefill), 32x32 output tile, full F32 ──
