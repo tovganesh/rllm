@@ -46,6 +46,7 @@ fn model(dtype: DType) -> LlamaModel<CpuBackend> {
                 *w = quantize(w, dtype);
             }
         }
+        m.fuse_projections().unwrap();
     }
     m
 }

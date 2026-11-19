@@ -139,6 +139,26 @@ impl Tensor {
         })
     }
 
+    /// Zero-copy view of rows `start..start + len` of a contiguous rank-2 tensor
+    /// (works for block-quantized types as long as rows are whole blocks).
+    pub fn slice_rows(&self, start: usize, len: usize) -> Result<Self> {
+        let dims = self.shape.dims();
+        if dims.len() != 2 || !self.is_contiguous() || start + len > dims[0] {
+            return Err(RllmError::BackendError(format!(
+                "slice_rows({start}, {len}) on tensor of shape {dims:?}"
+            )));
+        }
+        let row_bytes = self.dtype.storage_bytes(dims[1]);
+        Ok(Self {
+            shape: Shape::new(vec![len, dims[1]]),
+            strides: Shape::new(vec![len, dims[1]]).default_strides(),
+            dtype: self.dtype,
+            device: self.device,
+            storage: self.storage.clone(),
+            offset: self.offset + start * row_bytes,
+        })
+    }
+
     /// Byte offset of the first element within the underlying storage.
     pub fn offset(&self) -> usize {
         self.offset

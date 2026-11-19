@@ -13,6 +13,9 @@ use std::sync::Arc;
 
 /// Self-attention projection tensors ($Q, K, V, O$).
 pub struct LlamaAttention {
+    /// Fused `[q | k | v]` projection (see [`LlamaModel::fuse_projections`]); when set,
+    /// `q_proj`, `k_proj` and `v_proj` are row views of it.
+    pub qkv_proj: Option<Tensor>,
     pub q_proj: Tensor,
     pub k_proj: Tensor,
     pub v_proj: Tensor,
@@ -21,6 +24,8 @@ pub struct LlamaAttention {
 
 /// SwiGLU feed-forward multilayer perceptron tensors (Gate, Up, Down).
 pub struct LlamaMlp {
+    /// Fused `[gate | up]` projection; when set, `gate_proj` and `up_proj` are views of it.
+    pub gate_up_proj: Option<Tensor>,
     pub gate_proj: Tensor,
     pub up_proj: Tensor,
     pub down_proj: Tensor,
@@ -72,6 +77,7 @@ impl<B: Backend> LlamaModel<B> {
             layers.push(LlamaDecoderLayer {
                 input_layernorm: init.norm_weight(h, dev)?,
                 self_attn: LlamaAttention {
+                    qkv_proj: None,
                     q_proj: init.linear(h, h, dev)?,
                     k_proj: init.linear(kv_dim, h, dev)?,
                     v_proj: init.linear(kv_dim, h, dev)?,
@@ -79,6 +85,7 @@ impl<B: Backend> LlamaModel<B> {
                 },
                 post_attention_layernorm: init.norm_weight(h, dev)?,
                 mlp: LlamaMlp {
+                    gate_up_proj: None,
                     gate_proj: init.linear(inter, h, dev)?,
                     up_proj: init.linear(inter, h, dev)?,
                     down_proj: init.linear(h, inter, dev)?,
@@ -98,7 +105,7 @@ impl<B: Backend> LlamaModel<B> {
         let cos_table = Tensor::from_f32(&cos_raw, table_shape.clone(), dev)?;
         let sin_table = Tensor::from_f32(&sin_raw, table_shape, dev)?;
 
-        Ok(Self {
+        let mut model = Self {
             config,
             backend,
             embed_tokens,
@@ -108,7 +115,38 @@ impl<B: Backend> LlamaModel<B> {
             cos_table,
             sin_table,
             kv_cache: Default::default(),
-        })
+        };
+        model.fuse_projections()?;
+        Ok(model)
+    }
+
+    /// Concatenates each layer's Q/K/V and gate/up weights into single matrices and
+    /// re-points the individual projections at row views of them (no extra memory).
+    /// The forward pass then runs one linear layer for Q/K/V and one for gate/up,
+    /// quantizing activations once per fused matrix. Idempotent; call it again after
+    /// replacing individual projection tensors. Layers whose parts differ in dtype or
+    /// width are left unfused.
+    pub fn fuse_projections(&mut self) -> Result<()> {
+        for layer in &mut self.layers {
+            let a = &mut layer.self_attn;
+            if let Some(fused) = concat_rows(&[&a.q_proj, &a.k_proj, &a.v_proj])? {
+                let (nq, nk) = (a.q_proj.dims()[0], a.k_proj.dims()[0]);
+                let nv = a.v_proj.dims()[0];
+                a.q_proj = fused.slice_rows(0, nq)?;
+                a.k_proj = fused.slice_rows(nq, nk)?;
+                a.v_proj = fused.slice_rows(nq + nk, nv)?;
+                a.qkv_proj = Some(fused);
+            }
+            let m = &mut layer.mlp;
+            if let Some(fused) = concat_rows(&[&m.gate_proj, &m.up_proj])? {
+                let ng = m.gate_proj.dims()[0];
+                let nu = m.up_proj.dims()[0];
+                m.gate_proj = fused.slice_rows(0, ng)?;
+                m.up_proj = fused.slice_rows(ng, nu)?;
+                m.gate_up_proj = Some(fused);
+            }
+        }
+        Ok(())
     }
 
     /// Single autoregressive decode step: one token per sequence.
@@ -233,9 +271,22 @@ impl<B: Backend> LlamaModel<B> {
                 self.backend
                     .rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
-            let mut q = self.backend.linear(&normed, &layer.self_attn.q_proj)?;
-            let mut k = self.backend.linear(&normed, &layer.self_attn.k_proj)?;
-            let v = self.backend.linear(&normed, &layer.self_attn.v_proj)?;
+            // Fused projections pay off for decode-sized batches (one activation
+            // quantization, fewer parallel regions); for prefill-sized batches the separate
+            // row views are faster (no column split, smaller GEMMs). Measured on an M4.
+            let use_fused = num_rows < FUSED_MAX_ROWS;
+            let (mut q, mut k, v) = match layer.self_attn.qkv_proj.as_ref().filter(|_| use_fused) {
+                Some(qkv) => {
+                    let fused = self.backend.linear(&normed, qkv)?;
+                    let kv_dim = num_kv_heads * head_dim;
+                    split_columns(&fused, &[h, kv_dim, kv_dim], self.backend.device())?
+                }
+                None => (
+                    self.backend.linear(&normed, &layer.self_attn.q_proj)?,
+                    self.backend.linear(&normed, &layer.self_attn.k_proj)?,
+                    self.backend.linear(&normed, &layer.self_attn.v_proj)?,
+                ),
+            };
 
             q = q.reshape(Shape::new(vec![num_rows, num_q_heads, head_dim]))?;
             k = k.reshape(Shape::new(vec![num_rows, num_kv_heads, head_dim]))?;
@@ -298,13 +349,17 @@ impl<B: Backend> LlamaModel<B> {
                 &layer.post_attention_layernorm,
                 self.config.rms_norm_eps,
             )?;
-            let gate = self
-                .backend
-                .linear(&ffn_normed, &layer.mlp.gate_proj)?;
-            let up = self
-                .backend
-                .linear(&ffn_normed, &layer.mlp.up_proj)?;
-            let act = self.backend.swiglu(&gate, &up)?;
+            let act = match layer.mlp.gate_up_proj.as_ref().filter(|_| use_fused) {
+                Some(gu) => {
+                    let fused = self.backend.linear(&ffn_normed, gu)?;
+                    swiglu_fused(&fused, self.config.intermediate_size, self.backend.device())?
+                }
+                None => {
+                    let gate = self.backend.linear(&ffn_normed, &layer.mlp.gate_proj)?;
+                    let up = self.backend.linear(&ffn_normed, &layer.mlp.up_proj)?;
+                    self.backend.swiglu(&gate, &up)?
+                }
+            };
             let ffn_out = self
                 .backend
                 .linear(&act, &layer.mlp.down_proj)?;
@@ -347,6 +402,69 @@ pub struct ForwardBatch<'a> {
     pub block_tables: &'a [BlockTable],
     /// Rows for which logits are returned (typically the last row of each sequence).
     pub logits_rows: &'a [usize],
+}
+
+/// Batches with fewer rows than this use the fused Q/K/V and gate/up projections.
+const FUSED_MAX_ROWS: usize = 32;
+
+/// Row-concatenates matrices with the same width and dtype into one contiguous tensor.
+/// Returns `None` when they differ (the layer then stays unfused).
+fn concat_rows(parts: &[&Tensor]) -> Result<Option<Tensor>> {
+    let cols = parts[0].dims()[1];
+    let dtype = parts[0].dtype();
+    if parts.iter().any(|t| t.dims().len() != 2 || t.dims()[1] != cols || t.dtype() != dtype) {
+        return Ok(None);
+    }
+    let rows: usize = parts.iter().map(|t| t.dims()[0]).sum();
+    let mut bytes = Vec::with_capacity(dtype.storage_bytes(rows * cols));
+    for t in parts {
+        let len = dtype.storage_bytes(t.numel());
+        bytes.extend_from_slice(&t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + len]);
+    }
+    Ok(Some(Tensor::new(
+        Shape::new(vec![rows, cols]),
+        dtype,
+        parts[0].device(),
+        rllm_core::storage::Storage::Cpu(rllm_core::storage::CpuStorage::from_bytes(bytes)),
+    )))
+}
+
+/// Splits the columns of `[rows, sum(widths)]` into three contiguous tensors.
+fn split_columns(x: &Tensor, widths: &[usize; 3], dev: rllm_core::device::Device) -> Result<(Tensor, Tensor, Tensor)> {
+    let total: usize = widths.iter().sum();
+    let src = x.as_f32_slice()?;
+    let rows = src.len() / total;
+    let mut parts: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (p, &w) in parts.iter_mut().zip(widths) {
+        p.reserve(rows * w);
+    }
+    for row in src.chunks_exact(total) {
+        let mut off = 0;
+        for (p, &w) in parts.iter_mut().zip(widths) {
+            p.extend_from_slice(&row[off..off + w]);
+            off += w;
+        }
+    }
+    let t = |v: &Vec<f32>, w: usize| Tensor::from_f32(v, Shape::new(vec![rows, w]), dev);
+    Ok((t(&parts[0], widths[0])?, t(&parts[1], widths[1])?, t(&parts[2], widths[2])?))
+}
+
+/// SwiGLU over a fused `[rows, 2 * inter]` gate/up output: `silu(gate) * up`.
+fn swiglu_fused(gu: &Tensor, inter: usize, dev: rllm_core::device::Device) -> Result<Tensor> {
+    use rayon::prelude::*;
+    let src = gu.as_f32_slice()?;
+    let rows = src.len() / (2 * inter);
+    let mut out = vec![0f32; rows * inter];
+    out.par_chunks_mut(inter)
+        .zip(src.par_chunks(2 * inter))
+        .with_min_len((16 * 1024 / inter.max(1)).max(1))
+        .for_each(|(o, r)| {
+            let (g, u) = r.split_at(inter);
+            for ((o, &g), &u) in o.iter_mut().zip(g).zip(u) {
+                *o = g / (1.0 + (-g).exp()) * u;
+            }
+        });
+    Tensor::from_f32(&out, Shape::new(vec![rows, inter]), dev)
 }
 
 fn add_inplace(dst: &mut Tensor, src: &Tensor) -> Result<()> {
