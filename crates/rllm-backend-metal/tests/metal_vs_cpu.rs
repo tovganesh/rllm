@@ -94,9 +94,9 @@ fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
 /// (matrix-vector kernel), comparing logits at every step. The CPU reference always
 /// runs batches of 32+ rows (and requests logits for every row) so that it, like Metal,
 /// uses F32 activations; single-row CPU decode would quantize activations to Q8.
-/// `prefill_tol` is looser for quantized weights: the Metal prefill GEMM stores
-/// dequantized weights as half precision in threadgroup memory (as llama.cpp's Metal
-/// backend does), whereas the CPU reference uses F32.
+/// `prefill_tol` is looser: the Metal prefill GEMM multiplies half-precision weight and
+/// activation tiles and the prefill attention stages keys/values as half (as llama.cpp's
+/// Metal backend does), whereas the CPU reference uses F32.
 fn check(dtype: DType, tol: f32, prefill_tol: f32) {
     if !MetalLlama::is_available() {
         eprintln!("skipping: no Metal device");
@@ -147,7 +147,9 @@ fn check(dtype: DType, tol: f32, prefill_tol: f32) {
 
 #[test]
 fn metal_matches_cpu_f32() {
-    check(DType::F32, 1e-4, 1e-4);
+    // Prefill attention stages keys/values in half precision (as llama.cpp's Metal flash
+    // attention does with its F16 KV cache), hence the looser prefill bound.
+    check(DType::F32, 1e-4, 5e-4);
 }
 
 #[test]

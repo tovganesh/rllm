@@ -354,52 +354,66 @@ kernel void mm_f32(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]],
     mm32_impl<WF32>(w, x, y, n, k, m, accumulate, ldy, tg, tid, sg, sa, sb, sc);
 }
 
-// ── quantized-weight tiled matrix-matrix (prefill), 64x64 output tile ──
+// ── quantized / F16-weight tiled matrix-matrix (prefill), 64x64 output tile ──
 // 64 activation rows x 64 weight rows per threadgroup (128 threads, 4 simdgroups, each
-// 32x32 = 4x4 accumulators). Each k-step dequantizes a 64x32 weight tile into
-// half-precision threadgroup memory stored k-major (fragments load untransposed) and
-// copies a 64x32 activation tile as float4; products are float x half -> float.
-// Chosen by A/B on an M4 against 32x32, 32x64 (with/without prefetch, half activations),
-// 8-simdgroup and transposed-output variants.
+// 32x32 = 4x4 accumulators), k-step 64. Activations arrive as half precision (converted
+// once per linear layer, not once per weight tile) and both tiles are half in
+// threadgroup memory, stored so fragments load untransposed; products are
+// half x half -> float. Each k-step a thread dequantizes one 32-value weight block
+// (row-per-thread mapping, conflict-free tile stores) or, for formats whose blocks are
+// not word-aligned (Q6_K), four threads share a block (coalesced reads).
+// Chosen with tests/gemm_bench.rs on an M4 against BK=32, float activations, 64x128
+// tiles (4 or 8 simdgroups) and 32 accumulators per simdgroup (spills: 5.5x slower).
 constant constexpr uint TQ = 64;
+constant constexpr uint TK = 64;
 
-template <typename T>
-inline void mmq_impl(device const uchar* w, device const float* x, device float* y,
+template <typename T, bool BLOCK_MAJOR>
+inline void mmq_impl(device const uchar* w, device const half* x, device float* y,
                      uint n, uint k, uint m, uint acc_in, uint ldy, uint2 tg, uint tid, uint sg,
                      threadgroup char* shmem) {
-    threadgroup half*  sw = (threadgroup half*)shmem;                // [BK][TQ] halves  4 KB
-    threadgroup float* sx = (threadgroup float*)(shmem + 4096);      // [TQ][BK] floats  8 KB
+    threadgroup half* sw = (threadgroup half*)shmem;             // [TK][TQ] 8 KB
+    threadgroup half* sx = (threadgroup half*)(shmem + 8192);    // [TQ][TK] 8 KB
     const uint row0 = tg.y * TQ, col0 = tg.x * TQ;
     const uint xi = (sg / 2) * 32, wj = (sg % 2) * 32;
     simdgroup_float8x8 acc[4][4];
     for (uint a = 0; a < 4; ++a)
         for (uint b = 0; b < 4; ++b) acc[a][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-    for (uint k0 = 0; k0 < k; k0 += BK) {
-        for (uint idx = tid; idx < TQ * 4; idx += 128) {
-            const uint wr = idx / 4, q = idx % 4;
-            float v[8];
-            if (col0 + wr < n) load8(w, col0 + wr, k, k0 / 32, q, v, T());
-            else for (uint j = 0; j < 8; ++j) v[j] = 0.0f;
-            for (uint j = 0; j < 8; ++j) sw[(q * 8 + j) * TQ + wr] = half(v[j]);
+    for (uint k0 = 0; k0 < k; k0 += TK) {
+        if (BLOCK_MAJOR) {
+            for (uint idx = tid; idx < TQ * 8; idx += 128) {
+                const uint wr = idx / 8, q8 = idx % 8;
+                float v[8];
+                if (col0 + wr < n) load8(w, col0 + wr, k, k0 / 32 + q8 / 4, q8 % 4, v, T());
+                else for (uint j = 0; j < 8; ++j) v[j] = 0.0f;
+                for (uint j = 0; j < 8; ++j) sw[(q8 * 8 + j) * TQ + wr] = half(v[j]);
+            }
+        } else {
+            const uint wr = tid % TQ, blk = tid / TQ;   // 64 rows x 2 blocks = 128 threads
+            for (uint q = 0; q < 4; ++q) {
+                float v[8];
+                if (col0 + wr < n) load8(w, col0 + wr, k, k0 / 32 + blk, q, v, T());
+                else for (uint j = 0; j < 8; ++j) v[j] = 0.0f;
+                for (uint j = 0; j < 8; ++j) sw[(blk * 32 + q * 8 + j) * TQ + wr] = half(v[j]);
+            }
         }
-        for (uint idx = tid; idx < TQ * 4; idx += 128) {
-            const uint xr = idx / 4, xq = idx % 4;
-            threadgroup float4* dst = (threadgroup float4*)(sx + xr * BK + xq * 8);
+        for (uint idx = tid; idx < TQ * 8; idx += 128) {
+            const uint xr = idx / 8, xq = idx % 8;
+            threadgroup half4* dst = (threadgroup half4*)(sx + xr * TK + xq * 8);
             if (row0 + xr < m) {
-                device const float4* src = (device const float4*)(x + (ulong)(row0 + xr) * k + k0 + xq * 8);
+                device const half4* src = (device const half4*)(x + (ulong)(row0 + xr) * k + k0 + xq * 8);
                 dst[0] = src[0];
                 dst[1] = src[1];
             } else {
-                dst[0] = 0.0f;
-                dst[1] = 0.0f;
+                dst[0] = half4(0.0h);
+                dst[1] = half4(0.0h);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < BK; kk += 8) {
-            simdgroup_float8x8 fx[4];
+        for (uint kk = 0; kk < TK; kk += 8) {
+            simdgroup_half8x8 fx[4];
             simdgroup_half8x8 fw[4];
-            for (uint a = 0; a < 4; ++a) simdgroup_load(fx[a], sx + (xi + a * 8) * BK + kk, BK);
+            for (uint a = 0; a < 4; ++a) simdgroup_load(fx[a], sx + (xi + a * 8) * TK + kk, TK);
             for (uint b = 0; b < 4; ++b) simdgroup_load(fw[b], sw + kk * TQ + wj + b * 8, TQ);
             for (uint a = 0; a < 4; ++a)
                 for (uint b = 0; b < 4; ++b) simdgroup_multiply_accumulate(acc[a][b], fx[a], fw[b], acc[a][b]);
@@ -429,17 +443,23 @@ inline void mmq_impl(device const uchar* w, device const float* x, device float*
     }
 }
 
-#define MMQ_KERNEL(NAME, TAG) \
+// `x` is bound as half-precision activations for these kernels.
+#define MMH_KERNEL(NAME, TAG, BM) \
 kernel void NAME(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]], \
                  uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup char shmem[16384]; \
-    mmq_impl<TAG>(w, x, y, n, k, m, accumulate, ldy, tg, tid, sg, shmem); }
+    mmq_impl<TAG, BM>(w, (device const half*)x, y, n, k, m, accumulate, ldy, tg, tid, sg, shmem); }
 
-MMQ_KERNEL(mm_q8_0, WQ8)
-MMQ_KERNEL(mm_q4_0, WQ4)
-MMQ_KERNEL(mm_f16, WF16)
-MMQ_KERNEL(mm_q4_k, WQ4K)
-MMQ_KERNEL(mm_q6_k, WQ6K)
+MMH_KERNEL(mm_q8_0, WQ8, false)
+MMH_KERNEL(mm_q4_0, WQ4, false)
+MMH_KERNEL(mm_f16, WF16, false)
+MMH_KERNEL(mm_q4_k, WQ4K, false)
+MMH_KERNEL(mm_q6_k, WQ6K, true)
+
+// ── F32 -> F16 conversion of a linear layer's input (prefill) ──
+kernel void to_half(device const float4* x [[buffer(0)]], device half4* y [[buffer(1)]],
+                    uint i [[thread_position_in_grid]]) { y[i] = half4(x[i]); }
+
 
 // ── embedding lookup: out[r, c] = table[ids[r], c] ──
 template <typename T>
@@ -528,19 +548,21 @@ kernel void kv_write(device const float* qkv [[buffer(0)]], constant uint& k_off
 // query (held in threadgroup memory), the tile updates an online softmax, and values
 // are accumulated with each lane owning hd/32 output dimensions. Simdgroups take
 // interleaved tiles and are merged at the end. Used for decode rows.
-kernel void attention(ATTN_ARGS, device const uint* row_list [[buffer(12)]],
-                      uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
+// The head dimension is a template parameter so the per-lane accumulators stay in
+// registers.
+template <uint HD>
+inline void attn_row_impl(device const float* q, device const float* kc, device const float* vc,
+                          device float* out, device const uint* tables, device const uint* table_off,
+                          device const uint* pos, uint nq, uint nkv, uint bs, float scale, uint q_stride,
+                          device const uint* row_list, threadgroup float* qs, threadgroup float* tm,
+                          threadgroup float* ts, threadgroup float* tacc, uint2 tg, uint sg, uint lane) {
     constexpr uint NSG = 4;
-    threadgroup float qs[256];
-    threadgroup float tm[NSG];
-    threadgroup float ts[NSG];
-    threadgroup float tacc[NSG * 256];
+    constexpr uint hd = HD;
 
     const uint head = tg.x, r = row_list[tg.y];
     const uint kvh = head / (nq / nkv);
     const uint ctx = pos[r] + 1;
-    const uint dpl = hd / 32;
+    constexpr uint dpl = HD / 32;
     const ulong block_stride = (ulong)nkv * bs * hd;
     const ulong head_off = (ulong)kvh * bs * hd;
     device const uint* table = tables + table_off[r];
@@ -550,7 +572,7 @@ kernel void attention(ATTN_ARGS, device const uint* row_list [[buffer(12)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float m = -INFINITY, s = 0.0f;
-    float acc[8];
+    float acc[dpl];
     for (uint i = 0; i < dpl; ++i) acc[i] = 0.0f;
 
     for (uint t0 = sg * 32; t0 < ctx; t0 += NSG * 32) {
@@ -594,87 +616,183 @@ kernel void attention(ATTN_ARGS, device const uint* row_list [[buffer(12)]],
     }
 }
 
-// ── causal attention for a tile of up to 8 consecutive query rows of one sequence ──
-// One simdgroup per (head, tile). Keys/values are read once per tile as 8x8 fragments
-// straight from the paged cache (8-key groups never cross a block when bs % 8 == 0);
-// scores and outputs use simdgroup matrices, with a per-row online softmax. Prefill.
-kernel void attention_tile(ATTN_ARGS, device const uint2* tiles [[buffer(12)]],
-                           uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float S[64];
-    threadgroup float P[64];
-    threadgroup float D[64];
-    threadgroup float rowm[8];
-    threadgroup float rows[8];
-    threadgroup float Ot[8 * 128];
+#define ATTN_ROW_KERNEL(HDV) \
+kernel void attention_hd##HDV(ATTN_ARGS, device const uint* row_list [[buffer(12)]], \
+                              uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                              uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float qs[HDV]; \
+    threadgroup float tm[4]; \
+    threadgroup float ts[4]; \
+    threadgroup float tacc[4 * HDV]; \
+    attn_row_impl<HDV>(q, kc, vc, out, tables, table_off, pos, nq, nkv, bs, scale, q_stride, row_list, qs, tm, ts, \
+                       tacc, tg, sg, lane); }
+ATTN_ROW_KERNEL(32)
+ATTN_ROW_KERNEL(64)
+ATTN_ROW_KERNEL(96)
+ATTN_ROW_KERNEL(128)
+
+// ── causal attention for a tile of up to 32 consecutive query rows of one sequence ──
+// One threadgroup (4 simdgroups x 8 rows) per (head, tile); prefill. Each step stages
+// KB = 32 keys and values of the paged cache in threadgroup memory as half precision,
+// shared by the four simdgroups. Scores are computed transposed, S^T = K Q^T (K
+// fragments load untransposed; Q^T stays in registers), with two accumulators per
+// 8-key group so several products are in flight. The online softmax runs inside the
+// simdgroup (4 lanes per row, shuffle reductions); P (half) x V (half) accumulates into
+// float output fragments, rescaled only when a row's maximum grows by more than 8 in
+// log space (lazy rescaling: probabilities stay below e^8, safe in half). The head
+// dimension is a template parameter so fragment arrays stay in registers.
+// `KV` is dynamic threadgroup memory: max(2 * KB * HD halves, 4 * 8 * HD floats).
+constant constexpr uint ATTN_KB = 32;
+
+template <uint HD>
+inline void attn_tile_impl(device const float* q, device const float* kc, device const float* vc,
+                           device float* out, device const uint* tables, device const uint* table_off,
+                           device const uint* pos, uint nq, uint nkv, uint bs, float scale, uint q_stride,
+                           device const uint2* tiles, threadgroup half* KV,
+                           threadgroup float (*Sbuf)[8 * ATTN_KB], threadgroup half (*Pbuf)[8 * ATTN_KB],
+                           threadgroup float (*Dbuf)[64],
+                           uint2 tg, uint tid, uint sg, uint lane) {
+    constexpr uint KB = ATTN_KB, ND = HD / 8, KL = KB / 4;
+    threadgroup half* Ks = KV;
+    threadgroup half* Vs = KV + KB * HD;
 
     const uint head = tg.x;
     const uint r0 = tiles[tg.y].x, cnt = tiles[tg.y].y;
     const uint kvh = head / (nq / nkv);
     device const uint* table = tables + table_off[r0];
     const uint nkeys = pos[r0 + cnt - 1] + 1;
-    const uint nd = hd / 8;
-    const ulong block_stride = (ulong)nkv * bs * hd;
-    const ulong head_off = (ulong)kvh * bs * hd;
+    const ulong block_stride = (ulong)nkv * bs * HD;
+    const ulong head_off = (ulong)kvh * bs * HD;
 
-    simdgroup_float8x8 Qf[16];
-    simdgroup_float8x8 O[16];
-    device const float* qbase = q + (ulong)r0 * q_stride + head * hd;   // rows past cnt are padding
-    for (uint i = 0; i < nd; ++i) {
-        simdgroup_load(Qf[i], qbase + i * 8, q_stride);
+    // This simdgroup's rows: r0 + 8*sg .. (+sub). Rows past `cnt` are padding (the q
+    // buffer has 32 rows of slack) and are never written.
+    const uint sub = (cnt > 8 * sg) ? min(8u, cnt - 8 * sg) : 0;
+    const uint my_keys = sub ? pos[r0 + 8 * sg + sub - 1] + 1 : 0;
+    const uint row = lane / 4, part = lane % 4;
+    const uint my_pos = sub ? pos[r0 + 8 * sg + min(row, sub - 1)] : 0;
+
+    simdgroup_float8x8 QT[ND];
+    simdgroup_float8x8 O[ND];
+    device const float* qbase = q + (ulong)(r0 + 8 * sg) * q_stride + head * HD;
+    for (uint i = 0; i < ND; ++i) {
+        simdgroup_load(QT[i], qbase + i * 8, q_stride, ulong2(0, 0), true);
         O[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
-    if (lane < 8) { rowm[lane] = -INFINITY; rows[lane] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m_row = -INFINITY, l_row = 0.0f;
 
-    for (uint t0 = 0; t0 < nkeys; t0 += 8) {
-        const ulong kbase = (ulong)table[t0 / bs] * block_stride + head_off + (t0 % bs) * hd;
-        simdgroup_float8x8 sf = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        for (uint i = 0; i < nd; ++i) {
-            simdgroup_float8x8 kf;
-            simdgroup_load(kf, kc + kbase + i * 8, hd, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(sf, Qf[i], kf, sf);
-        }
-        simdgroup_store(sf, S, 8);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < 8) {
-            const uint pr = pos[r0 + min(lane, cnt - 1)];
-            float vals[8];
-            float mx = rowm[lane];
-            for (uint j = 0; j < 8; ++j) {
-                vals[j] = (t0 + j <= pr) ? S[lane * 8 + j] * scale : -INFINITY;
-                mx = max(mx, vals[j]);
+    for (uint t0 = 0; t0 < nkeys; t0 += KB) {
+        // Stage K and V for keys t0..t0+KB (zeros past the last key).
+        for (uint idx = tid; idx < KB * HD / 4; idx += 128) {
+            const uint kr = idx / (HD / 4), c4 = idx % (HD / 4);
+            const uint t = t0 + kr;
+            half4 kv = half4(0.0h), vv = half4(0.0h);
+            if (t < nkeys) {
+                const ulong off = (ulong)table[t / bs] * block_stride + head_off + (t % bs) * HD + c4 * 4;
+                kv = half4(*(device const float4*)(kc + off));
+                vv = half4(*(device const float4*)(vc + off));
             }
-            const float corr = (rowm[lane] == -INFINITY) ? 0.0f : exp(rowm[lane] - mx);
+            *(threadgroup half4*)(Ks + kr * HD + c4 * 4) = kv;
+            *(threadgroup half4*)(Vs + kr * HD + c4 * 4) = vv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (t0 < my_keys) {
+            // S^T[keys][rows] = K Q^T, stored transposed as S[rows][keys].
+            simdgroup_float8x8 st[KB / 8][2];
+            for (uint c = 0; c < KB / 8; ++c)
+                for (uint h2 = 0; h2 < 2; ++h2) st[c][h2] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint i = 0; i < ND; i += 2) {
+                for (uint h2 = 0; h2 < 2 && i + h2 < ND; ++h2) {
+                    for (uint c = 0; c < KB / 8; ++c) {
+                        simdgroup_half8x8 kf;
+                        simdgroup_load(kf, Ks + (c * 8) * HD + (i + h2) * 8, HD);
+                        simdgroup_multiply_accumulate(st[c][h2], kf, QT[i + h2], st[c][h2]);
+                    }
+                }
+            }
+            const simdgroup_float8x8 ident(1.0f);   // diagonal constructor: identity
+            for (uint c = 0; c < KB / 8; ++c) {
+                simdgroup_float8x8 t;
+                simdgroup_multiply_accumulate(t, ident, st[c][0], st[c][1]);
+                simdgroup_store(t, Sbuf[sg] + c * 8, KB, ulong2(0, 0), true);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Online softmax: lane handles row `row`, keys part*KL .. part*KL+KL.
+            float v[KL];
+            float mx = -INFINITY;
+            for (uint j = 0; j < KL; ++j) {
+                const uint t = t0 + part * KL + j;
+                v[j] = (t <= my_pos) ? Sbuf[sg][row * KB + part * KL + j] * scale : -INFINITY;
+                mx = max(mx, v[j]);
+            }
+            mx = max(mx, simd_shuffle_xor(mx, 1));
+            mx = max(mx, simd_shuffle_xor(mx, 2));
+            const bool first = (m_row == -INFINITY);
+            const bool grow = simd_any(!first && mx > m_row + 8.0f);
+            const float m_new = (first || grow) ? max(m_row, mx) : m_row;
+            const float corr = first ? 0.0f : exp(m_row - m_new);
             float sum = 0.0f;
-            for (uint j = 0; j < 8; ++j) {
-                const float p = (vals[j] == -INFINITY) ? 0.0f : exp(vals[j] - mx);
-                P[lane * 8 + j] = p;
-                sum += p;
+            for (uint j = 0; j < KL; ++j) {
+                const float pj = (v[j] == -INFINITY) ? 0.0f : exp(v[j] - m_new);
+                Pbuf[sg][row * KB + part * KL + j] = half(pj);
+                sum += pj;
             }
-            rows[lane] = rows[lane] * corr + sum;
-            rowm[lane] = mx;
-            for (uint j = 0; j < 8; ++j) D[lane * 8 + j] = (j == lane) ? corr : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_float8x8 pf, df;
-        simdgroup_load(pf, P, 8);
-        simdgroup_load(df, D, 8);
-        for (uint i = 0; i < nd; ++i) {
-            simdgroup_float8x8 vf;
-            simdgroup_load(vf, vc + kbase + i * 8, hd);
-            simdgroup_multiply(O[i], df, O[i]);
-            simdgroup_multiply_accumulate(O[i], pf, vf, O[i]);
+            sum += simd_shuffle_xor(sum, 1);
+            sum += simd_shuffle_xor(sum, 2);
+            l_row = l_row * corr + sum;
+            m_row = m_new;
+            if (grow) {
+                for (uint j = 0; j < 2; ++j) {
+                    const uint col = part * 2 + j;
+                    Dbuf[sg][row * 8 + col] = (col == row) ? corr : 0.0f;
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (grow) {
+                simdgroup_float8x8 df;
+                simdgroup_load(df, Dbuf[sg], 8);
+                for (uint i = 0; i < ND; ++i) simdgroup_multiply(O[i], df, O[i]);
+            }
+            for (uint c = 0; c < KB / 8; ++c) {
+                simdgroup_half8x8 pf;
+                simdgroup_load(pf, Pbuf[sg] + c * 8, KB);
+                for (uint i = 0; i < ND; ++i) {
+                    simdgroup_half8x8 vf;
+                    simdgroup_load(vf, Vs + (c * 8) * HD + i * 8, HD);
+                    simdgroup_multiply_accumulate(O[i], pf, vf, O[i]);
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    for (uint i = 0; i < nd; ++i) simdgroup_store(O[i], Ot + i * 8, hd);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = lane; idx < cnt * hd; idx += 32) {
-        const uint row = idx / hd, d = idx % hd;
-        out[((ulong)(r0 + row) * nq + head) * hd + d] = Ot[row * hd + d] / rows[row];
+    // Normalise and write through threadgroup memory (the K/V staging area is free now).
+    threadgroup float* Ot = (threadgroup float*)KV + sg * 8 * HD;
+    for (uint i = 0; i < ND; ++i) simdgroup_store(O[i], Ot + i * 8, HD);
+    if (part == 0) Sbuf[sg][row] = l_row;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = lane; idx < sub * HD; idx += 32) {
+        const uint rr = idx / HD, d = idx % HD;
+        out[((ulong)(r0 + 8 * sg + rr) * nq + head) * HD + d] = Ot[rr * HD + d] / Sbuf[sg][rr];
     }
 }
+
+#define ATTN_TILE_KERNEL(HDV) \
+kernel void attention_tile32_hd##HDV(ATTN_ARGS, device const uint2* tiles [[buffer(12)]], \
+                                     threadgroup half* KV [[threadgroup(0)]], \
+                                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float Sbuf[4][8 * ATTN_KB]; \
+    threadgroup half Pbuf[4][8 * ATTN_KB]; \
+    threadgroup float Dbuf[4][64]; \
+    attn_tile_impl<HDV>(q, kc, vc, out, tables, table_off, pos, nq, nkv, bs, scale, q_stride, tiles, KV, \
+                        Sbuf, Pbuf, Dbuf, tg, tid, sg, lane); }
+ATTN_TILE_KERNEL(32)
+ATTN_TILE_KERNEL(64)
+ATTN_TILE_KERNEL(96)
+ATTN_TILE_KERNEL(128)
 
 // ── SwiGLU on the fused gate/up buffer: out[r, j] = silu(gu[r, j]) * gu[r, inter + j] ──
 kernel void swiglu(device const float* gu [[buffer(0)]], device float* out [[buffer(1)]],

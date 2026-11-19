@@ -96,6 +96,12 @@ pub struct MetalLlama {
     state: Mutex<State>,
 }
 
+/// Query rows per tile of the prefill attention kernel (4 simdgroups x 8 rows).
+const ATTN_TILE_ROWS: usize = 32;
+
+/// Keys per step of the prefill attention kernel (must match `ATTN_KB` in the shaders).
+const ATTN_KB: usize = 32;
+
 /// Rows at or below which linear layers use the matrix-vector kernel.
 const MV_MAX_ROWS: usize = 8;
 
@@ -126,8 +132,9 @@ impl MetalLlama {
         let mut pipelines = HashMap::new();
         let names = [
             "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
-            "mm_q4_k", "mm_q6_k", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
-            "rms_norm", "rope", "kv_write", "attention", "attention_tile", "swiglu",
+            "mm_q4_k", "mm_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
+            "rms_norm", "rope", "kv_write", "attention_hd32", "attention_hd64", "attention_hd96", "attention_hd128", "attention_tile32_hd32", "attention_tile32_hd64", "attention_tile32_hd96",
+            "attention_tile32_hd128", "swiglu",
         ];
         for name in names {
             let f = library
@@ -401,14 +408,22 @@ impl Enc<'_> {
 
 impl MetalLlama {
     /// `y[m, rows] = x[m, cols] · Wᵀ`, or `y += …` when `accumulate`.
-    fn linear(&self, e: &Enc<'_>, w: &Weight, x: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
-        self.linear_segments(e, std::slice::from_ref(w), x, y, m, accumulate);
+    #[allow(clippy::too_many_arguments)]
+    fn linear(&self, e: &Enc<'_>, w: &Weight, x: &Buffer, xh: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
+        self.linear_segments(e, std::slice::from_ref(w), x, xh, y, m, accumulate);
     }
 
     /// Linear layer whose weight rows are split into segments (possibly of different
     /// formats); segment `i` writes output columns starting after segments `0..i`.
-    fn linear_segments(&self, e: &Enc<'_>, segs: &[Weight], x: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
+    /// For prefill-sized batches the input is converted to half precision once into
+    /// `xh`, which the tiled GEMM kernels read.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_segments(&self, e: &Enc<'_>, segs: &[Weight], x: &Buffer, xh: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
         let ldy = segs.iter().map(|w| w.rows).sum::<usize>() as u32;
+        if m > MV_MAX_ROWS && segs.iter().any(|w| w.kind != WKind::F32) {
+            let quads = (m * segs[0].cols / 4) as u64;
+            e.threads(self.pipeline("to_half"), &[Arg::B(x), Arg::B(xh)], (quads, 1, 1));
+        }
         let mut col = 0u64;
         for w in segs {
             let (n, k) = (w.rows as u32, w.cols as u32);
@@ -431,6 +446,8 @@ impl MetalLlama {
                 e.groups(self.pipeline("mm_f32"), &args, ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1), 128);
             } else {
                 let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
+                let mut args = args;
+                args[1] = Arg::B(xh);
                 e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1), 128);
             }
             col += w.rows as u64;
@@ -523,7 +540,7 @@ impl LanguageModel for MetalLlama {
         }
         let positions: Vec<u32> = batch.positions.iter().map(|&p| p as u32).collect();
         // Group consecutive rows of one sequence (same table, consecutive positions) into
-        // tiles of up to 8 for the tiled attention kernel; lone rows (decode) use the
+        // tiles of up to 32 for the tiled attention kernel; lone rows (decode) use the
         // per-row kernel, which parallelises over keys instead.
         let mut tiles: Vec<[u32; 2]> = Vec::new();
         let mut singles: Vec<u32> = Vec::new();
@@ -531,7 +548,7 @@ impl LanguageModel for MetalLlama {
         while i < n {
             let mut j = i + 1;
             while j < n
-                && j - i < 8
+                && j - i < ATTN_TILE_ROWS
                 && table_off[j] == table_off[i]
                 && batch.positions[j] == batch.positions[j - 1] + 1
             {
@@ -549,7 +566,8 @@ impl LanguageModel for MetalLlama {
         // (Re)allocate scratch when the batch outgrows it.
         let sc = &mut st.scratch;
         if n > sc.rows || r > sc.logit_rows || tables.len() > sc.table_len {
-            // (q gets 8 rows of slack: the tiled attention kernel loads 8-row fragments.)
+            // (q gets 32 rows of slack: the tiled attention kernel loads 8-row fragments for
+            // each of its four simdgroups.)
             let rows = n.max(sc.rows);
             let lrows = r.max(sc.logit_rows);
             let tlen = tables.len().max(sc.table_len).max(1);
@@ -563,13 +581,15 @@ impl LanguageModel for MetalLlama {
                 ("tables", tlen),
                 ("hidden", rows * h),
                 ("normed", rows * h),
-                ("qkv", (rows + 8) * qkv_dim),
+                ("qkv", (rows + ATTN_TILE_ROWS) * qkv_dim),
                 ("tiles", rows * 2),
                 ("singles", rows),
                 ("attn", rows * h),
                 ("gu", rows * 2 * inter),
                 ("act", rows * inter),
                 ("final", lrows * h),
+                // Half-precision copy of a linear layer's input (prefill GEMM).
+                ("xh", rows.max(lrows) * h.max(inter) / 2 + 4),
                 ("logits", lrows * c.vocab_size),
             ] {
                 sc.bufs.insert(name, f(len));
@@ -605,7 +625,7 @@ impl LanguageModel for MetalLlama {
                 // Attention block: norm -> fused QKV -> RoPE on q and k heads -> KV write ->
                 // attention -> output projection accumulated into the residual stream.
                 self.rms(&e, b("hidden"), &layer.attn_norm, b("normed"), n, None);
-                self.linear_segments(&e, &layer.qkv, b("normed"), b("qkv"), n, false);
+                self.linear_segments(&e, &layer.qkv, b("normed"), b("xh"), b("qkv"), n, false);
                 e.threads(
                     self.pipeline("rope"),
                     &[
@@ -658,28 +678,32 @@ impl LanguageModel for MetalLlama {
                     v
                 };
                 if !tiles.is_empty() {
-                    e.groups(self.pipeline("attention_tile"), &attn_args(b("tiles")), (nq as u64, tiles.len() as u64, 1), 32);
+                    // Dynamic threadgroup memory: K/V staging (2 x KB x hd halves), reused
+                    // for the 4 x 8 x hd float output at the end.
+                    let tg_bytes = (2 * ATTN_KB * hd * 2).max(4 * 8 * hd * 4) as u64;
+                    e.enc.set_threadgroup_memory_length(0, tg_bytes);
+                    e.groups(self.pipeline(&format!("attention_tile32_hd{hd}")), &attn_args(b("tiles")), (nq as u64, tiles.len() as u64, 1), 128);
                 }
                 if !singles.is_empty() {
-                    e.groups(self.pipeline("attention"), &attn_args(b("singles")), (nq as u64, singles.len() as u64, 1), 128);
+                    e.groups(self.pipeline(&format!("attention_hd{hd}")), &attn_args(b("singles")), (nq as u64, singles.len() as u64, 1), 128);
                 }
-                self.linear(&e, &layer.o, b("attn"), b("hidden"), n, true);
+                self.linear(&e, &layer.o, b("attn"), b("xh"), b("hidden"), n, true);
 
                 // MLP block: norm -> fused gate/up -> SwiGLU -> down projection accumulated
                 // into the residual stream.
                 self.rms(&e, b("hidden"), &layer.ffn_norm, b("normed"), n, None);
-                self.linear_segments(&e, &layer.gate_up, b("normed"), b("gu"), n, false);
+                self.linear_segments(&e, &layer.gate_up, b("normed"), b("xh"), b("gu"), n, false);
                 e.threads(
                     self.pipeline("swiglu"),
                     &[Arg::B(b("gu")), Arg::B(b("act")), Arg::U(inter as u32)],
                     ((n * inter) as u64, 1, 1),
                 );
-                self.linear(&e, &layer.down, b("act"), b("hidden"), n, true);
+                self.linear(&e, &layer.down, b("act"), b("xh"), b("hidden"), n, true);
             }
 
             // Final norm on the requested rows only, then the LM head.
             self.rms(&e, b("hidden"), &self.final_norm, b("final"), r, Some(b("logit_rows")));
-            self.linear(&e, &self.lm_head, b("final"), b("logits"), r, false);
+            self.linear(&e, &self.lm_head, b("final"), b("xh"), b("logits"), r, false);
 
             enc.end_encoding();
             cb.commit();
