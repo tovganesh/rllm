@@ -1,7 +1,10 @@
 //! Metal executor checked against the CPU executor on seeded synthetic models.
 #![cfg(target_os = "macos")]
 
-use rllm_backend_cpu::{ops::quant::{quantize_f32_to_q4_0, quantize_f32_to_q8_0}, CpuBackend};
+use rllm_backend_cpu::{
+    ops::quant::{quantize_f32_to_q4_0, quantize_f32_to_q4_k, quantize_f32_to_q6_k, quantize_f32_to_q8_0},
+    CpuBackend,
+};
 use rllm_backend_metal::MetalLlama;
 use rllm_core::{backend::BlockTable, device::Device, dtype::DType, storage::{CpuStorage, Storage}, tensor::Tensor};
 use rllm_models::{ForwardBatch, LanguageModel, LlamaConfig, LlamaModel};
@@ -31,12 +34,22 @@ fn quantize(t: &Tensor, dtype: DType) -> Tensor {
                 quantize_f32_to_q4_0(src, dst);
             }
         }
+        DType::Q4_K => bytes = quantize_f32_to_q4_k(&data),
+        DType::Q6_K => bytes = quantize_f32_to_q6_k(&data),
         _ => unreachable!(),
     }
     Tensor::new(t.shape().clone(), dtype, Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(bytes)))
 }
 
+/// 256-wide config for K-quants (whole 256-value super-blocks per row).
+fn config_k() -> LlamaConfig {
+    LlamaConfig { hidden_size: 256, intermediate_size: 512, ..config() }
+}
+
 fn model(dtype: DType) -> LlamaModel<CpuBackend> {
+    if dtype == DType::Q4_K {
+        return model_k_mixed();
+    }
     let mut m = LlamaModel::new_seeded(config(), Arc::new(CpuBackend), 11).unwrap();
     if dtype != DType::F32 {
         m.embed_tokens = quantize(&m.embed_tokens, dtype);
@@ -52,6 +65,25 @@ fn model(dtype: DType) -> LlamaModel<CpuBackend> {
     m
 }
 
+/// Q4_K_M-like mix: Q4_K q/k/o/gate/up, Q6_K v/down and embeddings, so fused Q/K/V
+/// has mixed formats (two segments on Metal).
+fn model_k_mixed() -> LlamaModel<CpuBackend> {
+    let mut m = LlamaModel::new_seeded(config_k(), Arc::new(CpuBackend), 11).unwrap();
+    m.embed_tokens = quantize(&m.embed_tokens, DType::Q6_K);
+    m.lm_head = quantize(&m.lm_head, DType::Q6_K);
+    for l in &mut m.layers {
+        for w in [&mut l.self_attn.q_proj, &mut l.self_attn.k_proj, &mut l.self_attn.o_proj, &mut l.mlp.gate_proj, &mut l.mlp.up_proj] {
+            *w = quantize(w, DType::Q4_K);
+        }
+        for w in [&mut l.self_attn.v_proj, &mut l.mlp.down_proj] {
+            *w = quantize(w, DType::Q6_K);
+        }
+    }
+    m.fuse_projections().unwrap();
+    m.pack_for_backend().unwrap();
+    m
+}
+
 fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     let scale = b.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
@@ -62,9 +94,9 @@ fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
 /// (matrix-vector kernel), comparing logits at every step. The CPU reference always
 /// runs batches of 32+ rows (and requests logits for every row) so that it, like Metal,
 /// uses F32 activations; single-row CPU decode would quantize activations to Q8.
-/// `prefill_tol` is looser for quantized weights: the Metal prefill GEMM stores
-/// dequantized weights as half precision in threadgroup memory (as llama.cpp's Metal
-/// backend does), whereas the CPU reference uses F32.
+/// `prefill_tol` is looser: the Metal prefill GEMM multiplies half-precision weight and
+/// activation tiles and the prefill attention stages keys/values as half (as llama.cpp's
+/// Metal backend does), whereas the CPU reference uses F32.
 fn check(dtype: DType, tol: f32, prefill_tol: f32) {
     if !MetalLlama::is_available() {
         eprintln!("skipping: no Metal device");
@@ -106,7 +138,7 @@ fn check(dtype: DType, tol: f32, prefill_tol: f32) {
         let all = fresh
             .forward_cached(&ForwardBatch { tokens: &seq_a, positions: &p, block_tables: &vec![ta.clone(); seq_a.len()], logits_rows: &p })
             .unwrap();
-        let vocab = config().vocab_size;
+        let vocab = cpu.config.vocab_size;
         let c = &all[pos * vocab..(pos + 1) * vocab];
         let d = max_rel_diff(&g, c);
         assert!(d < tol, "{dtype:?} decode step {step}: relative diff {d}");
@@ -115,7 +147,9 @@ fn check(dtype: DType, tol: f32, prefill_tol: f32) {
 
 #[test]
 fn metal_matches_cpu_f32() {
-    check(DType::F32, 1e-4, 1e-4);
+    // Prefill attention stages keys/values in half precision (as llama.cpp's Metal flash
+    // attention does with its F16 KV cache), hence the looser prefill bound.
+    check(DType::F32, 1e-4, 5e-4);
 }
 
 #[test]
@@ -126,4 +160,9 @@ fn metal_matches_cpu_q8_0() {
 #[test]
 fn metal_matches_cpu_q4_0() {
     check(DType::Q4_0, 1e-4, 1e-3);
+}
+
+#[test]
+fn metal_matches_cpu_q4_k_q6_k_mixed() {
+    check(DType::Q4_K, 1e-4, 1e-3);
 }
