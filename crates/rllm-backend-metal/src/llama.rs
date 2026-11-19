@@ -46,15 +46,14 @@ struct Weight {
     cols: usize,
 }
 
+/// One decoder layer. Q/K/V and gate/up projections are fused into single matrices
+/// (`[q | k | v]` and `[gate | up]` row blocks) so each is one dispatch.
 struct Layer {
     attn_norm: Buffer,
-    q: Weight,
-    k: Weight,
-    v: Weight,
+    qkv: Weight,
     o: Weight,
     ffn_norm: Buffer,
-    gate: Weight,
-    up: Weight,
+    gate_up: Weight,
     down: Weight,
 }
 
@@ -118,7 +117,7 @@ impl MetalLlama {
         let mut pipelines = HashMap::new();
         let names = [
             "mv_f32", "mv_q8_0", "mv_q4_0", "mm_f32", "mm_q8_0", "mm_q4_0", "embed_f32", "embed_q8_0", "embed_q4_0",
-            "rms_norm", "rope", "kv_write", "attention", "attention_tile", "add_inplace", "swiglu",
+            "rms_norm", "rope", "kv_write", "attention", "attention_tile", "swiglu",
         ];
         for name in names {
             let f = library
@@ -153,6 +152,32 @@ impl MetalLlama {
             })
         };
         let vec_buf = |t: &Tensor| -> Result<Buffer> { Ok(new_buffer_with(&device, as_bytes(t.as_f32_slice()?))) };
+        // Row-concatenation of matrices with equal column counts. Raw blocks are
+        // concatenated when every part has the same storage type; otherwise all parts
+        // are dequantized to F32.
+        let upload_concat = |parts: &[&Tensor]| -> Result<Weight> {
+            let cols = parts[0].dims()[1];
+            let rows: usize = parts.iter().map(|t| t.dims()[0]).sum();
+            if parts.iter().any(|t| t.dims().len() != 2 || t.dims()[1] != cols) {
+                return Err(RllmError::BackendError("cannot fuse matrices with different widths".into()));
+            }
+            let dtype = parts[0].dtype();
+            if parts.iter().all(|t| t.dtype() == dtype) {
+                let mut bytes = Vec::new();
+                for t in parts {
+                    let len = dtype.storage_bytes(t.numel());
+                    bytes.extend_from_slice(&t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + len]);
+                }
+                let shape = rllm_core::shape::Shape::new(vec![rows, cols]);
+                let storage = rllm_core::storage::Storage::Cpu(rllm_core::storage::CpuStorage::from_bytes(bytes));
+                return upload(&Tensor::new(shape, dtype, rllm_core::device::Device::Cpu, storage));
+            }
+            let mut dense = Vec::with_capacity(rows * cols);
+            for t in parts {
+                dense.extend(dequantize_to_f32(t)?);
+            }
+            upload(&Tensor::from_f32(&dense, rllm_core::shape::Shape::new(vec![rows, cols]), rllm_core::device::Device::Cpu)?)
+        };
 
         let embed = upload(&model.embed_tokens)?;
         let tied = model.lm_head.storage().as_cpu()?.as_bytes().as_ptr()
@@ -166,13 +191,10 @@ impl MetalLlama {
         for l in &model.layers {
             layers.push(Layer {
                 attn_norm: vec_buf(&l.input_layernorm)?,
-                q: upload(&l.self_attn.q_proj)?,
-                k: upload(&l.self_attn.k_proj)?,
-                v: upload(&l.self_attn.v_proj)?,
+                qkv: upload_concat(&[&l.self_attn.q_proj, &l.self_attn.k_proj, &l.self_attn.v_proj])?,
                 o: upload(&l.self_attn.o_proj)?,
                 ffn_norm: vec_buf(&l.post_attention_layernorm)?,
-                gate: upload(&l.mlp.gate_proj)?,
-                up: upload(&l.mlp.up_proj)?,
+                gate_up: upload_concat(&[&l.mlp.gate_proj, &l.mlp.up_proj])?,
                 down: upload(&l.mlp.down_proj)?,
             });
         }
@@ -230,6 +252,20 @@ impl MetalLlama {
         }
         Ok(())
     }
+}
+
+/// Dense F32 copy of an F32 / Q8_0 / Q4_0 matrix.
+fn dequantize_to_f32(t: &Tensor) -> Result<Vec<f32>> {
+    use rllm_backend_cpu::ops::quant::{dequantize_q4_0, dequantize_q8_0};
+    let mut out = vec![0f32; t.numel()];
+    let bytes = &t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + t.dtype().storage_bytes(t.numel())];
+    match t.dtype() {
+        DType::F32 => return t.to_vec::<f32>(),
+        DType::Q8_0 => dequantize_q8_0(bytes, &mut out),
+        DType::Q4_0 => dequantize_q4_0(bytes, &mut out),
+        other => return Err(RllmError::BackendError(format!("cannot dequantize {other}"))),
+    }
+    Ok(out)
 }
 
 fn as_bytes<T: Copy>(s: &[T]) -> &[u8] {
@@ -293,15 +329,18 @@ impl Enc<'_> {
 }
 
 impl MetalLlama {
-    fn linear(&self, e: &Enc<'_>, w: &Weight, x: &Buffer, y: &Buffer, m: usize) {
+    /// `y[m, rows] = x[m, cols] · Wᵀ`, or `y += …` when `accumulate`.
+    fn linear(&self, e: &Enc<'_>, w: &Weight, x: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
         let (n, k) = (w.rows as u32, w.cols as u32);
-        let args = [Arg::B(&w.buf), Arg::B(x), Arg::B(y), Arg::U(n), Arg::U(k), Arg::U(m as u32)];
+        let args = [Arg::B(&w.buf), Arg::B(x), Arg::B(y), Arg::U(n), Arg::U(k), Arg::U(m as u32), Arg::U(accumulate as u32)];
         if m <= MV_MAX_ROWS {
             let p = self.pipeline(&format!("mv_{}", w.kind.suffix()));
             e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
+        } else if w.kind == WKind::F32 {
+            e.groups(self.pipeline("mm_f32"), &args, ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1), 128);
         } else {
             let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
-            e.groups(p, &args, ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1), 128);
+            e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1), 128);
         }
     }
 
@@ -376,6 +415,7 @@ impl LanguageModel for MetalLlama {
         let (h, inter, hd) = (c.hidden_size, c.intermediate_size, c.head_dim());
         let (nq, nkv) = (c.num_attention_heads, c.num_key_value_heads);
         let kv_dim = nkv * hd;
+        let qkv_dim = h + 2 * kv_dim;
 
         // Flatten block tables, sharing one copy between consecutive rows of a sequence.
         let mut tables: Vec<u32> = Vec::new();
@@ -430,15 +470,11 @@ impl LanguageModel for MetalLlama {
                 ("tables", tlen),
                 ("hidden", rows * h),
                 ("normed", rows * h),
-                ("q", (rows + 8) * h),
+                ("qkv", (rows + 8) * qkv_dim),
                 ("tiles", rows * 2),
                 ("singles", rows),
-                ("k", rows * kv_dim),
-                ("v", rows * kv_dim),
                 ("attn", rows * h),
-                ("proj", rows * h),
-                ("gate", rows * inter),
-                ("up", rows * inter),
+                ("gu", rows * 2 * inter),
                 ("act", rows * inter),
                 ("final", lrows * h),
                 ("logits", lrows * c.vocab_size),
@@ -473,22 +509,30 @@ impl LanguageModel for MetalLlama {
 
             for (li, layer) in self.layers.iter().enumerate() {
                 let (kc, vc) = &st.kv[li];
+                // Attention block: norm -> fused QKV -> RoPE on q and k heads -> KV write ->
+                // attention -> output projection accumulated into the residual stream.
                 self.rms(&e, b("hidden"), &layer.attn_norm, b("normed"), n, None);
-                self.linear(&e, &layer.q, b("normed"), b("q"), n);
-                self.linear(&e, &layer.k, b("normed"), b("k"), n);
-                self.linear(&e, &layer.v, b("normed"), b("v"), n);
-                for (buf, heads) in [(b("q"), nq), (b("k"), nkv)] {
-                    e.threads(
-                        self.pipeline("rope"),
-                        &[Arg::B(buf), Arg::B(&self.cos), Arg::B(&self.sin), Arg::B(b("positions")), Arg::U(heads as u32), Arg::U(hd as u32)],
-                        ((hd / 2) as u64, heads as u64, n as u64),
-                    );
-                }
+                self.linear(&e, &layer.qkv, b("normed"), b("qkv"), n, false);
+                e.threads(
+                    self.pipeline("rope"),
+                    &[
+                        Arg::B(b("qkv")),
+                        Arg::B(&self.cos),
+                        Arg::B(&self.sin),
+                        Arg::B(b("positions")),
+                        Arg::U((nq + nkv) as u32),
+                        Arg::U(hd as u32),
+                        Arg::U(qkv_dim as u32),
+                    ],
+                    ((hd / 2) as u64, (nq + nkv) as u64, n as u64),
+                );
                 e.threads(
                     self.pipeline("kv_write"),
                     &[
-                        Arg::B(b("k")),
-                        Arg::B(b("v")),
+                        Arg::B(b("qkv")),
+                        Arg::U(h as u32),
+                        Arg::U((h + kv_dim) as u32),
+                        Arg::U(qkv_dim as u32),
                         Arg::B(kc),
                         Arg::B(vc),
                         Arg::B(b("tables")),
@@ -501,7 +545,7 @@ impl LanguageModel for MetalLlama {
                     (hd as u64, nkv as u64, n as u64),
                 );
                 let attn_base = [
-                    Arg::B(b("q")),
+                    Arg::B(b("qkv")),
                     Arg::B(kc),
                     Arg::B(vc),
                     Arg::B(b("attn")),
@@ -517,6 +561,7 @@ impl LanguageModel for MetalLlama {
                 let attn_args = |extra| {
                     let mut v = attn_base.to_vec();
                     v.push(Arg::B(extra));
+                    v.push(Arg::U(qkv_dim as u32));
                     v
                 };
                 if !tiles.is_empty() {
@@ -525,23 +570,23 @@ impl LanguageModel for MetalLlama {
                 if !singles.is_empty() {
                     e.groups(self.pipeline("attention"), &attn_args(b("singles")), (nq as u64, singles.len() as u64, 1), 128);
                 }
-                self.linear(&e, &layer.o, b("attn"), b("proj"), n);
-                e.threads(self.pipeline("add_inplace"), &[Arg::B(b("hidden")), Arg::B(b("proj"))], ((n * h) as u64, 1, 1));
+                self.linear(&e, &layer.o, b("attn"), b("hidden"), n, true);
+
+                // MLP block: norm -> fused gate/up -> SwiGLU -> down projection accumulated
+                // into the residual stream.
                 self.rms(&e, b("hidden"), &layer.ffn_norm, b("normed"), n, None);
-                self.linear(&e, &layer.gate, b("normed"), b("gate"), n);
-                self.linear(&e, &layer.up, b("normed"), b("up"), n);
+                self.linear(&e, &layer.gate_up, b("normed"), b("gu"), n, false);
                 e.threads(
                     self.pipeline("swiglu"),
-                    &[Arg::B(b("gate")), Arg::B(b("up")), Arg::B(b("act"))],
+                    &[Arg::B(b("gu")), Arg::B(b("act")), Arg::U(inter as u32)],
                     ((n * inter) as u64, 1, 1),
                 );
-                self.linear(&e, &layer.down, b("act"), b("proj"), n);
-                e.threads(self.pipeline("add_inplace"), &[Arg::B(b("hidden")), Arg::B(b("proj"))], ((n * h) as u64, 1, 1));
+                self.linear(&e, &layer.down, b("act"), b("hidden"), n, true);
             }
 
             // Final norm on the requested rows only, then the LM head.
             self.rms(&e, b("hidden"), &self.final_norm, b("final"), r, Some(b("logit_rows")));
-            self.linear(&e, &self.lm_head, b("final"), b("logits"), r);
+            self.linear(&e, &self.lm_head, b("final"), b("logits"), r, false);
 
             enc.end_encoding();
             cb.commit();
