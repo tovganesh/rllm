@@ -20,6 +20,7 @@ pub fn sgemm_nt(a: &[f32], w: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
 
 /// `C[:, j0..j0 + nc] = A[M, K] · W[nc, K]ᵀ`, where `C` is row-major with leading
 /// dimension `ldc` (used to fill a column block of a wider output).
+#[allow(clippy::too_many_arguments)]
 pub fn sgemm_nt_cols(a: &[f32], w: &[f32], c: &mut [f32], m: usize, k: usize, nc: usize, j0: usize, ldc: usize) {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(w.len(), nc * k);

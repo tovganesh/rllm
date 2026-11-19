@@ -7,7 +7,7 @@
 A modular, multi-backend LLM inference engine and hybrid RAG platform written in Rust from the ground up.
 
 > [!WARNING]
-> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU or an Apple GPU (Metal), with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. On Apple Silicon its CPU prefill is faster than llama.cpp's CPU backend and its Metal decode matches llama.cpp's Metal backend on a 1B model, while Metal prefill is ~60% of llama.cpp's. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
+> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU or an Apple GPU (Metal), with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. On an Apple M4 its CPU prompt processing is 1.3–2.5x faster than llama.cpp's CPU backend, decode is at parity on a 1B model (0.75–0.98x across formats on a 135M model), and Metal prompt processing is 0.70–0.84x of llama.cpp's Metal backend. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
 
 ---
 
@@ -85,7 +85,7 @@ The P0 correctness issues found in the initial review (stride-ignoring matmul on
 Remaining limitations:
 
 1. **Only LLaMA-architecture GGUF models with a byte-level BPE tokenizer load.** Qwen2 (attention biases, NeoX RoPE), Gemma, Phi, and SentencePiece tokenizers are not supported yet.
-2. **Performance gaps.** Apple M4: CPU decode is 15–35% slower than llama.cpp's CPU backend; Metal decode matches llama.cpp Metal on Llama-3.2-1B (67 tok/s) but Metal prefill is ~60% of llama.cpp's (GEMM kernel not yet tuned). No CUDA backend; Metal runs only on macOS. See [BENCHMARKS](docs/BENCHMARKS.md).
+2. **Performance gaps (Apple M4).** Metal prompt processing is 0.70–0.84x of llama.cpp; CPU decode of 4-bit weights is 0.75–0.84x (K-quants run as Q8_0). Decode on Llama-3.2-1B is at parity on CPU and Metal. No CUDA backend; Metal runs only on macOS. See [BENCHMARKS](docs/BENCHMARKS.md).
 3. **K-quant weights are converted to Q8_0 at load**, so a Q4_K_M file uses about 2× its file size in RAM; F16 / BF16 files use 2× (F32).
 4. **Small models rarely write `[n]` citations.** SmolLM2-135M answers correctly from the sources but usually without citation markers; the response then carries a warning. Dense thresholds are calibrated only for bge-small-en-v1.5 and all-MiniLM-L6-v2. The reranker is lexical, not a neural cross-encoder.
 5. **No authentication, per-client rate limiting or TLS** — put rllm behind a reverse proxy for anything exposed. A single engine thread serves one model per process.
