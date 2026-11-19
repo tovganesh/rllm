@@ -163,6 +163,40 @@ fn prefix_cache_hit_reuses_blocks_and_preserves_output() {
 }
 
 #[test]
+fn running_sequences_share_their_prefix_with_later_requests() {
+    // A second request with the same prompt, submitted while the first is still
+    // generating, must reuse the first one's prompt blocks.
+    let m = model();
+    let total_blocks = 64;
+    let s = scheduler(total_blocks, 4);
+    let expected = reference_greedy(&m, &PROMPT_A, 8);
+
+    s.submit_sequence(seq(1, &PROMPT_A, 8)).unwrap();
+    let mut out: HashMap<u64, Vec<u32>> = HashMap::new();
+    for (id, tok) in s.step().unwrap() {
+        out.entry(id).or_default().push(tok);
+    }
+    // After the prefill step the 3 full prompt blocks are already cached.
+    assert_eq!(s.num_cached_blocks(), 3);
+    assert_eq!(s.num_running(), 1);
+
+    let free_before = s.num_free_blocks();
+    s.submit_sequence(seq(2, &PROMPT_A, 8)).unwrap();
+    for (id, tok) in s.step().unwrap() {
+        out.entry(id).or_default().push(tok);
+    }
+    // Sequence 2 needed one fresh block (for its last prompt token); sequence 1 may
+    // have grown by at most one block in the same step.
+    assert!(free_before - s.num_free_blocks() <= 2, "prefix blocks were not shared");
+    for (id, toks) in run_to_completion(&s) {
+        out.entry(id).or_default().extend(toks);
+    }
+    assert_eq!(out[&1], expected);
+    assert_eq!(out[&2], expected);
+    assert_eq!(s.num_free_blocks() + s.num_cached_blocks(), total_blocks);
+}
+
+#[test]
 fn cached_blocks_survive_pool_pressure_without_corruption() {
     // Regression test: the cache used to keep pointing at blocks that had been returned
     // to the free list, so later sequences overwrote cached KV entries.

@@ -173,6 +173,17 @@ enum Commands {
         /// Repetitions per measurement for --model (the median is reported)
         #[arg(long, default_value_t = 3)]
         repetitions: usize,
+
+        /// With --model: tokens of context already in the KV cache before each pp and tg
+        /// test (like llama-bench's `-d`), to measure long-context behaviour.
+        #[arg(long, default_value_t = 0)]
+        depth: usize,
+
+        /// With --model: measure time to first token through the scheduler for prompts
+        /// of --prompt-tokens tokens whose first N tokens are shared with the previous
+        /// request (prefix cache warm) versus not (cold).
+        #[arg(long)]
+        shared_prefix: Option<usize>,
     },
 
     /// Run end-to-end RAG interactive demonstration with citations and relevance verification
@@ -364,9 +375,14 @@ async fn main() -> anyhow::Result<()> {
             warmup,
             model,
             repetitions,
+            depth,
+            shared_prefix,
         } => {
             if let Some(path) = model {
-                run_model_bench(&path, prompt_tokens, generate_tokens, repetitions.max(1), device)?;
+                match shared_prefix {
+                    Some(shared) => run_prefix_bench(&path, prompt_tokens, shared, repetitions.max(1), device)?,
+                    None => run_model_bench(&path, prompt_tokens, generate_tokens, depth, repetitions.max(1), device)?,
+                }
                 return Ok(());
             }
             let opts = BenchmarkOptions {
@@ -616,12 +632,13 @@ impl LlmDevice {
     }
 }
 
-/// `rllm bench --model`: llama-bench-style prompt-processing and generation throughput.
-fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
+/// `rllm bench --model`: llama-bench-style prompt-processing and generation throughput,
+/// optionally after `depth` tokens of context (llama-bench `-d`).
+fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, depth: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
     use rllm_core::backend::BlockTable;
     use rllm_models::ForwardBatch;
 
-    let ctx = pp + tg + 1;
+    let ctx = depth + pp.max(tg) + 1;
     let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(ctx.max(16)), ..LoadOptions::default() })?;
     let vocab = bundle.model.config.vocab_size as u32;
     let lm = device.executor(bundle.model)?;
@@ -629,37 +646,123 @@ fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, reps: usize, de
     let blocks = ctx.div_ceil(block);
     lm.init_kv_cache(blocks, block)?;
     let table = BlockTable { block_size: block, block_ids: (0..blocks).collect() };
-    // Deterministic pseudo-random prompt tokens, as llama-bench uses random tokens.
-    let tokens: Vec<u32> = (0..pp as u32).map(|i| (i.wrapping_mul(2654435761) >> 8) % vocab).collect();
-    let positions: Vec<usize> = (0..pp).collect();
-    let tables = vec![table.clone(); pp];
+    // Deterministic pseudo-random tokens, as llama-bench uses random tokens.
+    let token = |i: usize| ((i as u32).wrapping_mul(2654435761) >> 8) % vocab;
+    let prefill = |start: usize, n: usize| -> anyhow::Result<()> {
+        let tokens: Vec<u32> = (start..start + n).map(token).collect();
+        let positions: Vec<usize> = (start..start + n).collect();
+        let tables = vec![table.clone(); n];
+        lm.forward_cached(&ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &tables, logits_rows: &[n - 1] })?;
+        Ok(())
+    };
     let median = |mut v: Vec<f64>| {
         v.sort_by(|a, b| a.total_cmp(b));
         v[v.len() / 2]
     };
 
-    // Warm-up (shader/pipeline caches, page faults).
-    lm.forward_cached(&ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &tables, logits_rows: &[pp - 1] })?;
+    // Context of `depth` tokens (in chunks, as a server would prefill), then a warm-up
+    // pass (shader/pipeline caches, page faults).
+    let mut done = 0;
+    while done < depth {
+        let n = (depth - done).min(2048);
+        prefill(done, n)?;
+        done += n;
+    }
+    if pp > 0 {
+        prefill(depth, pp)?;
+    }
 
     let mut pp_rates = Vec::new();
     for _ in 0..reps {
+        if pp == 0 {
+            break;
+        }
         let t = Instant::now();
-        lm.forward_cached(&ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &tables, logits_rows: &[pp - 1] })?;
+        prefill(depth, pp)?;
         pp_rates.push(pp as f64 / t.elapsed().as_secs_f64());
     }
     let mut tg_rates = Vec::new();
     for _ in 0..reps {
+        if tg == 0 {
+            break;
+        }
         let t = Instant::now();
         for i in 0..tg {
             let tok = [(i as u32 * 7919) % vocab];
-            lm.forward_cached(&ForwardBatch { tokens: &tok, positions: &[i], block_tables: std::slice::from_ref(&table), logits_rows: &[0] })?;
+            let pos = depth + i;
+            lm.forward_cached(&ForwardBatch { tokens: &tok, positions: &[pos], block_tables: std::slice::from_ref(&table), logits_rows: &[0] })?;
         }
         tg_rates.push(tg as f64 / t.elapsed().as_secs_f64());
     }
     println!("| model | device | test | t/s |");
     println!("| --- | --- | --- | ---: |");
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    println!("| {name} | {} | pp{pp} | {:.1} |", lm.device_name(), median(pp_rates));
-    println!("| {name} | {} | tg{tg} | {:.1} |", lm.device_name(), median(tg_rates));
+    let at = if depth > 0 { format!(" @ d{depth}") } else { String::new() };
+    if !pp_rates.is_empty() {
+        println!("| {name} | {} | pp{pp}{at} | {:.1} |", lm.device_name(), median(pp_rates));
+    }
+    if !tg_rates.is_empty() {
+        println!("| {name} | {} | tg{tg}{at} | {:.1} |", lm.device_name(), median(tg_rates));
+    }
+    Ok(())
+}
+
+/// `rllm bench --model --shared-prefix N`: time to first token through the scheduler
+/// for a `prompt`-token request whose first `shared` tokens a previous request already
+/// computed (warm prefix cache), versus a request with nothing cached (cold).
+fn run_prefix_bench(path: &std::path::Path, prompt: usize, shared: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
+    anyhow::ensure!(shared < prompt, "--shared-prefix must be smaller than --prompt-tokens");
+    let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(prompt + 16), ..LoadOptions::default() })?;
+    let vocab = bundle.model.config.vocab_size as u32;
+    let lm = device.executor(bundle.model)?;
+    let block_size = 16;
+    let tokens = |seed: u32, n: usize| -> Vec<u32> {
+        (0..n as u32).map(|i| (i.wrapping_add(seed.wrapping_mul(7919)).wrapping_mul(2654435761) >> 8) % vocab).collect()
+    };
+    let one_token = SamplingParams { temperature: 0.0, max_tokens: 1, stop_tokens: Vec::new(), ..SamplingParams::default() };
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    let (mut cold, mut warm) = (Vec::new(), Vec::new());
+    let mut cached = 0;
+    for r in 0..=reps {
+        let scheduler = ContinuousBatchScheduler::new(
+            SchedulerConfig {
+                max_batch_size: 1,
+                block_size,
+                total_blocks: (3 * prompt).div_ceil(block_size) + 4,
+                max_prefill_tokens: prompt + 1,
+            },
+            lm.clone(),
+        )?;
+        let prefix = tokens(1000 + r as u32, shared);
+        let ttft = |suffix_seed: u32| -> anyhow::Result<f64> {
+            let mut p = prefix.clone();
+            p.extend(tokens(suffix_seed, prompt - shared));
+            scheduler.submit_sequence(Sequence::new(scheduler.next_sequence_id(), p, one_token.clone(), block_size, None))?;
+            let t = Instant::now();
+            scheduler.step()?;
+            let dt = t.elapsed().as_secs_f64();
+            while scheduler.has_work() {
+                scheduler.step()?;
+            }
+            Ok(dt)
+        };
+        let c = ttft(1)?;
+        let before = scheduler.metrics.cached_prompt_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        let w = ttft(2)?;
+        cached = scheduler.metrics.cached_prompt_tokens.load(std::sync::atomic::Ordering::Relaxed) - before;
+        if r > 0 {
+            // The first round only warms up pipelines and page tables.
+            cold.push(c);
+            warm.push(w);
+        }
+    }
+    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let (c, w) = (median(cold) * 1e3, median(warm) * 1e3);
+    println!("| model | device | prompt | shared prefix | cached tokens | TTFT cold ms | TTFT warm ms | speed-up |");
+    println!("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!("| {name} | {} | {prompt} | {shared} | {cached} | {c:.1} | {w:.1} | {:.2}x |", lm.device_name(), c / w);
     Ok(())
 }

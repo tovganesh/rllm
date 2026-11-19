@@ -166,3 +166,36 @@ fn metal_matches_cpu_q4_0() {
 fn metal_matches_cpu_q4_k_q6_k_mixed() {
     check(DType::Q4_K, 1e-4, 1e-3);
 }
+
+/// Prefix reuse on Metal: a sequence whose first two KV blocks were written by another
+/// sequence computes only its own suffix, and must produce the same logits as a full
+/// prefill of its tokens into fresh blocks.
+#[test]
+fn metal_prefix_block_reuse_matches_full_prefill() {
+    if !MetalLlama::is_available() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let gpu = MetalLlama::from_cpu_model(&model(DType::Q8_0)).unwrap();
+    let block = 16;
+    gpu.init_kv_cache(12, block).unwrap();
+    let run = |tokens: &[u32], start: usize, ids: Vec<usize>| -> Vec<f32> {
+        let table = BlockTable { block_size: block, block_ids: ids };
+        let positions: Vec<usize> = (start..start + tokens.len()).collect();
+        let tables = vec![table; tokens.len()];
+        gpu.forward_cached(&ForwardBatch { tokens, positions: &positions, block_tables: &tables, logits_rows: &[tokens.len() - 1] })
+            .unwrap()
+    };
+    let a: Vec<u32> = (0..40u32).map(|i| (i * 7 + 3) % 96).collect();
+    let mut b: Vec<u32> = a[..32].to_vec();
+    b.extend([5u32, 9, 11, 2, 60, 44]);
+
+    // Sequence A fills blocks 3 and 7 with the shared 32-token prefix (and block 1).
+    run(&a, 0, vec![3, 7, 1]);
+    // Sequence B reuses blocks 3 and 7 and computes only its 6 suffix tokens in block 9.
+    let reused = run(&b[32..], 32, vec![3, 7, 9]);
+    // Reference: B from scratch in unrelated blocks.
+    let fresh = run(&b, 0, vec![0, 2, 4]);
+    let d = max_rel_diff(&reused, &fresh);
+    assert!(d < 1e-3, "prefix reuse: relative diff {d}");
+}

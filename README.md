@@ -49,7 +49,7 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | Component | Status | Notes |
 | :--- | :---: | :--- |
 | Paged KV block allocator with ref-counts | ✅ | |
-| Radix-tree prefix cache | ✅ | Ref-counted block ownership with LRU leaf eviction; reused prefixes skip prefill. |
+| Radix-tree prefix cache | ✅ | Block-granular tree, ref-counted blocks, LRU leaf eviction. Blocks are shared as soon as they are computed, so concurrent requests reuse a common system prompt or chat history. Time to first token with a warm 2k-token prefix: 14x faster on CPU, 23x on Metal (Llama-3.2-1B). |
 | Continuous batching (iteration-level) | ✅ | A dedicated engine thread steps the scheduler; each step mixes prefill of new sequences with decode of running ones, and preempts (recompute) under KV pressure. Requests receive tokens and a terminal event over their own channel; disconnecting cancels the sequence and frees its KV blocks. 8 concurrent requests run 2.8× faster than sequential on SmolLM2-135M. |
 | Sampler (temperature, top-k, top-p, repetition penalty) | ✅ | |
 | Speculative decoding | 📋 | |
@@ -90,7 +90,7 @@ Remaining limitations:
 3. **Q5_K weights are converted to Q8_0** (no native kernel yet), and F16 / BF16 files use 2× their size on CPU (F32).
 4. **Small models rarely write `[n]` citations.** SmolLM2-135M answers correctly from the sources but usually without citation markers; the response then carries a warning. Dense thresholds are calibrated only for bge-small-en-v1.5 and all-MiniLM-L6-v2. The reranker is lexical, not a neural cross-encoder.
 5. **No authentication, per-client rate limiting or TLS** — put rllm behind a reverse proxy for anything exposed. A single engine thread serves one model per process.
-6. **The prefix cache only records completed sequences** and shares whole blocks only (no copy-on-write of partial blocks).
+6. **The prefix cache shares whole blocks only** (no copy-on-write of partial blocks), and only exact prefixes: RAG prompts whose retrieved passages differ reuse just the instructions before them.
 
 ---
 
