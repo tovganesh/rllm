@@ -99,8 +99,9 @@ impl MetalLlama {
         Device::system_default().is_some()
     }
 
-    /// Uploads a CPU-loaded model to the default Metal device. Linear weights must be
-    /// F32, Q8_0 or Q4_0 (the GGUF loader converts other formats to Q8_0 by default).
+    /// Uploads a CPU-loaded model to the default Metal device. F32, Q8_0 and Q4_0 weights
+    /// are uploaded as they are (F32 as F16 when exact); the CPU-only formats are
+    /// converted: repacked `Q4_0x4` back to Q4_0, and Q5_0 / Q4_K / Q6_K to Q8_0.
     pub fn from_cpu_model<B: Backend>(model: &LlamaModel<B>) -> Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| RllmError::BackendError("No Metal device available".to_string()))?;
@@ -137,6 +138,11 @@ impl MetalLlama {
             if dims.len() != 2 {
                 return Err(RllmError::BackendError(format!("expected a matrix, got {dims:?}")));
             }
+            // Formats without Metal kernels: the CPU-repacked Q4_0 is unpacked; Q5_0 and
+            // the K-quants become Q8_0 (what the GGUF loader produced before the CPU
+            // backend gained native kernels for them).
+            let converted = to_metal_format(t)?;
+            let t = converted.as_ref().unwrap_or(t);
             let kind = match t.dtype() {
                 DType::F32 => WKind::F32,
                 DType::Q8_0 => WKind::Q8,
@@ -173,6 +179,10 @@ impl MetalLlama {
             if parts.iter().any(|t| t.dims().len() != 2 || t.dims()[1] != cols) {
                 return Err(RllmError::BackendError("cannot fuse matrices with different widths".into()));
             }
+            // Convert CPU-only formats first so that e.g. Q4_K + Q6_K parts (both Q8_0
+            // on Metal) are still concatenated as raw blocks.
+            let converted: Vec<Option<Tensor>> = parts.iter().map(|t| to_metal_format(t)).collect::<Result<_>>()?;
+            let parts: Vec<&Tensor> = parts.iter().zip(&converted).map(|(t, c)| c.as_ref().unwrap_or(t)).collect();
             let dtype = parts[0].dtype();
             if parts.iter().all(|t| t.dtype() == dtype) {
                 let mut bytes = Vec::new();
@@ -266,18 +276,44 @@ impl MetalLlama {
     }
 }
 
-/// Dense F32 copy of an F32 / Q8_0 / Q4_0 matrix.
+/// Dense F32 copy of a matrix in any CPU weight format.
 fn dequantize_to_f32(t: &Tensor) -> Result<Vec<f32>> {
-    use rllm_backend_cpu::ops::quant::{dequantize_q4_0, dequantize_q8_0};
+    use rllm_backend_cpu::ops::{quant::dequantize_into, repack::dequantize_q4_0x4_row};
     let mut out = vec![0f32; t.numel()];
     let bytes = &t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + t.dtype().storage_bytes(t.numel())];
     match t.dtype() {
         DType::F32 => return t.to_vec::<f32>(),
-        DType::Q8_0 => dequantize_q8_0(bytes, &mut out),
-        DType::Q4_0 => dequantize_q4_0(bytes, &mut out),
-        other => return Err(RllmError::BackendError(format!("cannot dequantize {other}"))),
+        DType::Q4_0x4 => {
+            let k = t.dims()[1];
+            for (r, row) in out.chunks_exact_mut(k).enumerate() {
+                dequantize_q4_0x4_row(bytes, k, r, row);
+            }
+        }
+        other => dequantize_into(other, bytes, &mut out)?,
     }
     Ok(out)
+}
+
+/// Converts a CPU weight whose format has no Metal kernel: `Q4_0x4` back to `Q4_0`,
+/// `Q5_0` / `Q4_K` / `Q6_K` to `Q8_0`. Returns `None` for formats Metal handles.
+fn to_metal_format(t: &Tensor) -> Result<Option<Tensor>> {
+    use rllm_backend_cpu::ops::{quant::quantize_f32_to_q8_0, repack::unpack_q4_0x4};
+    use rllm_core::{shape::Shape, storage::{CpuStorage, Storage}};
+    let (dtype, bytes) = match t.dtype() {
+        DType::Q4_0x4 => {
+            let (n, k) = (t.dims()[0], t.dims()[1]);
+            let src = &t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + t.dtype().storage_bytes(t.numel())];
+            (DType::Q4_0, unpack_q4_0x4(src, n, k))
+        }
+        DType::Q5_0 | DType::Q4_K | DType::Q6_K => {
+            let dense = dequantize_to_f32(t)?;
+            let mut bytes = vec![0u8; dense.len() / 32 * 34];
+            quantize_f32_to_q8_0(&dense, &mut bytes);
+            (DType::Q8_0, bytes)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(Tensor::new(Shape::new(t.dims().to_vec()), dtype, rllm_core::device::Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(bytes)))))
 }
 
 fn as_bytes<T: Copy>(s: &[T]) -> &[u8] {

@@ -31,9 +31,19 @@ pub trait Backend: Send + Sync + 'static {
     /// Linear layer without bias: `y[..., out] = x[..., in] · Wᵀ`.
     ///
     /// `w` is stored `[out_features, in_features]` and may be F32 or a block-quantized
-    /// type supported by the backend (Q8_0 / Q4_0 on CPU). Quantized weights are used
-    /// directly, without materialising an F32 copy.
+    /// type supported by the backend (on CPU: Q8_0, Q4_0, Q5_0, Q4_K, Q6_K and the
+    /// repacked Q4_0x4). Quantized weights are used directly, without materialising an
+    /// F32 copy.
     fn linear(&self, x: &Tensor, w: &Tensor) -> Result<Tensor>;
+
+    /// Optionally converts a `[out, in]` linear weight into a backend-preferred layout
+    /// with identical values (e.g. interleaved rows for SIMD kernels). Returns `None`
+    /// when the weight should stay as it is. The result must still be accepted by
+    /// [`Backend::linear`] and [`Backend::embedding`]. Row views of a packed weight
+    /// are only valid at the backend's row granularity (4 rows for CPU `Q4_0x4`).
+    fn pack_weight(&self, _w: &Tensor) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
 
     /// Root Mean Square Normalization (RMSNorm):
     /// $$y_i = \frac{x_i}{\sqrt{\frac{1}{d} \sum_{j=1}^d x_j^2 + \epsilon}} \cdot w_i$$

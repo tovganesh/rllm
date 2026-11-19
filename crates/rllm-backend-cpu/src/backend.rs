@@ -4,8 +4,9 @@ use crate::ops::{
     norm::rms_norm_f32,
     paged_attn::paged_attention_kv_group,
     blas::{sgemm_nt, sgemm_nt_cols},
-    qdot::{gemv_quantized, linear_quantized},
-    quant::{dequantize_q4_0, dequantize_q8_0, gemv_q4_0_f32, gemv_q8_0_f32},
+    qdot::{gemv_quantized, linear_quantized, QFormat},
+    quant::{dequantize_into, gemv_q4_0_f32, gemv_q8_0_f32, q5_0_to_q8_0},
+    repack::{dequantize_q4_0x4_group, dequantize_q4_0x4_row, gemm_q4_0x4, gemv_q4_0x4, has_i8mm, repack_q4_0},
     rope::rope_f32,
     softmax::softmax_inplace,
 };
@@ -26,6 +27,16 @@ const DEQUANT_CHUNK_ROWS: usize = 2048;
 /// Batches with at least this many rows use dequantized-weight F32 GEMM instead of
 /// integer dot products (llama.cpp uses the same cut-over for its BLAS path).
 pub const BATCHED_F32_MIN_ROWS: usize = 32;
+
+/// Whether a batch of `m` rows against a repacked `Q4_0` `[n, k]` weight should use the
+/// i8mm integer GEMM rather than dequantization + F32 GEMM. Measured on an M4: i8mm
+/// is 3-6x faster than per-row SDOT below 32 rows; from 32 to ~192 rows it beats
+/// dequantize + Accelerate only for large matrices (Llama-3.2-1B: +12% at 128 prompt
+/// tokens, +65% at 64), whose F32 copies spill out of cache, and loses on small ones
+/// (SmolLM2-135M: -25% at 128).
+fn use_i8mm(m: usize, n: usize, k: usize) -> bool {
+    has_i8mm() && (m < BATCHED_F32_MIN_ROWS || (m < 192 && n * k >= 1 << 22))
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CpuBackend;
@@ -114,24 +125,18 @@ impl Backend for CpuBackend {
             return y.reshape(Shape::new(out_dims));
         }
 
-        let is_q8 = match w.dtype() {
-            DType::Q8_0 => true,
-            DType::Q4_0 => false,
-            other => {
-                return Err(RllmError::UnsupportedOp {
-                    op: "linear",
-                    dtype: other.to_string(),
-                    device: "cpu".to_string(),
-                })
-            }
-        };
-        if k % 32 != 0 {
+        let dtype = w.dtype();
+        let fmt = QFormat::from_dtype(dtype);
+        if fmt.is_none() && dtype != DType::Q4_0x4 {
+            return Err(RllmError::UnsupportedOp { op: "linear", dtype: dtype.to_string(), device: "cpu".to_string() });
+        }
+        let block = dtype.block_info().map_or(1, |(values, _)| values);
+        if k % block != 0 {
             return Err(RllmError::QuantizationError(format!(
-                "linear: in_features {} is not a multiple of the 32-element block size",
-                k
+                "linear: in_features {k} is not a multiple of the {block}-element {dtype} block"
             )));
         }
-        let w_bytes = w.dtype().storage_bytes(n * k);
+        let w_bytes = dtype.storage_bytes(n * k);
         let all = w.storage().as_cpu()?.as_bytes();
         let w_bytes = all.get(w.offset()..w.offset() + w_bytes).ok_or_else(|| {
             RllmError::BackendError("quantized weight storage too small".to_string())
@@ -144,35 +149,71 @@ impl Backend for CpuBackend {
         let mut out = Tensor::zeros(Shape::new(out_dims), DType::F32, Device::Cpu)?;
         let out_slice = out.as_mut_f32_slice()?;
         let m = x_slice.len() / k;
-        if m >= BATCHED_F32_MIN_ROWS {
+        let repacked = dtype == DType::Q4_0x4;
+        let integer_path = m < BATCHED_F32_MIN_ROWS || (repacked && use_i8mm(m, n, k));
+        if m == 1 {
+            // Decode: activations quantized to Q8, integer dot products.
+            match fmt {
+                Some(fmt) => gemv_quantized(fmt, w_bytes, x_slice, out_slice, n, k),
+                None => gemv_q4_0x4(w_bytes, x_slice, out_slice, n, k),
+            }
+        } else if integer_path {
+            match fmt {
+                Some(fmt) => linear_quantized(fmt, w_bytes, x_slice, out_slice, m, n, k),
+                None => gemm_q4_0x4(w_bytes, x_slice, out_slice, m, n, k),
+            }
+        } else {
             // Large batches (prefill): dequantize the weight and use an F32 GEMM, as
             // llama.cpp's CPU backend does for batches of 32+ rows.
             // The weight is processed in row chunks small enough to stay in cache between
             // dequantization and the GEMM that consumes them.
-            let row_bytes = w.dtype().storage_bytes(k);
+            let row_bytes = dtype.storage_bytes(k);
             let chunk = DEQUANT_CHUNK_ROWS.min(n);
             let mut wf = vec![0f32; chunk * k];
             let mut j0 = 0;
             while j0 < n {
                 let nc = chunk.min(n - j0);
                 let src = &w_bytes[j0 * row_bytes..(j0 + nc) * row_bytes];
-                wf[..nc * k].par_chunks_mut(k).zip(src.par_chunks(row_bytes)).for_each(|(dst, src)| {
-                    if is_q8 {
-                        dequantize_q8_0(src, dst);
-                    } else {
-                        dequantize_q4_0(src, dst);
-                    }
-                });
+                if repacked {
+                    wf[..nc * k].par_chunks_mut(4 * k).zip(src.par_chunks(4 * row_bytes)).for_each(|(dst, src)| {
+                        let (r0, rest) = dst.split_at_mut(k);
+                        let (r1, rest) = rest.split_at_mut(k);
+                        let (r2, r3) = rest.split_at_mut(k);
+                        dequantize_q4_0x4_group(src, [r0, r1, r2, r3]);
+                    });
+                } else {
+                    wf[..nc * k].par_chunks_mut(k).zip(src.par_chunks(row_bytes)).try_for_each(|(dst, src)| {
+                        dequantize_into(dtype, src, dst)
+                    })?;
+                }
                 sgemm_nt_cols(x_slice, &wf[..nc * k], out_slice, m, k, nc, j0, n);
                 j0 += nc;
             }
-        } else if m == 1 {
-            // Decode: activations quantized to Q8, integer dot products.
-            gemv_quantized(is_q8, w_bytes, x_slice, out_slice, n, k);
-        } else {
-            linear_quantized(is_q8, w_bytes, x_slice, out_slice, m, n, k);
         }
         Ok(out)
+    }
+
+    /// Repacks `Q4_0` matrices with a multiple of 4 rows into interleaved `Q4_0x4`, and
+    /// expands `Q5_0` losslessly to `Q8_0` (the SDOT Q8_0 kernel is ~1.75x faster than
+    /// unpacking 5-bit values on an M4, at 34 instead of 22 bytes per block).
+    fn pack_weight(&self, w: &Tensor) -> Result<Option<Tensor>> {
+        let dims = w.dims();
+        if dims.len() != 2 || !dims[1].is_multiple_of(32) {
+            return Ok(None);
+        }
+        let len = w.dtype().storage_bytes(w.numel());
+        let bytes = || -> Result<&[u8]> { Ok(&w.storage().as_cpu()?.as_bytes()[w.offset()..w.offset() + len]) };
+        let (dtype, packed) = match w.dtype() {
+            DType::Q4_0 if dims[0].is_multiple_of(4) => (DType::Q4_0x4, repack_q4_0(bytes()?, dims[0], dims[1])),
+            DType::Q5_0 => (DType::Q8_0, q5_0_to_q8_0(bytes()?)),
+            _ => return Ok(None),
+        };
+        Ok(Some(Tensor::new(
+            w.shape().clone(),
+            dtype,
+            Device::Cpu,
+            rllm_core::storage::Storage::Cpu(rllm_core::storage::CpuStorage::from_bytes(packed)),
+        )))
     }
 
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
@@ -280,16 +321,17 @@ impl Backend for CpuBackend {
                     dst.copy_from_slice(&table_slice[id * hidden_dim..(id + 1) * hidden_dim]);
                 }
             }
-            dtype @ (DType::Q8_0 | DType::Q4_0) => {
+            DType::Q4_0x4 => {
+                let bytes = &table.storage().as_cpu()?.as_bytes()[table.offset()..];
+                for (dst, &id) in out_slice.chunks_exact_mut(hidden_dim).zip(ids) {
+                    dequantize_q4_0x4_row(bytes, hidden_dim, id as usize, dst);
+                }
+            }
+            dtype if dtype.is_quantized() || matches!(dtype, DType::F16 | DType::BF16) => {
                 let row_bytes = dtype.storage_bytes(hidden_dim);
                 let bytes = &table.storage().as_cpu()?.as_bytes()[table.offset()..];
                 for (dst, &id) in out_slice.chunks_exact_mut(hidden_dim).zip(ids) {
-                    let row = &bytes[id as usize * row_bytes..(id as usize + 1) * row_bytes];
-                    if dtype == DType::Q8_0 {
-                        dequantize_q8_0(row, dst);
-                    } else {
-                        dequantize_q4_0(row, dst);
-                    }
+                    dequantize_into(dtype, &bytes[id as usize * row_bytes..(id as usize + 1) * row_bytes], dst)?;
                 }
             }
             other => {

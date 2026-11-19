@@ -117,7 +117,45 @@ impl<B: Backend> LlamaModel<B> {
             kv_cache: Default::default(),
         };
         model.fuse_projections()?;
+        model.pack_for_backend()?;
         Ok(model)
+    }
+
+    /// Lets the backend convert every linear weight into its preferred layout
+    /// ([`Backend::pack_weight`]), then re-fuses the Q/K/V and gate/up projections so the
+    /// fused matrices use the packed layout too (packing can also make the dtypes of a
+    /// layer's parts agree, enabling fusion). A tied embedding table follows the output
+    /// head. Idempotent.
+    pub fn pack_for_backend(&mut self) -> Result<()> {
+        let backend = self.backend.clone();
+        let mut changed = false;
+        let mut pack = |t: &mut Tensor| -> Result<()> {
+            if let Some(p) = backend.pack_weight(t)? {
+                *t = p;
+                changed = true;
+            }
+            Ok(())
+        };
+        for layer in &mut self.layers {
+            let (a, m) = (&mut layer.self_attn, &mut layer.mlp);
+            for w in [&mut a.q_proj, &mut a.k_proj, &mut a.v_proj, &mut a.o_proj, &mut m.gate_proj, &mut m.up_proj, &mut m.down_proj] {
+                pack(w)?;
+            }
+        }
+        let tied = self.lm_head.storage().as_cpu()?.as_bytes().as_ptr()
+            == self.embed_tokens.storage().as_cpu()?.as_bytes().as_ptr();
+        pack(&mut self.lm_head)?;
+        if tied {
+            self.embed_tokens = self.lm_head.clone();
+        }
+        if changed {
+            for layer in &mut self.layers {
+                layer.self_attn.qkv_proj = None;
+                layer.mlp.gate_up_proj = None;
+            }
+            self.fuse_projections()?;
+        }
+        Ok(())
     }
 
     /// Concatenates each layer's Q/K/V and gate/up weights into single matrices and

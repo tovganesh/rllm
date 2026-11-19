@@ -1,10 +1,12 @@
 pub mod activations;
 pub mod blas;
 pub mod gemm;
+pub mod kdot;
 pub mod norm;
 pub mod paged_attn;
 pub mod qdot;
 pub mod quant;
+pub mod repack;
 pub mod rope;
 pub mod softmax;
 
