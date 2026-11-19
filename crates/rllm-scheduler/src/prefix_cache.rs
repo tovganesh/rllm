@@ -1,4 +1,4 @@
-//! Radix-tree prefix cache for prompt KV-cache sharing.
+//! Radix-tree prefix cache for KV-cache sharing between sequences.
 //!
 //! Stores token prefixes mapped to the physical KV blocks that hold their keys and
 //! values. When a new sequence shares a block-aligned prefix with a cached one, those
@@ -13,37 +13,27 @@
 
 use std::collections::HashMap;
 
-/// A node in the prefix tree (one node per token).
-#[derive(Debug)]
-pub struct RadixNode {
-    /// Token ID associated with this node.
-    pub token: u32,
-    /// Physical block ID if this node ends a full block.
-    pub block_id: Option<usize>,
+/// A node of the prefix tree: one full KV block, keyed (in its parent) by the
+/// `block_size` tokens it holds.
+#[derive(Debug, Default)]
+struct Node {
+    /// Physical block holding these tokens' keys and values (unused for the root).
+    block_id: usize,
     /// Logical clock of the last match or insert that touched this node.
-    pub last_access: u64,
-    /// Child nodes keyed by the next token ID.
-    pub children: HashMap<u32, RadixNode>,
+    last_access: u64,
+    /// Children keyed by the next block's tokens.
+    children: HashMap<Box<[u32]>, Node>,
 }
 
-impl RadixNode {
-    /// Constructs a new empty node for a given token.
-    pub fn new(token: u32) -> Self {
-        Self {
-            token,
-            block_id: None,
-            last_access: 0,
-            children: HashMap::new(),
-        }
-    }
-}
-
-/// Radix-tree prefix cache for prompt key-value block reuse.
+/// Block-granular radix tree mapping token prefixes to the KV blocks that hold them.
+///
+/// Every node is one full block, so lookups cost one hash probe per block (not per
+/// token) and the tree has at most as many nodes as there are KV blocks.
 #[derive(Debug)]
 pub struct PrefixCache {
     /// Block size in tokens for physical block alignment.
     pub block_size: usize,
-    root: RadixNode,
+    root: Node,
     clock: u64,
     num_blocks: usize,
 }
@@ -51,12 +41,7 @@ pub struct PrefixCache {
 impl PrefixCache {
     /// Constructs a new [`PrefixCache`] with the specified block size.
     pub fn new(block_size: usize) -> Self {
-        Self {
-            block_size,
-            root: RadixNode::new(0),
-            clock: 0,
-            num_blocks: 0,
-        }
+        Self { block_size, root: Node::default(), clock: 0, num_blocks: 0 }
     }
 
     /// Number of physical blocks currently recorded (and referenced) by the cache.
@@ -73,29 +58,18 @@ impl PrefixCache {
         self.clock += 1;
         let now = self.clock;
         let mut curr = &mut self.root;
-        let mut matched_blocks = Vec::new();
-        let mut matched_tokens = 0;
-
-        for (i, &token) in tokens.iter().enumerate() {
-            match curr.children.get_mut(&token) {
+        let mut blocks = Vec::new();
+        for chunk in tokens.chunks_exact(self.block_size) {
+            match curr.children.get_mut(chunk) {
                 Some(child) => {
+                    child.last_access = now;
+                    blocks.push(child.block_id);
                     curr = child;
-                    curr.last_access = now;
-                    if (i + 1) % self.block_size == 0 {
-                        match curr.block_id {
-                            Some(bid) => {
-                                matched_blocks.push(bid);
-                                matched_tokens = i + 1;
-                            }
-                            None => break,
-                        }
-                    }
                 }
                 None => break,
             }
         }
-
-        (matched_tokens, matched_blocks)
+        (blocks.len() * self.block_size, blocks)
     }
 
     /// Records the full blocks of `tokens`, whose KV entries live in `block_ids`.
@@ -106,27 +80,17 @@ impl PrefixCache {
     /// Returns the block IDs newly recorded; the caller must add one allocator reference
     /// to each of them on behalf of the cache.
     pub fn insert_prefix(&mut self, tokens: &[u32], block_ids: &[usize]) -> Vec<usize> {
-        let blocks_to_insert = (tokens.len() / self.block_size).min(block_ids.len());
         let mut newly_cached = Vec::new();
-        if blocks_to_insert == 0 {
-            return newly_cached;
-        }
         self.clock += 1;
         let now = self.clock;
-
         let mut curr = &mut self.root;
-        for (i, &token) in tokens[..blocks_to_insert * self.block_size].iter().enumerate() {
-            curr = curr
-                .children
-                .entry(token)
-                .or_insert_with(|| RadixNode::new(token));
-            curr.last_access = now;
-
-            if (i + 1) % self.block_size == 0 && curr.block_id.is_none() {
-                let bid = block_ids[i / self.block_size];
-                curr.block_id = Some(bid);
+        for (chunk, &bid) in tokens.chunks_exact(self.block_size).zip(block_ids) {
+            let child = curr.children.entry(chunk.into()).or_insert_with(|| {
                 newly_cached.push(bid);
-            }
+                Node { block_id: bid, last_access: now, children: HashMap::new() }
+            });
+            child.last_access = now;
+            curr = child;
         }
         self.num_blocks += newly_cached.len();
         newly_cached
@@ -139,60 +103,39 @@ impl PrefixCache {
     /// Typical use passes `|b| allocator.ref_count(b) == 1`, i.e. only blocks no running
     /// sequence is using.
     pub fn evict_one(&mut self, can_evict: impl Fn(usize) -> bool) -> Option<usize> {
-        let mut candidates = Vec::new();
+        let mut best: Option<(u64, Vec<Box<[u32]>>)> = None;
         let mut path = Vec::new();
-        collect_leaf_blocks(&self.root, &mut path, &mut candidates);
-
-        let (_, victim_path, block_id) = candidates
-            .into_iter()
-            .filter(|(_, _, b)| can_evict(*b))
-            .min_by_key(|(t, _, _)| *t)?;
-
-        remove_block(&mut self.root, &victim_path);
+        find_lru_leaf(&self.root, &mut path, &can_evict, &mut best);
+        let (_, victim) = best?;
+        let (last, parents) = victim.split_last()?;
+        let mut node = &mut self.root;
+        for key in parents {
+            node = node.children.get_mut(key)?;
+        }
+        let removed = node.children.remove(last)?;
         self.num_blocks -= 1;
-        Some(block_id)
+        Some(removed.block_id)
     }
 }
 
-/// Collects `(last_access, token path, block_id)` for every block node that has no
-/// block-holding descendants. Returns whether `node`'s subtree holds any block.
-fn collect_leaf_blocks(
-    node: &RadixNode,
-    path: &mut Vec<u32>,
-    out: &mut Vec<(u64, Vec<u32>, usize)>,
-) -> bool {
-    let mut subtree_has_block = false;
-    for (&tok, child) in &node.children {
-        path.push(tok);
-        subtree_has_block |= collect_leaf_blocks(child, path, out);
+/// Finds the least-recently-used evictable leaf below `node`.
+fn find_lru_leaf(
+    node: &Node,
+    path: &mut Vec<Box<[u32]>>,
+    can_evict: &impl Fn(usize) -> bool,
+    best: &mut Option<(u64, Vec<Box<[u32]>>)>,
+) {
+    for (key, child) in &node.children {
+        path.push(key.clone());
+        if child.children.is_empty() {
+            if can_evict(child.block_id) && best.as_ref().is_none_or(|(t, _)| child.last_access < *t) {
+                *best = Some((child.last_access, path.clone()));
+            }
+        } else {
+            find_lru_leaf(child, path, can_evict, best);
+        }
         path.pop();
     }
-    if let Some(bid) = node.block_id {
-        if !subtree_has_block {
-            out.push((node.last_access, path.clone(), bid));
-        }
-        return true;
-    }
-    subtree_has_block
-}
-
-/// Clears the block at the end of `path` and prunes nodes left with no block and no
-/// children. Returns true if `node` itself should be removed by its parent.
-fn remove_block(node: &mut RadixNode, path: &[u32]) -> bool {
-    match path.split_first() {
-        None => node.block_id = None,
-        Some((tok, rest)) => {
-            let remove_child = node
-                .children
-                .get_mut(tok)
-                .map(|child| remove_block(child, rest))
-                .unwrap_or(false);
-            if remove_child {
-                node.children.remove(tok);
-            }
-        }
-    }
-    node.block_id.is_none() && node.children.is_empty()
 }
 
 #[cfg(test)]

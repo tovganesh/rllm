@@ -344,8 +344,20 @@ impl ContinuousBatchScheduler {
         let vocab_size = self.model.config().vocab_size;
         let max_pos = self.model.config().max_position_embeddings;
         let mut generated = Vec::with_capacity(running.len());
+        let block_size = self.config.block_size;
         for (idx, seq) in running.iter_mut().enumerate() {
+            let before = seq.num_computed_tokens;
             seq.num_computed_tokens = seq.total_tokens();
+            // Share newly completed blocks right away (not only when the sequence
+            // finishes), so concurrent requests with the same prefix — a system prompt,
+            // a chat history — reuse them. Full blocks are never written again: later
+            // tokens go to positions past `num_computed_tokens`.
+            if seq.num_computed_tokens / block_size > before / block_size {
+                let computed = &seq.all_tokens()[..seq.num_computed_tokens];
+                for bid in prefix_cache.insert_prefix(computed, &seq.block_table.block_ids) {
+                    allocator.inc_ref(bid);
+                }
+            }
             let seq_logits = &logits_slice[idx * vocab_size..(idx + 1) * vocab_size];
             let token = Sampler::sample(seq_logits, &seq.sampling_params, &seq.output_tokens);
             seq.append_token(token);

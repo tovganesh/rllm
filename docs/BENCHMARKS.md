@@ -80,6 +80,42 @@ Exact token parity across engines is only expected where both use the same arith
 
 SmolLM2-135M pp128 on Metal is noisy in this script (single runs of the same build vary by up to ~20%).
 
+#### Long context (2,048 tokens of context)
+
+`python3 scripts/bench_vs_llamacpp.py --depth 2048` (llama-bench `-d 2048`, `rllm bench --depth 2048`; 2 repetitions):
+
+| model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
+| --- | --- | --- | ---: | ---: | ---: |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 @ d2048 | 1,352 | 1,171 | 0.87x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 @ d2048 | 1,390 | 1,266 | 0.91x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 @ d2048 | 101 | 80 | 0.79x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 @ d2048 | 1,327 | 1,179 | 0.89x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 @ d2048 | 1,381 | 1,282 | 0.93x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 @ d2048 | 67 | 54 | 0.81x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp128 @ d2048 | 137 | 178 | 1.29x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp512 @ d2048 | 130 | 191 | 1.46x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | tg128 @ d2048 | 45 | 60 | 1.34x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 @ d2048 | 137 | 171 | 1.25x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 @ d2048 | 124 | 191 | 1.53x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 @ d2048 | 34 | 42 | 1.21x |
+
+On the CPU, rllm's paged GQA attention keeps it well ahead at depth. On Metal, long-context decode is 0.79–0.81x: the decode attention kernel reads F32 keys/values (llama.cpp: F16) — the next targets are the F16 KV cache and that kernel.
+
+#### Prefix cache: time to first token
+
+`rllm bench --model M --prompt-tokens P --shared-prefix S`: a request whose first S tokens were computed by an earlier request (warm) versus one with nothing cached (cold), through the scheduler; median of 3.
+
+| model | device | prompt | shared prefix | cached tokens | TTFT cold ms | TTFT warm ms | speed-up |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | 512 | 448 | 448 | 996.4 | 282.0 | 3.53x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | 2048 | 1984 | 1984 | 6039.8 | 433.2 | 13.94x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal (Apple M4) | 512 | 448 | 448 | 342.0 | 54.5 | 6.27x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal (Apple M4) | 2048 | 1984 | 1984 | 1440.3 | 62.4 | 23.08x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | 1024 | 896 | 896 | 2269.9 | 474.1 | 4.79x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal (Apple M4) | 1024 | 896 | 896 | 706.5 | 100.5 | 7.03x |
+
+Completed blocks are now shared as soon as they are computed (previously only when a sequence finished), so concurrent requests with the same system prompt or chat history reuse each other's KV blocks.
+
 **Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU decode of Llama-3.2-1B Q4_K_M (1.04x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x).
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
@@ -90,7 +126,7 @@ SmolLM2-135M pp128 on Metal is noisy in this script (single runs of the same bui
 **What changed in this round** (Metal prefill; Llama-3.2-1B pp512 Q8_0 1,377 → 1,508, Q4_0 1,292 → 1,487, Q4_K_M 1,327 → 1,425 tok/s; SmolLM2 Q8_0 8,132 → 9,868):
 1. **GEMM** (`tests/gemm_bench.rs`, an ignored micro-benchmark on the 1B shapes, plus a peak probe: 3.93 TFLOPS for half x half -> float `simdgroup_matrix` products, 1.05 for float x float): k-step 32 → 64; activations converted to half once per linear layer (`to_half`) instead of once per weight tile; one 32-value weight block dequantized per thread with conflict-free tile stores (Q6_K, whose 210-byte blocks are not word-aligned, keeps four threads per block). GEMM time per layer at 512 rows: Q4_0 −11%, F16 −9%, Q8_0 −6%, Q4_K −5%, Q6_K −5%. Rejected: 64x128 tiles with 32 accumulators per simdgroup (register spills, 5.5x slower), 8 simdgroups on 64x128 (mixed), half activations alone (+1%).
 2. **Prefill attention** rewritten (3.1x faster at 1,024 tokens: 92 → 29 ms on 1B; was 8% of pp512 time): 32-row query tiles over four simdgroups sharing 32-key K/V blocks staged as half; scores computed transposed (S^T = K Q^T, so K fragments load untransposed) with two accumulators per key group (the previous single chain of 8 dependent products was latency-bound); in-simdgroup online softmax; lazy rescaling; and — the largest single step, 63 → 29 ms — the head dimension as a template parameter, so fragment arrays indexed in loops stay in registers instead of spilling. Found by ablating loads / scores / P·V with temporary shader defines.
-3. Decode attention also templated on the head dimension (+2–6% decode at 2,048 tokens of context; larger on SmolLM2).
+3. Decode attention also templated on the head dimension (+2–6% decode; larger on SmolLM2). *Correction:* this was reported as measured "at 2,048 tokens of context", but `rllm bench --model` then always decoded from position 0, so it was a short-context figure. `--depth` now exists; see "Long context" above.
 
 Correctness of this round: Metal perplexity vs `llama-perplexity -ngl 99` at 128 and 512 tokens of context within 0.05% for 1B Q8_0 / Q4_0 and SmolLM2 Q8_0 / F16 (1B Q4_K_M: −0.20% at 128, −0.01% at 512); greedy output identical to `llama-simple -ngl 99` for 1B Q8_0, Q4_K_M and Q4_0. The F32 Metal-vs-CPU prefill bound went from 1e-4 to 5e-4 (attention now stages K/V as half, as llama.cpp's Metal flash attention does).
 
@@ -213,7 +249,7 @@ Once a real model runs correctly:
 1. **Models:** one small LLaMA-family GGUF model in F32/F16, Q8_0 and Q4_0.
 2. **Correctness gate:** logits match a reference implementation within tolerance before any timing is reported.
 3. **Metrics:** prefill tokens/s, decode tokens/s, TTFT, per-token latency percentiles, peak RSS, at batch sizes 1/2/4/8.
-4. **Prefix cache:** cold vs warm TTFT for a shared system prompt of 256–2,048 tokens.
+4. **Prefix cache:** cold vs warm TTFT for a shared system prompt of 256–2,048 tokens. ✅ (`rllm bench --shared-prefix`, see section 1)
 5. **Baseline:** llama.cpp on the same machine and the same model file.
 6. **Reporting:** hardware, OS, Rust version, commit hash, and exact commands for every table.
 
