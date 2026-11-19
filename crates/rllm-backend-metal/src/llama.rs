@@ -27,6 +27,8 @@ enum WKind {
     F16,
     Q8,
     Q4,
+    Q4K,
+    Q6K,
 }
 
 impl WKind {
@@ -36,6 +38,8 @@ impl WKind {
             WKind::F16 => "f16",
             WKind::Q8 => "q8_0",
             WKind::Q4 => "q4_0",
+            WKind::Q4K => "q4_k",
+            WKind::Q6K => "q6_k",
         }
     }
 }
@@ -49,13 +53,15 @@ struct Weight {
 }
 
 /// One decoder layer. Q/K/V and gate/up projections are fused into single matrices
-/// (`[q | k | v]` and `[gate | up]` row blocks) so each is one dispatch.
+/// (`[q | k | v]` and `[gate | up]` row blocks) so each is one dispatch per storage
+/// format: parts in different formats (e.g. Q4_K q/k with a Q6_K v) stay separate
+/// segments that write adjacent column ranges of the same output.
 struct Layer {
     attn_norm: Buffer,
-    qkv: Weight,
+    qkv: Vec<Weight>,
     o: Weight,
     ffn_norm: Buffer,
-    gate_up: Weight,
+    gate_up: Vec<Weight>,
     down: Weight,
 }
 
@@ -99,9 +105,9 @@ impl MetalLlama {
         Device::system_default().is_some()
     }
 
-    /// Uploads a CPU-loaded model to the default Metal device. F32, Q8_0 and Q4_0 weights
-    /// are uploaded as they are (F32 as F16 when exact); the CPU-only formats are
-    /// converted: repacked `Q4_0x4` back to Q4_0, and Q5_0 / Q4_K / Q6_K to Q8_0.
+    /// Uploads a CPU-loaded model to the default Metal device. F32, Q8_0, Q4_0, Q4_K and
+    /// Q6_K weights are uploaded as they are (F32 as F16 when exact); the CPU-only
+    /// formats are converted: repacked `Q4_0x4` back to Q4_0, Q5_0 losslessly to Q8_0.
     pub fn from_cpu_model<B: Backend>(model: &LlamaModel<B>) -> Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| RllmError::BackendError("No Metal device available".to_string()))?;
@@ -119,8 +125,8 @@ impl MetalLlama {
             .map_err(|e| RllmError::BackendError(format!("Metal shader compilation failed: {e}")))?;
         let mut pipelines = HashMap::new();
         let names = [
-            "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16", "embed_f32", "embed_q8_0",
-            "embed_q4_0", "embed_f16",
+            "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
+            "mm_q4_k", "mm_q6_k", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
             "rms_norm", "rope", "kv_write", "attention", "attention_tile", "swiglu",
         ];
         for name in names {
@@ -147,6 +153,8 @@ impl MetalLlama {
                 DType::F32 => WKind::F32,
                 DType::Q8_0 => WKind::Q8,
                 DType::Q4_0 => WKind::Q4,
+                DType::Q4_K => WKind::Q4K,
+                DType::Q6_K => WKind::Q6K,
                 other => {
                     return Err(RllmError::BackendError(format!("Metal executor does not support {other} weights")))
                 }
@@ -173,32 +181,36 @@ impl MetalLlama {
         // Row-concatenation of matrices with equal column counts. Raw blocks are
         // concatenated when every part has the same storage type; otherwise all parts
         // are dequantized to F32.
-        let upload_concat = |parts: &[&Tensor]| -> Result<Weight> {
+        // Row-concatenation of matrices with equal column counts: consecutive parts with
+        // the same storage format are concatenated as raw blocks into one segment.
+        let upload_concat = |parts: &[&Tensor]| -> Result<Vec<Weight>> {
             let cols = parts[0].dims()[1];
-            let rows: usize = parts.iter().map(|t| t.dims()[0]).sum();
             if parts.iter().any(|t| t.dims().len() != 2 || t.dims()[1] != cols) {
                 return Err(RllmError::BackendError("cannot fuse matrices with different widths".into()));
             }
-            // Convert CPU-only formats first so that e.g. Q4_K + Q6_K parts (both Q8_0
-            // on Metal) are still concatenated as raw blocks.
+            // Convert CPU-only formats first so that parts that end up in the same
+            // Metal format are still concatenated.
             let converted: Vec<Option<Tensor>> = parts.iter().map(|t| to_metal_format(t)).collect::<Result<_>>()?;
             let parts: Vec<&Tensor> = parts.iter().zip(&converted).map(|(t, c)| c.as_ref().unwrap_or(t)).collect();
-            let dtype = parts[0].dtype();
-            if parts.iter().all(|t| t.dtype() == dtype) {
+            let mut segments = Vec::new();
+            let mut i = 0;
+            while i < parts.len() {
+                let dtype = parts[i].dtype();
+                let mut j = i;
                 let mut bytes = Vec::new();
-                for t in parts {
+                while j < parts.len() && parts[j].dtype() == dtype {
+                    let t = parts[j];
                     let len = dtype.storage_bytes(t.numel());
                     bytes.extend_from_slice(&t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + len]);
+                    j += 1;
                 }
+                let rows: usize = parts[i..j].iter().map(|t| t.dims()[0]).sum();
                 let shape = rllm_core::shape::Shape::new(vec![rows, cols]);
                 let storage = rllm_core::storage::Storage::Cpu(rllm_core::storage::CpuStorage::from_bytes(bytes));
-                return upload(&Tensor::new(shape, dtype, rllm_core::device::Device::Cpu, storage));
+                segments.push(upload(&Tensor::new(shape, dtype, rllm_core::device::Device::Cpu, storage))?);
+                i = j;
             }
-            let mut dense = Vec::with_capacity(rows * cols);
-            for t in parts {
-                dense.extend(dequantize_to_f32(t)?);
-            }
-            upload(&Tensor::from_f32(&dense, rllm_core::shape::Shape::new(vec![rows, cols]), rllm_core::device::Device::Cpu)?)
+            Ok(segments)
         };
 
         let embed = upload(&model.embed_tokens)?;
@@ -295,9 +307,13 @@ fn dequantize_to_f32(t: &Tensor) -> Result<Vec<f32>> {
 }
 
 /// Converts a CPU weight whose format has no Metal kernel: `Q4_0x4` back to `Q4_0`,
-/// `Q5_0` / `Q4_K` / `Q6_K` to `Q8_0`. Returns `None` for formats Metal handles.
+/// `Q5_0` losslessly to `Q8_0`, and K-quants whose rows are not whole super-blocks to
+/// `Q8_0`. Returns `None` for formats Metal handles.
 fn to_metal_format(t: &Tensor) -> Result<Option<Tensor>> {
-    use rllm_backend_cpu::ops::{quant::quantize_f32_to_q8_0, repack::unpack_q4_0x4};
+    use rllm_backend_cpu::ops::{
+        quant::{q5_0_to_q8_0, quantize_f32_to_q8_0},
+        repack::unpack_q4_0x4,
+    };
     use rllm_core::{shape::Shape, storage::{CpuStorage, Storage}};
     let (dtype, bytes) = match t.dtype() {
         DType::Q4_0x4 => {
@@ -305,7 +321,11 @@ fn to_metal_format(t: &Tensor) -> Result<Option<Tensor>> {
             let src = &t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + t.dtype().storage_bytes(t.numel())];
             (DType::Q4_0, unpack_q4_0x4(src, n, k))
         }
-        DType::Q5_0 | DType::Q4_K | DType::Q6_K => {
+        DType::Q5_0 => {
+            let src = &t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + t.dtype().storage_bytes(t.numel())];
+            (DType::Q8_0, q5_0_to_q8_0(src))
+        }
+        DType::Q4_K | DType::Q6_K if !t.dims()[1].is_multiple_of(256) => {
             let dense = dequantize_to_f32(t)?;
             let mut bytes = vec![0u8; dense.len() / 32 * 34];
             quantize_f32_to_q8_0(&dense, &mut bytes);
@@ -345,6 +365,8 @@ struct Enc<'a> {
 #[derive(Clone, Copy)]
 enum Arg<'a> {
     B(&'a Buffer),
+    /// Buffer bound at a byte offset.
+    BO(&'a Buffer, u64),
     U(u32),
     F(f32),
 }
@@ -356,6 +378,7 @@ impl Enc<'_> {
             let i = i as u64;
             match a {
                 Arg::B(b) => self.enc.set_buffer(i, Some(b), 0),
+                Arg::BO(b, off) => self.enc.set_buffer(i, Some(b), *off),
                 Arg::U(v) => self.enc.set_bytes(i, 4, v as *const u32 as *const std::ffi::c_void),
                 Arg::F(v) => self.enc.set_bytes(i, 4, v as *const f32 as *const std::ffi::c_void),
             }
@@ -379,18 +402,38 @@ impl Enc<'_> {
 impl MetalLlama {
     /// `y[m, rows] = x[m, cols] · Wᵀ`, or `y += …` when `accumulate`.
     fn linear(&self, e: &Enc<'_>, w: &Weight, x: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
-        let (n, k) = (w.rows as u32, w.cols as u32);
-        let args = [Arg::B(&w.buf), Arg::B(x), Arg::B(y), Arg::U(n), Arg::U(k), Arg::U(m as u32), Arg::U(accumulate as u32)];
-        if m <= MV_MAX_ROWS {
-            let p = self.pipeline(&format!("mv_{}", w.kind.suffix()));
-            e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
-        } else if w.kind == WKind::F32 {
-            // Full-precision weights keep the F32 tile kernel (the large-tile kernel stores
-            // weights as half precision, which is lossless only for F16/quantized weights).
-            e.groups(self.pipeline("mm_f32"), &args, ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1), 128);
-        } else {
-            let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
-            e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1), 128);
+        self.linear_segments(e, std::slice::from_ref(w), x, y, m, accumulate);
+    }
+
+    /// Linear layer whose weight rows are split into segments (possibly of different
+    /// formats); segment `i` writes output columns starting after segments `0..i`.
+    fn linear_segments(&self, e: &Enc<'_>, segs: &[Weight], x: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
+        let ldy = segs.iter().map(|w| w.rows).sum::<usize>() as u32;
+        let mut col = 0u64;
+        for w in segs {
+            let (n, k) = (w.rows as u32, w.cols as u32);
+            let args = [
+                Arg::B(&w.buf),
+                Arg::B(x),
+                Arg::BO(y, col * 4),
+                Arg::U(n),
+                Arg::U(k),
+                Arg::U(m as u32),
+                Arg::U(accumulate as u32),
+                Arg::U(ldy),
+            ];
+            if m <= MV_MAX_ROWS {
+                let p = self.pipeline(&format!("mv_{}", w.kind.suffix()));
+                e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
+            } else if w.kind == WKind::F32 {
+                // Full-precision weights keep the F32 tile kernel (the large-tile kernel stores
+                // weights as half precision, which is lossless only for F16/quantized weights).
+                e.groups(self.pipeline("mm_f32"), &args, ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1), 128);
+            } else {
+                let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
+                e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1), 128);
+            }
+            col += w.rows as u64;
         }
     }
 
@@ -562,7 +605,7 @@ impl LanguageModel for MetalLlama {
                 // Attention block: norm -> fused QKV -> RoPE on q and k heads -> KV write ->
                 // attention -> output projection accumulated into the residual stream.
                 self.rms(&e, b("hidden"), &layer.attn_norm, b("normed"), n, None);
-                self.linear(&e, &layer.qkv, b("normed"), b("qkv"), n, false);
+                self.linear_segments(&e, &layer.qkv, b("normed"), b("qkv"), n, false);
                 e.threads(
                     self.pipeline("rope"),
                     &[
@@ -625,7 +668,7 @@ impl LanguageModel for MetalLlama {
                 // MLP block: norm -> fused gate/up -> SwiGLU -> down projection accumulated
                 // into the residual stream.
                 self.rms(&e, b("hidden"), &layer.ffn_norm, b("normed"), n, None);
-                self.linear(&e, &layer.gate_up, b("normed"), b("gu"), n, false);
+                self.linear_segments(&e, &layer.gate_up, b("normed"), b("gu"), n, false);
                 e.threads(
                     self.pipeline("swiglu"),
                     &[Arg::B(b("gu")), Arg::B(b("act")), Arg::U(inter as u32)],

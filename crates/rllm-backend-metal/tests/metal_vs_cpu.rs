@@ -1,7 +1,10 @@
 //! Metal executor checked against the CPU executor on seeded synthetic models.
 #![cfg(target_os = "macos")]
 
-use rllm_backend_cpu::{ops::quant::{quantize_f32_to_q4_0, quantize_f32_to_q8_0}, CpuBackend};
+use rllm_backend_cpu::{
+    ops::quant::{quantize_f32_to_q4_0, quantize_f32_to_q4_k, quantize_f32_to_q6_k, quantize_f32_to_q8_0},
+    CpuBackend,
+};
 use rllm_backend_metal::MetalLlama;
 use rllm_core::{backend::BlockTable, device::Device, dtype::DType, storage::{CpuStorage, Storage}, tensor::Tensor};
 use rllm_models::{ForwardBatch, LanguageModel, LlamaConfig, LlamaModel};
@@ -31,12 +34,22 @@ fn quantize(t: &Tensor, dtype: DType) -> Tensor {
                 quantize_f32_to_q4_0(src, dst);
             }
         }
+        DType::Q4_K => bytes = quantize_f32_to_q4_k(&data),
+        DType::Q6_K => bytes = quantize_f32_to_q6_k(&data),
         _ => unreachable!(),
     }
     Tensor::new(t.shape().clone(), dtype, Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(bytes)))
 }
 
+/// 256-wide config for K-quants (whole 256-value super-blocks per row).
+fn config_k() -> LlamaConfig {
+    LlamaConfig { hidden_size: 256, intermediate_size: 512, ..config() }
+}
+
 fn model(dtype: DType) -> LlamaModel<CpuBackend> {
+    if dtype == DType::Q4_K {
+        return model_k_mixed();
+    }
     let mut m = LlamaModel::new_seeded(config(), Arc::new(CpuBackend), 11).unwrap();
     if dtype != DType::F32 {
         m.embed_tokens = quantize(&m.embed_tokens, dtype);
@@ -49,6 +62,25 @@ fn model(dtype: DType) -> LlamaModel<CpuBackend> {
         m.fuse_projections().unwrap();
         m.pack_for_backend().unwrap();
     }
+    m
+}
+
+/// Q4_K_M-like mix: Q4_K q/k/o/gate/up, Q6_K v/down and embeddings, so fused Q/K/V
+/// has mixed formats (two segments on Metal).
+fn model_k_mixed() -> LlamaModel<CpuBackend> {
+    let mut m = LlamaModel::new_seeded(config_k(), Arc::new(CpuBackend), 11).unwrap();
+    m.embed_tokens = quantize(&m.embed_tokens, DType::Q6_K);
+    m.lm_head = quantize(&m.lm_head, DType::Q6_K);
+    for l in &mut m.layers {
+        for w in [&mut l.self_attn.q_proj, &mut l.self_attn.k_proj, &mut l.self_attn.o_proj, &mut l.mlp.gate_proj, &mut l.mlp.up_proj] {
+            *w = quantize(w, DType::Q4_K);
+        }
+        for w in [&mut l.self_attn.v_proj, &mut l.mlp.down_proj] {
+            *w = quantize(w, DType::Q6_K);
+        }
+    }
+    m.fuse_projections().unwrap();
+    m.pack_for_backend().unwrap();
     m
 }
 
@@ -106,7 +138,7 @@ fn check(dtype: DType, tol: f32, prefill_tol: f32) {
         let all = fresh
             .forward_cached(&ForwardBatch { tokens: &seq_a, positions: &p, block_tables: &vec![ta.clone(); seq_a.len()], logits_rows: &p })
             .unwrap();
-        let vocab = config().vocab_size;
+        let vocab = cpu.config.vocab_size;
         let c = &all[pos * vocab..(pos + 1) * vocab];
         let d = max_rel_diff(&g, c);
         assert!(d < tol, "{dtype:?} decode step {step}: relative diff {d}");
@@ -126,4 +158,9 @@ fn metal_matches_cpu_q8_0() {
 #[test]
 fn metal_matches_cpu_q4_0() {
     check(DType::Q4_0, 1e-4, 1e-3);
+}
+
+#[test]
+fn metal_matches_cpu_q4_k_q6_k_mixed() {
+    check(DType::Q4_K, 1e-4, 1e-3);
 }

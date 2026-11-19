@@ -304,6 +304,85 @@ pub fn dequantize_q4_k(src: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Quantizes `src` (length a multiple of 256) to `Q4_K` with a simple min/max fit per
+/// 32-value sub-block (not llama.cpp's error-minimising search). For tests and tools.
+pub fn quantize_f32_to_q4_k(src: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() / QK_K * 144);
+    for x in src.chunks_exact(QK_K) {
+        let mut scales = [0f32; 8];
+        let mut mins = [0f32; 8];
+        for (j, sub) in x.chunks_exact(32).enumerate() {
+            let lo = sub.iter().cloned().fold(f32::INFINITY, f32::min).min(0.0);
+            let hi = sub.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            scales[j] = (hi - lo) / 15.0;
+            mins[j] = -lo;
+        }
+        let max_sc = scales.iter().cloned().fold(0f32, f32::max);
+        let max_m = mins.iter().cloned().fold(0f32, f32::max);
+        let d = f16::from_f32(max_sc / 63.0);
+        let dmin = f16::from_f32(max_m / 63.0);
+        let (df, dminf) = (d.to_f32(), dmin.to_f32());
+        let q6 = |v: f32, base: f32| if base > 0.0 { (v / base).round().clamp(0.0, 63.0) as u8 } else { 0 };
+        let ls: Vec<u8> = scales.iter().map(|&v| q6(v, df)).collect();
+        let lm: Vec<u8> = mins.iter().map(|&v| q6(v, dminf)).collect();
+        let mut packed = [0u8; 12];
+        for j in 0..8 {
+            if j < 4 {
+                packed[j] = ls[j];
+                packed[j + 4] = lm[j];
+            } else {
+                packed[j + 4] = (ls[j] & 0x0F) | ((lm[j] & 0x0F) << 4);
+                packed[j - 4] |= (ls[j] >> 4) << 6;
+                packed[j] |= (lm[j] >> 4) << 6;
+            }
+        }
+        let mut qs = [0u8; 128];
+        for j in 0..8 {
+            let (sc, m) = scale_min_k4(j, &packed);
+            let (step, off) = (df * sc, dminf * m);
+            for l in 0..32 {
+                let q = if step > 0.0 { ((x[j * 32 + l] + off) / step).round().clamp(0.0, 15.0) as u8 } else { 0 };
+                let byte = &mut qs[(j / 2) * 32 + l];
+                *byte |= if j % 2 == 0 { q } else { q << 4 };
+            }
+        }
+        out.extend_from_slice(&d.to_le_bytes());
+        out.extend_from_slice(&dmin.to_le_bytes());
+        out.extend_from_slice(&packed);
+        out.extend_from_slice(&qs);
+    }
+    out
+}
+
+/// Quantizes `src` (length a multiple of 256) to `Q6_K` with an absmax fit per
+/// 16-value group. For tests and tools.
+pub fn quantize_f32_to_q6_k(src: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() / QK_K * 210);
+    for x in src.chunks_exact(QK_K) {
+        let group_scale: Vec<f32> = x.chunks_exact(16).map(|g| g.iter().fold(0f32, |m, v| m.max(v.abs())) / 31.0).collect();
+        let max_sc = group_scale.iter().cloned().fold(0f32, f32::max);
+        let d = f16::from_f32(max_sc / 127.0);
+        let df = d.to_f32();
+        let sc: Vec<i8> = group_scale.iter().map(|&v| if df > 0.0 { (v / df).round().clamp(-128.0, 127.0) as i8 } else { 0 }).collect();
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+        for (p, &v) in x.iter().enumerate() {
+            let step = df * sc[p / 16] as f32;
+            let q = if step != 0.0 { (v / step).round().clamp(-32.0, 31.0) as i32 + 32 } else { 32 } as u8;
+            let (half, lo) = (p / 128, p % 128);
+            let (g, l) = (lo / 32, lo % 32);
+            let qli = half * 64 + (g & 1) * 32 + l;
+            ql[qli] |= if g >= 2 { (q & 0x0F) << 4 } else { q & 0x0F };
+            qh[half * 32 + l] |= (q >> 4) << (2 * g);
+        }
+        out.extend_from_slice(&ql);
+        out.extend_from_slice(&qh);
+        out.extend(sc.iter().map(|&v| v as u8));
+        out.extend_from_slice(&d.to_le_bytes());
+    }
+    out
+}
+
 /// Dequantizes `Q5_K` super-blocks (256 values / 176 bytes) into `out`.
 pub fn dequantize_q5_k(src: &[u8], out: &mut [f32]) {
     for (block, y) in src.chunks_exact(176).zip(out.chunks_exact_mut(QK_K)) {
@@ -496,6 +575,18 @@ mod dequant_tests {
         dequantize_q5_0(&src, &mut a);
         dequantize_q8_0(&q5_0_to_q8_0(&src), &mut b);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn k_quant_quantizers_round_trip() {
+        let x: Vec<f32> = (0..512).map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0).collect();
+        let mut y = vec![0f32; 512];
+        dequantize_q4_k(&quantize_f32_to_q4_k(&x), &mut y);
+        let e4 = x.iter().zip(&y).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(e4 < 0.2, "q4_k max error {e4}");
+        dequantize_q6_k(&quantize_f32_to_q6_k(&x), &mut y);
+        let e6 = x.iter().zip(&y).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(e6 < 0.05, "q6_k max error {e6}");
     }
 
     #[test]
