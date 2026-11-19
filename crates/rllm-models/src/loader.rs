@@ -157,6 +157,7 @@ impl<B: Backend> LlamaModel<B> {
             layers.push(LlamaDecoderLayer {
                 input_layernorm: norm(&p("attn_norm"))?,
                 self_attn: LlamaAttention {
+                    qkv_proj: None,
                     q_proj: weight(&p("attn_q"), &[h, h])?,
                     k_proj: weight(&p("attn_k"), &[kv_dim, h])?,
                     v_proj: weight(&p("attn_v"), &[kv_dim, h])?,
@@ -164,6 +165,7 @@ impl<B: Backend> LlamaModel<B> {
                 },
                 post_attention_layernorm: norm(&p("ffn_norm"))?,
                 mlp: LlamaMlp {
+                    gate_up_proj: None,
                     gate_proj: weight(&p("ffn_gate"), &[inter, h])?,
                     up_proj: weight(&p("ffn_up"), &[inter, h])?,
                     down_proj: weight(&p("ffn_down"), &[h, inter])?,
@@ -197,7 +199,7 @@ impl<B: Backend> LlamaModel<B> {
             config.max_position_embeddings
         );
 
-        Ok(LlamaModel {
+        let mut model = LlamaModel {
             config,
             backend,
             embed_tokens,
@@ -207,7 +209,9 @@ impl<B: Backend> LlamaModel<B> {
             cos_table,
             sin_table,
             kv_cache: Default::default(),
-        })
+        };
+        model.fuse_projections()?;
+        Ok(model)
     }
 }
 

@@ -46,6 +46,7 @@ fn model(dtype: DType) -> LlamaModel<CpuBackend> {
                 *w = quantize(w, dtype);
             }
         }
+        m.fuse_projections().unwrap();
     }
     m
 }
@@ -60,7 +61,10 @@ fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
 /// (matrix-vector kernel), comparing logits at every step. The CPU reference always
 /// runs batches of 32+ rows (and requests logits for every row) so that it, like Metal,
 /// uses F32 activations; single-row CPU decode would quantize activations to Q8.
-fn check(dtype: DType, tol: f32) {
+/// `prefill_tol` is looser for quantized weights: the Metal prefill GEMM stores
+/// dequantized weights as half precision in threadgroup memory (as llama.cpp's Metal
+/// backend does), whereas the CPU reference uses F32.
+fn check(dtype: DType, tol: f32, prefill_tol: f32) {
     if !MetalLlama::is_available() {
         eprintln!("skipping: no Metal device");
         return;
@@ -83,7 +87,7 @@ fn check(dtype: DType, tol: f32) {
     let rows: Vec<usize> = (0..la + lb).collect();
     let batch = ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &tables, logits_rows: &rows };
     let d = max_rel_diff(&gpu.forward_cached(&batch).unwrap(), &cpu.forward_cached(&batch).unwrap());
-    assert!(d < tol, "{dtype:?} prefill: relative diff {d}");
+    assert!(d < prefill_tol, "{dtype:?} prefill: relative diff {d}");
 
     // Decode: compare Metal against a CPU *prefill* of the full sequence so that both
     // use F32 activations (single-row CPU decode quantizes activations).
@@ -110,15 +114,15 @@ fn check(dtype: DType, tol: f32) {
 
 #[test]
 fn metal_matches_cpu_f32() {
-    check(DType::F32, 1e-4);
+    check(DType::F32, 1e-4, 1e-4);
 }
 
 #[test]
 fn metal_matches_cpu_q8_0() {
-    check(DType::Q8_0, 1e-4);
+    check(DType::Q8_0, 1e-4, 1e-3);
 }
 
 #[test]
 fn metal_matches_cpu_q4_0() {
-    check(DType::Q4_0, 1e-4);
+    check(DType::Q4_0, 1e-4, 1e-3);
 }

@@ -18,6 +18,27 @@ pub fn sgemm_nt(a: &[f32], w: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
     }
 }
 
+/// `C[:, j0..j0 + nc] = A[M, K] · W[nc, K]ᵀ`, where `C` is row-major with leading
+/// dimension `ldc` (used to fill a column block of a wider output).
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_nt_cols(a: &[f32], w: &[f32], c: &mut [f32], m: usize, k: usize, nc: usize, j0: usize, ldc: usize) {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(w.len(), nc * k);
+    debug_assert!(c.len() >= (m - 1) * ldc + j0 + nc);
+    #[cfg(target_os = "macos")]
+    {
+        accelerate::sgemm_nt_ld(a, w, &mut c[j0..], m, k, nc, ldc);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut tmp = vec![0f32; m * nc];
+        crate::ops::gemm::gemm_nt_f32(a, w, &mut tmp, m, k, nc);
+        for (i, row) in tmp.chunks_exact(nc).enumerate() {
+            c[i * ldc + j0..i * ldc + j0 + nc].copy_from_slice(row);
+        }
+    }
+}
+
 /// Whether [`sgemm_nt`] uses a vendor BLAS.
 pub const HAS_VENDOR_BLAS: bool = cfg!(target_os = "macos");
 
@@ -45,6 +66,17 @@ mod accelerate {
             c: *mut f32,
             ldc: i32,
         );
+    }
+
+    pub fn sgemm_nt_ld(a: &[f32], w: &[f32], c: &mut [f32], m: usize, k: usize, n: usize, ldc: usize) {
+        assert!(m <= i32::MAX as usize && n <= i32::MAX as usize && k <= i32::MAX as usize && ldc >= n);
+        // SAFETY: a is m*k, w is n*k, c holds (m-1)*ldc + n elements (checked by caller).
+        unsafe {
+            cblas_sgemm(
+                ROW_MAJOR, NO_TRANS, TRANS, m as i32, n as i32, k as i32, 1.0, a.as_ptr(), k as i32,
+                w.as_ptr(), k as i32, 0.0, c.as_mut_ptr(), ldc as i32,
+            );
+        }
     }
 
     pub fn sgemm_nt(a: &[f32], w: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {

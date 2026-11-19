@@ -3,7 +3,7 @@ use crate::ops::{
     gemm::{gemm_f32, gemm_nt_f32},
     norm::rms_norm_f32,
     paged_attn::paged_attention_kv_group,
-    blas::sgemm_nt,
+    blas::{sgemm_nt, sgemm_nt_cols},
     qdot::{gemv_quantized, linear_quantized},
     quant::{dequantize_q4_0, dequantize_q8_0, gemv_q4_0_f32, gemv_q8_0_f32},
     rope::rope_f32,
@@ -18,6 +18,10 @@ use rllm_core::{
     shape::Shape,
     tensor::Tensor,
 };
+
+/// Weight rows dequantized per GEMM call in the batched path (swept 128..n on an M4:
+/// 2048 was best; smaller chunks pay per-call GEMM overhead).
+const DEQUANT_CHUNK_ROWS: usize = 2048;
 
 /// Batches with at least this many rows use dequantized-weight F32 GEMM instead of
 /// integer dot products (llama.cpp uses the same cut-over for its BLAS path).
@@ -143,16 +147,25 @@ impl Backend for CpuBackend {
         if m >= BATCHED_F32_MIN_ROWS {
             // Large batches (prefill): dequantize the weight and use an F32 GEMM, as
             // llama.cpp's CPU backend does for batches of 32+ rows.
-            let mut wf = vec![0f32; n * k];
+            // The weight is processed in row chunks small enough to stay in cache between
+            // dequantization and the GEMM that consumes them.
             let row_bytes = w.dtype().storage_bytes(k);
-            wf.par_chunks_mut(k).zip(w_bytes.par_chunks(row_bytes)).for_each(|(dst, src)| {
-                if is_q8 {
-                    dequantize_q8_0(src, dst);
-                } else {
-                    dequantize_q4_0(src, dst);
-                }
-            });
-            sgemm_nt(x_slice, &wf, out_slice, m, k, n);
+            let chunk = DEQUANT_CHUNK_ROWS.min(n);
+            let mut wf = vec![0f32; chunk * k];
+            let mut j0 = 0;
+            while j0 < n {
+                let nc = chunk.min(n - j0);
+                let src = &w_bytes[j0 * row_bytes..(j0 + nc) * row_bytes];
+                wf[..nc * k].par_chunks_mut(k).zip(src.par_chunks(row_bytes)).for_each(|(dst, src)| {
+                    if is_q8 {
+                        dequantize_q8_0(src, dst);
+                    } else {
+                        dequantize_q4_0(src, dst);
+                    }
+                });
+                sgemm_nt_cols(x_slice, &wf[..nc * k], out_slice, m, k, nc, j0, n);
+                j0 += nc;
+            }
         } else if m == 1 {
             // Decode: activations quantized to Q8, integer dot products.
             gemv_quantized(is_q8, w_bytes, x_slice, out_slice, n, k);

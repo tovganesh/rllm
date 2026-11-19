@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 rllm-core = { workspace = true }
 rllm-models = { workspace = true }
+rllm-backend-cpu = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
 half.workspace = true

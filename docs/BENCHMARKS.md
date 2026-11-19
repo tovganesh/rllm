@@ -22,7 +22,61 @@ Checked against llama.cpp on SmolLM2-135M-Instruct (`crates/rllm-models/tests/re
 
 Exact token parity across engines is only expected where both use the same arithmetic. llama.cpp quantizes activations to Q8 for decode and small batches but uses F32 BLAS for batches of 32+ tokens, and its Metal backend never quantizes activations; rllm follows the CPU behaviour. Near-tied tokens can flip between these paths, so perplexity is the primary cross-engine check.
 
-### Throughput
+### Head-to-head on an Apple M4 (latest)
+
+`python3 scripts/bench_vs_llamacpp.py --device {cpu,metal} <models>`: llama-bench (`-ngl 0` / `-ngl 99`) vs `rllm bench --model`, pp = one forward pass over N tokens, tg = per-token decode, 3 repetitions, 4 CPU threads. Ratios above 1.00x mean rllm is faster. Single runs vary by a few percent (llama.cpp's Metal tg128 on SmolLM2 ranged 283–347 tok/s across runs).
+
+| model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
+| --- | --- | --- | ---: | ---: | ---: |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | pp128 | 1,935 | 2,993 | 1.55x |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | pp512 | 1,304 | 2,324 | 1.78x |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | tg128 | 401 | 372 | 0.93x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp128 | 1,961 | 2,949 | 1.50x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp512 | 1,320 | 2,287 | 1.73x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | tg128 | 555 | 417 | 0.75x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp128 | 1,381 | 3,050 | 2.21x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp512 | 1,113 | 2,300 | 2.07x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | tg128 | 447 | 374 | 0.84x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | pp128 | 1,207 | 3,048 | 2.53x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | pp512 | 1,239 | 2,307 | 1.86x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | tg128 | 131 | 121 | 0.92x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 | 469 | 410 | 0.87x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 | 391 | 520 | 1.33x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 | 54 | 53 | 0.98x |
+| SmolLM2-135M-Instruct-Q8_0 | metal | pp128 | 9,916 | 7,640 | 0.77x |
+| SmolLM2-135M-Instruct-Q8_0 | metal | pp512 | 10,858 | 8,162 | 0.75x |
+| SmolLM2-135M-Instruct-Q8_0 | metal | tg128 | 347 | 303 | 0.87x |
+| SmolLM2-135M-Instruct-Q4_0.requant | metal | pp128 | 10,193 | 7,320 | 0.72x |
+| SmolLM2-135M-Instruct-Q4_0.requant | metal | pp512 | 11,058 | 7,756 | 0.70x |
+| SmolLM2-135M-Instruct-Q4_0.requant | metal | tg128 | 350 | 303 | 0.87x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp128 | 9,518 | 7,632 | 0.80x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp512 | 10,365 | 8,146 | 0.79x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | tg128 | 349 | 296 | 0.85x |
+| SmolLM2-135M-Instruct-F16.requant | metal | pp128 | 10,129 | 7,426 | 0.73x |
+| SmolLM2-135M-Instruct-F16.requant | metal | pp512 | 11,361 | 8,260 | 0.73x |
+| SmolLM2-135M-Instruct-F16.requant | metal | tg128 | 223 | 221 | 0.99x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 | 1,604 | 1,323 | 0.82x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 | 1,657 | 1,388 | 0.84x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 | 71 | 69 | 0.97x |
+
+**Where rllm is ahead:** CPU prompt processing in every format (1.3–2.5x).
+**At parity (within ~3%):** CPU decode on Llama-3.2-1B, Metal decode on Llama-3.2-1B and on F16 weights.
+**Behind:**
+- Metal prompt processing, 0.70–0.84x. The quantized GEMM (64x64 tiles, half-precision k-major weight tiles) plateaued here after A/B testing nine variants; the remaining gap is inside the k-loop.
+- CPU decode of 4-bit weights, Q4_0 0.75x and Q4_K_M 0.84x. llama.cpp repacks Q4_0 weights for wider kernels, and runs K-quants natively at ~4.5 bits per weight while rllm converts them to Q8_0 (8.5 bits).
+- CPU prompt processing on 1B at 128 tokens, 0.87x (Accelerate GEMM efficiency at small M).
+
+**What changed in this round** (all measured, with interleaved A/B runs for decisions):
+1. Metal quantized GEMM: 32x32 F32 tiles → 64x64 tiles with half-precision k-major weight tiles (1B pp512 996 → 1,388 tok/s). Rejected after A/B: register prefetching, half-precision activations, 8 simdgroups, a transposed Cᵀ formulation (3.6x slower), and a conflict-free weight-write mapping.
+2. Metal: Q/K/V and gate/up fused into single matrices, a single RoPE dispatch, and residual adds folded into the output projections (17 → 10 dispatches per layer). A first version initialised GEMM accumulators from `y` and was 3x slower (register spills); the accumulate is now a staged epilogue.
+3. Metal: F16 weights stay F16 (decode 136 → 221 tok/s on F16 files).
+4. CPU: fused Q/K/V and gate/up for batches under 32 rows (decode +6%), zero-copy via row views; prefill keeps separate projections (fusion cost 10% there).
+5. CPU: 2,048-row chunked dequantize+GEMM for prefill (1B pp128 +6%).
+6. CPU: four-row Q4_0 decode kernel with the nibble offset folded into activation sums (+5–7%); not used for Q8_0, where it was slower.
+
+### Earlier measurements
+
+#### Throughput
 
 Apple M4 (4 performance + 6 efficiency cores), macOS, CPU only, 4 threads for both engines, SmolLM2-135M-Instruct. llama.cpp: `llama-bench -ngl 0 -p 128,512 -n 128 -r 3` (BLAS via Accelerate). rllm: prefill = `rllm perplexity --ctx {128,512}` (one forward pass per chunk), decode = `rllm generate --raw --max-tokens 128`, median of 3. Tokens/s:
 
@@ -47,7 +101,7 @@ Progress during P3 on the 41-token chat prompt (Q8_0): prefill 340 → ~1,050 to
 
 **Remaining gaps:** decode is 15–35% behind llama.cpp (it repacks Q4_0 weights for wider SIMD kernels and uses native K-quant kernels and an F16 KV cache). Non-Apple platforms have no vendor BLAS (portable GEMM fallback) and x86 has no SIMD int8 kernels yet (portable scalar fallback). Measurements from this single machine are snapshots, not a formal benchmark; background load affects them noticeably.
 
-### Metal (Apple GPU)
+#### Metal (Apple GPU, before this round)
 
 Apple M4 (10-core GPU), `rllm --device metal bench --model … --prompt-tokens {128,512} --generate-tokens 128` (median of 3) vs `llama-bench -ngl 99`. Tokens/s:
 
