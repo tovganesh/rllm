@@ -24,6 +24,7 @@ use tracing::info;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WKind {
     F32,
+    F16,
     Q8,
     Q4,
 }
@@ -32,6 +33,7 @@ impl WKind {
     fn suffix(self) -> &'static str {
         match self {
             WKind::F32 => "f32",
+            WKind::F16 => "f16",
             WKind::Q8 => "q8_0",
             WKind::Q4 => "q4_0",
         }
@@ -116,7 +118,8 @@ impl MetalLlama {
             .map_err(|e| RllmError::BackendError(format!("Metal shader compilation failed: {e}")))?;
         let mut pipelines = HashMap::new();
         let names = [
-            "mv_f32", "mv_q8_0", "mv_q4_0", "mm_f32", "mm_q8_0", "mm_q4_0", "embed_f32", "embed_q8_0", "embed_q4_0",
+            "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16", "embed_f32", "embed_q8_0",
+            "embed_q4_0", "embed_f16",
             "rms_norm", "rope", "kv_write", "attention", "attention_tile", "swiglu",
         ];
         for name in names {
@@ -142,6 +145,15 @@ impl MetalLlama {
                     return Err(RllmError::BackendError(format!("Metal executor does not support {other} weights")))
                 }
             };
+            // F32 weights that round-trip exactly through F16 (e.g. loaded from an F16
+            // GGUF) are stored as F16: half the memory traffic, bit-identical values.
+            if kind == WKind::F32 {
+                let vals = t.as_f32_slice()?;
+                let halves: Vec<half::f16> = vals.iter().map(|&v| half::f16::from_f32(v)).collect();
+                if halves.iter().zip(vals).all(|(h, &v)| h.to_f32() == v) {
+                    return Ok(Weight { buf: new_buffer_with(&device, as_bytes(&halves)), kind: WKind::F16, rows: dims[0], cols: dims[1] });
+                }
+            }
             let bytes = &t.storage().as_cpu()?.as_bytes()[t.offset()..];
             let len = t.dtype().storage_bytes(t.numel());
             Ok(Weight {
@@ -337,6 +349,8 @@ impl MetalLlama {
             let p = self.pipeline(&format!("mv_{}", w.kind.suffix()));
             e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
         } else if w.kind == WKind::F32 {
+            // Full-precision weights keep the F32 tile kernel (the large-tile kernel stores
+            // weights as half precision, which is lossless only for F16/quantized weights).
             e.groups(self.pipeline("mm_f32"), &args, ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1), 128);
         } else {
             let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));

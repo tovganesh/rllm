@@ -20,10 +20,16 @@ struct block_q4_0 { half d; uchar qs[16]; };
 struct WF32 {};
 struct WQ8 {};
 struct WQ4 {};
+struct WF16 {};
 
 inline void load8(device const uchar* w, uint row, uint k, uint ib, uint q, thread float* out, WF32) {
     device const float* r = (device const float*)w + (ulong)row * k + ib * 32 + q * 8;
     for (uint j = 0; j < 8; ++j) out[j] = r[j];
+}
+inline void load8(device const uchar* w, uint row, uint k, uint ib, uint q, thread float* out, WF16) {
+    device const half4* r = (device const half4*)((device const half*)w + (ulong)row * k + ib * 32 + q * 8);
+    const float4 a = float4(r[0]), b = float4(r[1]);
+    for (uint j = 0; j < 4; ++j) { out[j] = a[j]; out[4 + j] = b[j]; }
 }
 inline void load8(device const uchar* w, uint row, uint k, uint ib, uint q, thread float* out, WQ8) {
     device const block_q8_0* b = (device const block_q8_0*)w + (ulong)row * (k / 32) + ib;
@@ -90,6 +96,7 @@ kernel void NAME(LINEAR_ARGS, uint tg [[threadgroup_position_in_grid]], \
 MV_KERNEL(mv_f32, WF32)
 MV_KERNEL(mv_q8_0, WQ8)
 MV_KERNEL(mv_q4_0, WQ4)
+MV_KERNEL(mv_f16, WF16)
 
 constant constexpr uint BK = 32;
 
@@ -234,6 +241,7 @@ kernel void NAME(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]], \
 
 MMQ_KERNEL(mm_q8_0, WQ8)
 MMQ_KERNEL(mm_q4_0, WQ4)
+MMQ_KERNEL(mm_f16, WF16)
 
 // ── embedding lookup: out[r, c] = table[ids[r], c] ──
 template <typename T>
@@ -251,6 +259,7 @@ kernel void NAME(device const uchar* table [[buffer(0)]], device const uint* ids
 EMBED_KERNEL(embed_f32, WF32)
 EMBED_KERNEL(embed_q8_0, WQ8)
 EMBED_KERNEL(embed_q4_0, WQ4)
+EMBED_KERNEL(embed_f16, WF16)
 
 // ── RMSNorm: one threadgroup (256 threads) per output row; optional row gather ──
 kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
