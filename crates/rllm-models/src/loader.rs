@@ -49,6 +49,8 @@ pub struct LoadOptions {
     /// weight versus 32 for F32 and runs on the integer decode kernels; its rounding
     /// error is far below the original 4–6-bit quantization error. Default: true.
     pub requantize_to_q8_0: bool,
+    /// KV cache storage type: `F16` (default, as in llama.cpp) or `F32`.
+    pub kv_dtype: DType,
 }
 
 impl Default for LoadOptions {
@@ -56,6 +58,7 @@ impl Default for LoadOptions {
         Self {
             max_context: None,
             requantize_to_q8_0: true,
+            kv_dtype: DType::F16,
         }
     }
 }
@@ -213,6 +216,7 @@ impl<B: Backend> LlamaModel<B> {
             lm_head,
             cos_table,
             sin_table,
+            kv_dtype: opts.kv_dtype,
             kv_cache: Default::default(),
         };
         model.fuse_projections()?;

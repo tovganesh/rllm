@@ -98,6 +98,16 @@ fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
 /// activation tiles and the prefill attention stages keys/values as half (as llama.cpp's
 /// Metal backend does), whereas the CPU reference uses F32.
 fn check(dtype: DType, tol: f32, prefill_tol: f32) {
+    check_kv(dtype, DType::F32, tol, prefill_tol);
+}
+
+/// As [`check`], with both executors using a `kv` KV cache.
+fn check_kv(dtype: DType, kv: DType, tol: f32, prefill_tol: f32) {
+    let model = |dtype| {
+        let mut m = model(dtype);
+        m.kv_dtype = kv;
+        m
+    };
     if !MetalLlama::is_available() {
         eprintln!("skipping: no Metal device");
         return;
@@ -198,4 +208,64 @@ fn metal_prefix_block_reuse_matches_full_prefill() {
     let fresh = run(&b, 0, vec![0, 2, 4]);
     let d = max_rel_diff(&reused, &fresh);
     assert!(d < 1e-3, "prefix reuse: relative diff {d}");
+}
+
+/// F16 KV cache (the default for loaded models) on both executors. Both round keys and
+/// values to half precision at the same point, so they still agree closely.
+#[test]
+fn metal_matches_cpu_q8_0_f16_kv() {
+    check_kv(DType::Q8_0, DType::F16, 1e-3, 1e-3);
+}
+
+/// Decode at long context, where Metal splits each row's keys over several threadgroups
+/// (chunks of 256) and combines the partials, batched with a short sequence whose
+/// later chunks are empty. Compared with fresh CPU prefills of the full sequences.
+#[test]
+fn metal_split_context_decode_matches_cpu() {
+    if !MetalLlama::is_available() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let cfg = LlamaConfig { max_position_embeddings: 1024, ..config() };
+    let make = || {
+        let mut m = LlamaModel::new_seeded(cfg.clone(), Arc::new(CpuBackend), 11).unwrap();
+        m.kv_dtype = DType::F16;
+        m
+    };
+    let gpu = MetalLlama::from_cpu_model(&make()).unwrap();
+    let block = 16;
+    gpu.init_kv_cache(64, block).unwrap();
+    let long: Vec<u32> = (0..700u32).map(|i| (i * 31 + 7) % 96).collect();
+    let short: Vec<u32> = (0..20u32).map(|i| (i * 13 + 1) % 96).collect();
+    let ta = BlockTable { block_size: block, block_ids: (0..45).collect() };
+    let tb = BlockTable { block_size: block, block_ids: (50..52).collect() };
+    for (toks, t) in [(&long, &ta), (&short, &tb)] {
+        let p: Vec<usize> = (0..toks.len()).collect();
+        gpu.forward_cached(&ForwardBatch { tokens: toks, positions: &p, block_tables: &vec![t.clone(); toks.len()], logits_rows: &[0] })
+            .unwrap();
+    }
+    // One decode step for both sequences in the same batch.
+    let (na, nb) = (5u32, 9u32);
+    let g = gpu
+        .forward_cached(&ForwardBatch {
+            tokens: &[na, nb],
+            positions: &[long.len(), short.len()],
+            block_tables: &[ta.clone(), tb.clone()],
+            logits_rows: &[0, 1],
+        })
+        .unwrap();
+    let vocab = cfg.vocab_size;
+    for (row, (toks, next)) in [(&long, na), (&short, nb)].into_iter().enumerate() {
+        let mut all = toks.clone();
+        all.push(next);
+        let cpu = make();
+        cpu.init_kv_cache(64, block).unwrap();
+        let p: Vec<usize> = (0..all.len()).collect();
+        let t = BlockTable { block_size: block, block_ids: (0..all.len().div_ceil(block)).collect() };
+        let c = cpu
+            .forward_cached(&ForwardBatch { tokens: &all, positions: &p, block_tables: &vec![t; all.len()], logits_rows: &[all.len() - 1] })
+            .unwrap();
+        let d = max_rel_diff(&g[row * vocab..(row + 1) * vocab], &c);
+        assert!(d < 2e-3, "row {row} (context {}): relative diff {d}", all.len());
+    }
 }

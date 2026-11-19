@@ -518,89 +518,111 @@ kernel void rope(device float* x [[buffer(0)]], device const float* cos_t [[buff
 }
 
 // ── write K/V rows (from the fused QKV buffer) into the paged cache ──
-kernel void kv_write(device const float* qkv [[buffer(0)]], constant uint& k_off [[buffer(1)]],
-                     constant uint& v_off [[buffer(2)]], constant uint& stride [[buffer(3)]],
-                     device float* kc [[buffer(4)]], device float* vc [[buffer(5)]],
-                     device const uint* tables [[buffer(6)]], device const uint* table_off [[buffer(7)]],
-                     device const uint* pos [[buffer(8)]], constant uint& nkv [[buffer(9)]],
-                     constant uint& hd [[buffer(10)]], constant uint& bs [[buffer(11)]],
-                     uint3 gid [[thread_position_in_grid]]) {
+template <typename KVT>
+inline void kv_write_impl(device const float* qkv, uint k_off, uint v_off, uint stride, device KVT* kc,
+                          device KVT* vc, device const uint* tables, device const uint* table_off,
+                          device const uint* pos, uint nkv, uint hd, uint bs, uint3 gid) {
     const uint d = gid.x, h = gid.y, r = gid.z;
     const uint p = pos[r];
     const uint phys = tables[table_off[r] + p / bs];
     const ulong dst = (ulong)phys * nkv * bs * hd + (ulong)h * bs * hd + (p % bs) * hd + d;
     device const float* row = qkv + (ulong)r * stride + h * hd + d;
-    kc[dst] = row[k_off];
-    vc[dst] = row[v_off];
+    kc[dst] = KVT(row[k_off]);
+    vc[dst] = KVT(row[v_off]);
 }
+// KV cache element type: `_f16` (default) or `_f32` kernels.
+#define KV_WRITE_KERNEL(NAME, KVT) \
+kernel void NAME(device const float* qkv [[buffer(0)]], constant uint& k_off [[buffer(1)]], \
+                 constant uint& v_off [[buffer(2)]], constant uint& stride [[buffer(3)]], \
+                 device KVT* kc [[buffer(4)]], device KVT* vc [[buffer(5)]], \
+                 device const uint* tables [[buffer(6)]], device const uint* table_off [[buffer(7)]], \
+                 device const uint* pos [[buffer(8)]], constant uint& nkv [[buffer(9)]], \
+                 constant uint& hd [[buffer(10)]], constant uint& bs [[buffer(11)]], \
+                 uint3 gid [[thread_position_in_grid]]) { \
+    kv_write_impl<KVT>(qkv, k_off, v_off, stride, kc, vc, tables, table_off, pos, nkv, hd, bs, gid); }
+KV_WRITE_KERNEL(kv_write_f32, float)
+KV_WRITE_KERNEL(kv_write_f16, half)
 
-#define ATTN_ARGS \
-    device const float* q [[buffer(0)]], device const float* kc [[buffer(1)]], \
-    device const float* vc [[buffer(2)]], device float* out [[buffer(3)]], \
+#define ATTN_ARGS(KVT) \
+    device const float* q [[buffer(0)]], device const KVT* kc [[buffer(1)]], \
+    device const KVT* vc [[buffer(2)]], device float* out [[buffer(3)]], \
     device const uint* tables [[buffer(4)]], device const uint* table_off [[buffer(5)]], \
     device const uint* pos [[buffer(6)]], constant uint& nq [[buffer(7)]], \
     constant uint& nkv [[buffer(8)]], constant uint& hd [[buffer(9)]], \
     constant uint& bs [[buffer(10)]], constant float& scale [[buffer(11)]], \
     constant uint& q_stride [[buffer(13)]]
 
-// ── causal paged attention, one threadgroup (4 simdgroups) per (query head, row) ──
-// Positions are processed in tiles of 32: each lane scores one position against the
-// query (held in threadgroup memory), the tile updates an online softmax, and values
-// are accumulated with each lane owning hd/32 output dimensions. Simdgroups take
-// interleaved tiles and are merged at the end. Used for decode rows.
-// The head dimension is a template parameter so the per-lane accumulators stay in
-// registers.
-template <uint HD>
-inline void attn_row_impl(device const float* q, device const float* kc, device const float* vc,
+// ── causal paged attention for decode rows, split over the context ("flash decoding") ──
+// One threadgroup (4 simdgroups) per (query head, row, context chunk of `chunk`
+// positions). Positions are processed in tiles of 32: each lane scores one position
+// (keys read 4 values at a time against the query in threadgroup memory), the tile
+// updates an online softmax, and values are accumulated with each lane owning HD/32
+// output dimensions. Simdgroups take interleaved tiles and are merged at the end. With
+// one chunk the result is written directly; otherwise each chunk writes its partial
+// (max, sum, unnormalised output) and `attn_reduce` combines them. Splitting keeps the
+// GPU busy for single-sequence decode at long context (one chunk per head would be
+// only `nq` threadgroups). The head dimension is a template parameter so the per-lane
+// accumulators stay in registers.
+template <uint HD, typename KVT>
+inline void attn_row_impl(device const float* q, device const KVT* kc, device const KVT* vc,
                           device float* out, device const uint* tables, device const uint* table_off,
                           device const uint* pos, uint nq, uint nkv, uint bs, float scale, uint q_stride,
-                          device const uint* row_list, threadgroup float* qs, threadgroup float* tm,
-                          threadgroup float* ts, threadgroup float* tacc, uint2 tg, uint sg, uint lane) {
+                          device const uint* row_list, device float* part, uint chunk, uint nsplit,
+                          threadgroup float* qs, threadgroup float* tm, threadgroup float* ts,
+                          threadgroup float* tacc, uint3 tg, uint sg, uint lane) {
     constexpr uint NSG = 4;
-    constexpr uint hd = HD;
+    constexpr uint dpl = HD / 32;
 
-    const uint head = tg.x, r = row_list[tg.y];
+    const uint head = tg.x, slot = tg.y, split = tg.z, r = row_list[slot];
     const uint kvh = head / (nq / nkv);
     const uint ctx = pos[r] + 1;
-    constexpr uint dpl = HD / 32;
-    const ulong block_stride = (ulong)nkv * bs * hd;
-    const ulong head_off = (ulong)kvh * bs * hd;
+    const uint begin = split * chunk, end = min(ctx, begin + chunk);
+    device float* pout = part + ((ulong)(slot * nq + head) * nsplit + split) * (HD + 2);
+    if (begin >= ctx) {
+        // This row's context is shorter than the longest in the batch: empty partial.
+        if (sg == 0 && lane == 0) { pout[0] = -INFINITY; pout[1] = 0.0f; }
+        if (sg == 0) for (uint i = 0; i < dpl; ++i) pout[2 + lane + i * 32] = 0.0f;
+        return;
+    }
+    const ulong block_stride = (ulong)nkv * bs * HD;
+    const ulong head_off = (ulong)kvh * bs * HD;
     device const uint* table = tables + table_off[r];
 
-    device const float* qr = q + (ulong)r * q_stride + head * hd;
-    for (uint i = sg * 32 + lane; i < hd; i += NSG * 32) qs[i] = qr[i] * scale;
+    device const float* qr = q + (ulong)r * q_stride + head * HD;
+    for (uint i = sg * 32 + lane; i < HD; i += NSG * 32) qs[i] = qr[i] * scale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const float4* q4 = (threadgroup const float4*)qs;
 
     float m = -INFINITY, s = 0.0f;
     float acc[dpl];
     for (uint i = 0; i < dpl; ++i) acc[i] = 0.0f;
 
-    for (uint t0 = sg * 32; t0 < ctx; t0 += NSG * 32) {
+    for (uint t0 = begin + sg * 32; t0 < end; t0 += NSG * 32) {
         const uint t = t0 + lane;
         float score = -INFINITY;
-        if (t < ctx) {
-            device const float* kr = kc + table[t / bs] * block_stride + head_off + (t % bs) * hd;
+        if (t < end) {
+            device const vec<KVT, 4>* kr = (device const vec<KVT, 4>*)(kc + table[t / bs] * block_stride + head_off + (t % bs) * HD);
             float d = 0.0f;
-            for (uint j = 0; j < hd; ++j) d += qs[j] * kr[j];
+            for (uint j = 0; j < HD / 4; ++j) d += dot(q4[j], float4(kr[j]));
             score = d;
         }
         const float mn = max(m, simd_max(score));
         const float corr = exp(m - mn);
-        const float p = (t < ctx) ? exp(score - mn) : 0.0f;
+        const float p = (t < end) ? exp(score - mn) : 0.0f;
         s = s * corr + simd_sum(p);
         for (uint i = 0; i < dpl; ++i) acc[i] *= corr;
-        const uint cnt = min(32u, ctx - t0);
+        const uint cnt = min(32u, end - t0);
         for (uint u = 0; u < cnt; ++u) {
             const float pu = simd_shuffle(p, u);
             const uint tu = t0 + u;
-            device const float* vr = vc + table[tu / bs] * block_stride + head_off + (tu % bs) * hd;
-            for (uint i = 0; i < dpl; ++i) acc[i] += pu * vr[lane + i * 32];
+            device const KVT* vr = vc + table[tu / bs] * block_stride + head_off + (tu % bs) * HD;
+            for (uint i = 0; i < dpl; ++i) acc[i] += pu * float(vr[lane + i * 32]);
         }
         m = mn;
     }
 
     if (lane == 0) { tm[sg] = m; ts[sg] = s; }
-    for (uint i = 0; i < dpl; ++i) tacc[sg * hd + lane + i * 32] = acc[i];
+    for (uint i = 0; i < dpl; ++i) tacc[sg * HD + lane + i * 32] = acc[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
         float M = -INFINITY;
@@ -610,26 +632,52 @@ inline void attn_row_impl(device const float* q, device const float* kc, device 
         for (uint i = 0; i < dpl; ++i) {
             const uint dim = lane + i * 32;
             float o = 0.0f;
-            for (uint g = 0; g < NSG; ++g) o += tacc[g * hd + dim] * exp(tm[g] - M);
-            out[((ulong)r * nq + head) * hd + dim] = o / S;
+            for (uint g = 0; g < NSG; ++g) o += tacc[g * HD + dim] * exp(tm[g] - M);
+            if (nsplit == 1) out[((ulong)r * nq + head) * HD + dim] = o / S;
+            else pout[2 + dim] = o;
         }
+        if (nsplit > 1 && lane == 0) { pout[0] = M; pout[1] = S; }
     }
 }
 
-#define ATTN_ROW_KERNEL(HDV) \
-kernel void attention_hd##HDV(ATTN_ARGS, device const uint* row_list [[buffer(12)]], \
-                              uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+#define ATTN_ROW_KERNEL(HDV, SFX, KVT) \
+kernel void attention_hd##HDV##SFX(ATTN_ARGS(KVT), device const uint* row_list [[buffer(12)]], \
+                              device float* part [[buffer(14)]], constant uint& chunk [[buffer(15)]], \
+                              constant uint& nsplit [[buffer(16)]], \
+                              uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
                               uint lane [[thread_index_in_simdgroup]]) { \
     threadgroup float qs[HDV]; \
     threadgroup float tm[4]; \
     threadgroup float ts[4]; \
     threadgroup float tacc[4 * HDV]; \
-    attn_row_impl<HDV>(q, kc, vc, out, tables, table_off, pos, nq, nkv, bs, scale, q_stride, row_list, qs, tm, ts, \
-                       tacc, tg, sg, lane); }
-ATTN_ROW_KERNEL(32)
-ATTN_ROW_KERNEL(64)
-ATTN_ROW_KERNEL(96)
-ATTN_ROW_KERNEL(128)
+    attn_row_impl<HDV, KVT>(q, kc, vc, out, tables, table_off, pos, nq, nkv, bs, scale, q_stride, row_list, part, \
+                            chunk, nsplit, qs, tm, ts, tacc, tg, sg, lane); }
+ATTN_ROW_KERNEL(32, _f32, float)
+ATTN_ROW_KERNEL(64, _f32, float)
+ATTN_ROW_KERNEL(96, _f32, float)
+ATTN_ROW_KERNEL(128, _f32, float)
+ATTN_ROW_KERNEL(32, _f16, half)
+ATTN_ROW_KERNEL(64, _f16, half)
+ATTN_ROW_KERNEL(96, _f16, half)
+ATTN_ROW_KERNEL(128, _f16, half)
+
+// ── combine split-context partials: one threadgroup (hd threads) per (head, row) ──
+kernel void attn_reduce(device const float* part [[buffer(0)]], device float* out [[buffer(1)]],
+                        device const uint* row_list [[buffer(2)]], constant uint& nq [[buffer(3)]],
+                        constant uint& hd [[buffer(4)]], constant uint& nsplit [[buffer(5)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint d [[thread_index_in_threadgroup]]) {
+    const uint head = tg.x, slot = tg.y, r = row_list[slot];
+    device const float* p = part + (ulong)(slot * nq + head) * nsplit * (hd + 2);
+    float M = -INFINITY;
+    for (uint s = 0; s < nsplit; ++s) M = max(M, p[s * (hd + 2)]);
+    float S = 0.0f, o = 0.0f;
+    for (uint s = 0; s < nsplit; ++s) {
+        const float w = exp(p[s * (hd + 2)] - M);
+        S += p[s * (hd + 2) + 1] * w;
+        o += p[s * (hd + 2) + 2 + d] * w;
+    }
+    out[((ulong)r * nq + head) * hd + d] = o / S;
+}
 
 // ── causal attention for a tile of up to 32 consecutive query rows of one sequence ──
 // One threadgroup (4 simdgroups x 8 rows) per (head, tile); prefill. Each step stages
@@ -644,8 +692,8 @@ ATTN_ROW_KERNEL(128)
 // `KV` is dynamic threadgroup memory: max(2 * KB * HD halves, 4 * 8 * HD floats).
 constant constexpr uint ATTN_KB = 32;
 
-template <uint HD>
-inline void attn_tile_impl(device const float* q, device const float* kc, device const float* vc,
+template <uint HD, typename KVT>
+inline void attn_tile_impl(device const float* q, device const KVT* kc, device const KVT* vc,
                            device float* out, device const uint* tables, device const uint* table_off,
                            device const uint* pos, uint nq, uint nkv, uint bs, float scale, uint q_stride,
                            device const uint2* tiles, threadgroup half* KV,
@@ -688,8 +736,8 @@ inline void attn_tile_impl(device const float* q, device const float* kc, device
             half4 kv = half4(0.0h), vv = half4(0.0h);
             if (t < nkeys) {
                 const ulong off = (ulong)table[t / bs] * block_stride + head_off + (t % bs) * HD + c4 * 4;
-                kv = half4(*(device const float4*)(kc + off));
-                vv = half4(*(device const float4*)(vc + off));
+                kv = half4(*(device const vec<KVT, 4>*)(kc + off));
+                vv = half4(*(device const vec<KVT, 4>*)(vc + off));
             }
             *(threadgroup half4*)(Ks + kr * HD + c4 * 4) = kv;
             *(threadgroup half4*)(Vs + kr * HD + c4 * 4) = vv;
@@ -779,20 +827,24 @@ inline void attn_tile_impl(device const float* q, device const float* kc, device
     }
 }
 
-#define ATTN_TILE_KERNEL(HDV) \
-kernel void attention_tile32_hd##HDV(ATTN_ARGS, device const uint2* tiles [[buffer(12)]], \
+#define ATTN_TILE_KERNEL(HDV, SFX, KVT) \
+kernel void attention_tile32_hd##HDV##SFX(ATTN_ARGS(KVT), device const uint2* tiles [[buffer(12)]], \
                                      threadgroup half* KV [[threadgroup(0)]], \
                                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
                                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
     threadgroup float Sbuf[4][8 * ATTN_KB]; \
     threadgroup half Pbuf[4][8 * ATTN_KB]; \
     threadgroup float Dbuf[4][64]; \
-    attn_tile_impl<HDV>(q, kc, vc, out, tables, table_off, pos, nq, nkv, bs, scale, q_stride, tiles, KV, \
+    attn_tile_impl<HDV, KVT>(q, kc, vc, out, tables, table_off, pos, nq, nkv, bs, scale, q_stride, tiles, KV, \
                         Sbuf, Pbuf, Dbuf, tg, tid, sg, lane); }
-ATTN_TILE_KERNEL(32)
-ATTN_TILE_KERNEL(64)
-ATTN_TILE_KERNEL(96)
-ATTN_TILE_KERNEL(128)
+ATTN_TILE_KERNEL(32, _f32, float)
+ATTN_TILE_KERNEL(64, _f32, float)
+ATTN_TILE_KERNEL(96, _f32, float)
+ATTN_TILE_KERNEL(128, _f32, float)
+ATTN_TILE_KERNEL(32, _f16, half)
+ATTN_TILE_KERNEL(64, _f16, half)
+ATTN_TILE_KERNEL(96, _f16, half)
+ATTN_TILE_KERNEL(128, _f16, half)
 
 // ── SwiGLU on the fused gate/up buffer: out[r, j] = silu(gu[r, j]) * gu[r, inter + j] ──
 kernel void swiglu(device const float* gu [[buffer(0)]], device float* out [[buffer(1)]],

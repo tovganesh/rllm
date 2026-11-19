@@ -39,6 +39,11 @@ struct Cli {
     #[arg(long, global = true, default_value = "cpu")]
     device: String,
 
+    /// KV cache storage type for the LLM: `f16` (default, as in llama.cpp: half the
+    /// memory and bandwidth) or `f32`.
+    #[arg(long, global = true, default_value = "f16")]
+    kv_dtype: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -216,6 +221,12 @@ async fn main() -> anyhow::Result<()> {
     let threads = rllm_backend_cpu::threads::init_thread_pool(cli.threads);
     tracing::info!("Using {threads} CPU worker threads");
     let device = LlmDevice::parse(&cli.device)?;
+    let kv_dtype = match cli.kv_dtype.as_str() {
+        "f16" => rllm_core::dtype::DType::F16,
+        "f32" => rllm_core::dtype::DType::F32,
+        other => anyhow::bail!("unknown --kv-dtype '{other}' (expected f16 or f32)"),
+    };
+    let _ = KV_DTYPE.set(kv_dtype);
 
     match cli.command {
         Commands::Serve {
@@ -250,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
                     let bundle = GgufBundle::load(
                         &model,
                         backend.clone(),
-                        &LoadOptions { max_context: Some(max_context), ..LoadOptions::default() },
+                        &load_opts(max_context),
                     )?;
                     model_name = std::path::Path::new(&model)
                         .file_stem()
@@ -406,7 +417,7 @@ async fn main() -> anyhow::Result<()> {
             let embedder = Arc::new(load_embedder(embedding_model.as_deref(), backend.clone())?);
             let generator = match model {
                 Some(path) => {
-                    let b = GgufBundle::load(&path, backend.clone(), &LoadOptions { max_context: Some(4096), ..LoadOptions::default() })?;
+                    let b = GgufBundle::load(&path, backend.clone(), &load_opts(4096))?;
                     let scheduler = ContinuousBatchScheduler::new(
                         SchedulerConfig {
                             max_batch_size: 1,
@@ -497,7 +508,7 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     let bundle = GgufBundle::load(
         &args.model,
         Arc::new(CpuBackend),
-        &LoadOptions { max_context: Some(args.max_context), ..LoadOptions::default() },
+        &load_opts(args.max_context),
     )?;
     let load_time = load_start.elapsed();
     let tokenizer = &bundle.tokenizer;
@@ -575,7 +586,7 @@ fn load_embedder(path: Option<&std::path::Path>, backend: Arc<CpuBackend>) -> an
 
 /// `rllm perplexity`: mirrors `llama-perplexity` so results can be compared directly.
 fn run_perplexity(model: &std::path::Path, file: &std::path::Path, ctx: usize, device: LlmDevice) -> anyhow::Result<()> {
-    let bundle = GgufBundle::load(model, Arc::new(CpuBackend), &LoadOptions { max_context: Some(ctx), ..LoadOptions::default() })?;
+    let bundle = GgufBundle::load(model, Arc::new(CpuBackend), &load_opts(ctx))?;
     let text = std::fs::read_to_string(file)?;
     let tokens = bundle.tokenizer.encode(&text, true, false);
     let bos = if bundle.tokenizer.add_bos { bundle.tokenizer.bos_token_id } else { None };
@@ -639,7 +650,7 @@ fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, depth: usize, r
     use rllm_models::ForwardBatch;
 
     let ctx = depth + pp.max(tg) + 1;
-    let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(ctx.max(16)), ..LoadOptions::default() })?;
+    let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &load_opts(ctx.max(16)))?;
     let vocab = bundle.model.config.vocab_size as u32;
     let lm = device.executor(bundle.model)?;
     let block = 16;
@@ -712,7 +723,7 @@ fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, depth: usize, r
 /// computed (warm prefix cache), versus a request with nothing cached (cold).
 fn run_prefix_bench(path: &std::path::Path, prompt: usize, shared: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
     anyhow::ensure!(shared < prompt, "--shared-prefix must be smaller than --prompt-tokens");
-    let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(prompt + 16), ..LoadOptions::default() })?;
+    let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &load_opts(prompt + 16))?;
     let vocab = bundle.model.config.vocab_size as u32;
     let lm = device.executor(bundle.model)?;
     let block_size = 16;
@@ -765,4 +776,16 @@ fn run_prefix_bench(path: &std::path::Path, prompt: usize, shared: usize, reps: 
     println!("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
     println!("| {name} | {} | {prompt} | {shared} | {cached} | {c:.1} | {w:.1} | {:.2}x |", lm.device_name(), c / w);
     Ok(())
+}
+
+/// KV cache storage type chosen with `--kv-dtype`.
+static KV_DTYPE: std::sync::OnceLock<rllm_core::dtype::DType> = std::sync::OnceLock::new();
+
+/// Load options for the LLM: context cap plus the `--kv-dtype` setting.
+fn load_opts(max_context: usize) -> LoadOptions {
+    LoadOptions {
+        max_context: Some(max_context),
+        kv_dtype: KV_DTYPE.get().copied().unwrap_or(rllm_core::dtype::DType::F16),
+        ..LoadOptions::default()
+    }
 }

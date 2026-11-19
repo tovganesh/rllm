@@ -5,6 +5,7 @@ use rllm_backend_cpu::ops::rope::precompute_rope_freqs;
 use crate::init::SyntheticInit;
 use rllm_core::{
     backend::{Backend, BlockTable},
+    dtype::DType,
     error::{Result, RllmError},
     shape::Shape,
     tensor::Tensor,
@@ -49,6 +50,10 @@ pub struct LlamaModel<B: Backend> {
     pub lm_head: Tensor,
     pub cos_table: Tensor,
     pub sin_table: Tensor,
+    /// Storage type of the KV cache allocated by [`crate::LanguageModel::init_kv_cache`]:
+    /// `F16` (default for loaded models, as in llama.cpp: half the memory and bandwidth)
+    /// or `F32`. Executors that wrap this model (e.g. Metal) follow it.
+    pub kv_dtype: DType,
     /// KV cache used by [`crate::LanguageModel::forward_cached`].
     pub(crate) kv_cache: std::sync::Mutex<crate::lm::KvCache>,
 }
@@ -114,6 +119,9 @@ impl<B: Backend> LlamaModel<B> {
             lm_head,
             cos_table,
             sin_table,
+            // Synthetic models keep an F32 cache so tests can compare against exact
+            // references; loaded models default to F16 (`LoadOptions::kv_dtype`).
+            kv_dtype: DType::F32,
             kv_cache: Default::default(),
         };
         model.fuse_projections()?;
@@ -333,37 +341,12 @@ impl<B: Backend> LlamaModel<B> {
             self.backend
                 .rope(&mut q, &mut k, &self.cos_table, &self.sin_table, batch.positions)?;
 
-            // Write every row's K and V into its sequence's physical cache slot.
+            // Write every row's K and V into its sequence's physical cache slot (the
+            // cache may be F32 or F16).
             let k_cache = &mut k_caches[layer_idx];
             let v_cache = &mut v_caches[layer_idx];
-            {
-                let k_slice = k.as_f32_slice()?;
-                let v_slice = v.as_f32_slice()?;
-                let k_cache_mut = k_cache.as_mut_f32_slice()?;
-                for (row, (&pos, bt)) in batch.positions.iter().zip(batch.block_tables).enumerate() {
-                    let block_stride = num_kv_heads * bt.block_size * head_dim;
-                    let phys_block_id = bt.block_ids[pos / bt.block_size];
-                    for kv_h in 0..num_kv_heads {
-                        let src = row * (num_kv_heads * head_dim) + kv_h * head_dim;
-                        let dst = phys_block_id * block_stride
-                            + kv_h * (bt.block_size * head_dim)
-                            + (pos % bt.block_size) * head_dim;
-                        k_cache_mut[dst..dst + head_dim].copy_from_slice(&k_slice[src..src + head_dim]);
-                    }
-                }
-                let v_cache_mut = v_cache.as_mut_f32_slice()?;
-                for (row, (&pos, bt)) in batch.positions.iter().zip(batch.block_tables).enumerate() {
-                    let block_stride = num_kv_heads * bt.block_size * head_dim;
-                    let phys_block_id = bt.block_ids[pos / bt.block_size];
-                    for kv_h in 0..num_kv_heads {
-                        let src = row * (num_kv_heads * head_dim) + kv_h * head_dim;
-                        let dst = phys_block_id * block_stride
-                            + kv_h * (bt.block_size * head_dim)
-                            + (pos % bt.block_size) * head_dim;
-                        v_cache_mut[dst..dst + head_dim].copy_from_slice(&v_slice[src..src + head_dim]);
-                    }
-                }
-            }
+            write_kv(k_cache, k.as_f32_slice()?, batch, num_kv_heads, head_dim)?;
+            write_kv(v_cache, v.as_f32_slice()?, batch, num_kv_heads, head_dim)?;
 
             // Causal paged attention: row i sees positions 0..=positions[i].
             let attn_out = self.backend.paged_attention(
@@ -447,6 +430,31 @@ const FUSED_MAX_ROWS: usize = 32;
 
 /// Row-concatenates matrices with the same width and dtype into one contiguous tensor.
 /// Returns `None` when they differ (the layer then stays unfused).
+/// Copies each row's `[num_kv_heads, head_dim]` keys or values into its paged cache
+/// slot, converting to the cache's storage type (F32 or F16).
+fn write_kv(cache: &mut Tensor, src: &[f32], batch: &ForwardBatch<'_>, num_kv_heads: usize, head_dim: usize) -> Result<()> {
+    use half::slice::HalfFloatSliceExt;
+    let dtype = cache.dtype();
+    let storage = cache.storage_mut().as_cpu_mut()?;
+    for (row, (&pos, bt)) in batch.positions.iter().zip(batch.block_tables).enumerate() {
+        let block_stride = num_kv_heads * bt.block_size * head_dim;
+        let phys_block_id = bt.block_ids[pos / bt.block_size];
+        for kv_h in 0..num_kv_heads {
+            let s = row * (num_kv_heads * head_dim) + kv_h * head_dim;
+            let d = phys_block_id * block_stride + kv_h * (bt.block_size * head_dim) + (pos % bt.block_size) * head_dim;
+            let src = &src[s..s + head_dim];
+            match dtype {
+                DType::F32 => storage.as_mut_slice::<f32>()[d..d + head_dim].copy_from_slice(src),
+                DType::F16 => storage.as_mut_slice::<half::f16>()[d..d + head_dim].convert_from_f32_slice(src),
+                other => {
+                    return Err(RllmError::BackendError(format!("KV cache dtype {other} is not supported (use F32 or F16)")))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn concat_rows(parts: &[&Tensor]) -> Result<Option<Tensor>> {
     let cols = parts[0].dims()[1];
     let dtype = parts[0].dtype();
