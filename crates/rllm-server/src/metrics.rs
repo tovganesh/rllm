@@ -112,6 +112,8 @@ pub fn render(state: &AppState) -> String {
         metric(&mut out, "rllm_prompt_tokens_computed_total", "counter", "Prompt tokens run through the model.", get(&sm.prefill_tokens));
         metric(&mut out, "rllm_prompt_tokens_cached_total", "counter", "Prompt tokens reused from the prefix cache.", get(&sm.cached_prompt_tokens));
         metric(&mut out, "rllm_generated_tokens_total", "counter", "Generated tokens.", get(&sm.generated_tokens));
+        metric(&mut out, "rllm_draft_tokens_total", "counter", "Prompt-lookup draft tokens verified.", get(&sm.draft_tokens));
+        metric(&mut out, "rllm_draft_tokens_accepted_total", "counter", "Prompt-lookup draft tokens accepted.", get(&sm.accepted_draft_tokens));
         metric(&mut out, "rllm_forward_passes_total", "counter", "Model forward passes.", get(&sm.forward_passes));
         metric(&mut out, "rllm_forward_seconds_total", "counter", "Time spent in forward passes.", format!("{:.6}", get(&sm.forward_time_us) as f64 / 1e6));
     }

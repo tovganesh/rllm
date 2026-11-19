@@ -335,5 +335,7 @@ mod tests {
         assert!(text.contains("rllm_sequences_finished_total{reason=\"length\"} 1"), "{text}");
         assert!(text.contains("rllm_time_to_first_token_seconds_count 1"), "{text}");
         assert!(text.contains("rllm_kv_blocks_free"));
+        assert!(text.contains("rllm_draft_tokens_total 0"), "{text}");
+        assert!(text.contains("rllm_draft_tokens_accepted_total 0"), "{text}");
     }
 }
