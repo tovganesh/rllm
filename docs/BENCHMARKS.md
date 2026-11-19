@@ -24,57 +24,89 @@ Exact token parity across engines is only expected where both use the same arith
 
 ### Head-to-head on an Apple M4 (latest)
 
-`python3 scripts/bench_vs_llamacpp.py --device {cpu,metal} <models>`: llama-bench (`-ngl 0` / `-ngl 99`) vs `rllm bench --model`, pp = one forward pass over N tokens, tg = per-token decode, 3 repetitions, 4 CPU threads. Ratios above 1.00x mean rllm is faster. Single runs vary by a few percent (llama.cpp's Metal tg128 on SmolLM2 ranged 283–347 tok/s across runs).
+`python3 scripts/bench_vs_llamacpp.py --device {cpu,metal} <models>`: llama-bench (`-ngl 0` / `-ngl 99`) vs `rllm bench --model`, pp = one forward pass over N tokens, tg = per-token decode, 3 repetitions, 4 CPU threads. Ratios above 1.00x mean rllm is faster. Single runs vary by a few percent (llama.cpp's Metal tg128 on SmolLM2 ranged 283–347 tok/s across runs). The `.requant` Llama-3.2-1B files were made from the Q8_0 file with `llama-quantize --allow-requantize`; both engines load the same file.
+
+#### CPU
 
 | model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
 | --- | --- | --- | ---: | ---: | ---: |
-| SmolLM2-135M-Instruct-Q8_0 | cpu | pp128 | 1,935 | 2,993 | 1.55x |
-| SmolLM2-135M-Instruct-Q8_0 | cpu | pp512 | 1,304 | 2,324 | 1.78x |
-| SmolLM2-135M-Instruct-Q8_0 | cpu | tg128 | 401 | 372 | 0.93x |
-| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp128 | 1,961 | 2,949 | 1.50x |
-| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp512 | 1,320 | 2,287 | 1.73x |
-| SmolLM2-135M-Instruct-Q4_0.requant | cpu | tg128 | 555 | 417 | 0.75x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp128 | 1,381 | 3,050 | 2.21x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp512 | 1,113 | 2,300 | 2.07x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | tg128 | 447 | 374 | 0.84x |
-| SmolLM2-135M-Instruct-F16.requant | cpu | pp128 | 1,207 | 3,048 | 2.53x |
-| SmolLM2-135M-Instruct-F16.requant | cpu | pp512 | 1,239 | 2,307 | 1.86x |
-| SmolLM2-135M-Instruct-F16.requant | cpu | tg128 | 131 | 121 | 0.92x |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 | 469 | 410 | 0.87x |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 | 391 | 520 | 1.33x |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 | 54 | 53 | 0.98x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 | 476 | 405 | 0.85x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 | 390 | 507 | 1.30x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 | 54 | 51 | 0.95x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | pp128 | 164 | 393 | 2.39x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | pp512 | 155 | 502 | 3.25x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | tg128 | 78 | 82 | 1.04x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp128 | 489 | 457 | 0.93x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp512 | 395 | 503 | 1.28x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | tg128 | 88 | 87 | 0.99x |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | pp128 | 1,881 | 3,033 | 1.61x |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | pp512 | 1,293 | 2,311 | 1.79x |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | tg128 | 400 | 362 | 0.90x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp128 | 1,369 | 3,019 | 2.21x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp512 | 1,084 | 2,313 | 2.13x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | tg128 | 439 | 380 | 0.87x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp128 | 1,912 | 2,958 | 1.55x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp512 | 1,300 | 2,312 | 1.78x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | tg128 | 561 | 505 | 0.90x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | pp128 | 1,196 | 3,052 | 2.55x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | pp512 | 1,205 | 2,332 | 1.94x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | tg128 | 132 | 120 | 0.91x |
+
+#### Metal
+
+| model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
+| --- | --- | --- | ---: | ---: | ---: |
 | SmolLM2-135M-Instruct-Q8_0 | metal | pp128 | 9,916 | 7,640 | 0.77x |
 | SmolLM2-135M-Instruct-Q8_0 | metal | pp512 | 10,858 | 8,162 | 0.75x |
 | SmolLM2-135M-Instruct-Q8_0 | metal | tg128 | 347 | 303 | 0.87x |
 | SmolLM2-135M-Instruct-Q4_0.requant | metal | pp128 | 10,193 | 7,320 | 0.72x |
 | SmolLM2-135M-Instruct-Q4_0.requant | metal | pp512 | 11,058 | 7,756 | 0.70x |
 | SmolLM2-135M-Instruct-Q4_0.requant | metal | tg128 | 350 | 303 | 0.87x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp128 | 9,518 | 7,632 | 0.80x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp512 | 10,365 | 8,146 | 0.79x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | tg128 | 349 | 296 | 0.85x |
 | SmolLM2-135M-Instruct-F16.requant | metal | pp128 | 10,129 | 7,426 | 0.73x |
 | SmolLM2-135M-Instruct-F16.requant | metal | pp512 | 11,361 | 8,260 | 0.73x |
 | SmolLM2-135M-Instruct-F16.requant | metal | tg128 | 223 | 221 | 0.99x |
 | Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 | 1,604 | 1,323 | 0.82x |
 | Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 | 1,657 | 1,388 | 0.84x |
 | Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 | 71 | 69 | 0.97x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp128 | 1,546 | 1,319 | 0.85x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp512 | 1,602 | 1,382 | 0.86x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | tg128 | 109 | 69 | 0.63x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 | 1,629 | 1,234 | 0.76x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 | 1,679 | 1,297 | 0.77x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 | 114 | 87 | 0.77x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp128 | 9,442 | 7,620 | 0.81x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp512 | 10,284 | 8,126 | 0.79x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | tg128 | 344 | 297 | 0.86x |
 
-**Where rllm is ahead:** CPU prompt processing in every format (1.3–2.5x).
-**At parity (within ~3%):** CPU decode on Llama-3.2-1B, Metal decode on Llama-3.2-1B and on F16 weights.
+**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU decode of Llama-3.2-1B Q4_K_M (1.04x).
+**At parity (within ~5%):** CPU decode on Llama-3.2-1B (Q8_0, Q4_0), Metal decode on Llama-3.2-1B Q8_0 and on F16 weights.
 **Behind:**
-- Metal prompt processing, 0.70–0.84x. The quantized GEMM (64x64 tiles, half-precision k-major weight tiles) plateaued here after A/B testing nine variants; the remaining gap is inside the k-loop.
-- CPU decode of 4-bit weights, Q4_0 0.75x and Q4_K_M 0.84x. llama.cpp repacks Q4_0 weights for wider kernels, and runs K-quants natively at ~4.5 bits per weight while rllm converts them to Q8_0 (8.5 bits).
-- CPU prompt processing on 1B at 128 tokens, 0.87x (Accelerate GEMM efficiency at small M).
+- Metal prompt processing, 0.70–0.86x. The quantized GEMM (64x64 tiles, half-precision k-major weight tiles) plateaued here after A/B testing nine variants; the remaining gap is inside the k-loop.
+- Metal decode of 4-bit Llama-3.2-1B: Q4_K_M 0.63x (Metal still converts K-quants to Q8_0, 8.5 bits per weight), Q4_0 0.77x.
+- CPU decode on SmolLM2-135M, 0.87–0.91x. At ~2 ms per token across ~120 small matrix-vector products, the profile is dominated by thread wake-up/fork-join latency rather than kernels (llama.cpp's thread pool spins between ops).
+- CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 now uses i8mm there, 0.93x).
 
-**What changed in this round** (all measured, with interleaved A/B runs for decisions):
+**What changed in this round** (native 4-bit CPU kernels):
+1. **Native K-quants.** `Q4_K` and `Q6_K` weights stay as stored (4.5 / 6.6 bits per weight instead of 8.5 as Q8_0) and run SDOT kernels against `Q8_K` activations (256-value super-blocks with per-16 sums), as in llama.cpp. Llama-3.2-1B Q4_K_M decode 52 → 82 tok/s (0.70x → 1.04x), and the model uses ~half the memory.
+2. **Q4_0 repacked at load** into interleaved 4-row groups (`DType::Q4_0x4`, nibbles stored as signed 4-bit) through a new `Backend::pack_weight` hook. One 16-byte load feeds two rows of SDOT lanes; the four row results come out of one `vpaddq` and are scaled with one vector of f16 scales. Q4_0 decode kernels: 1.6x faster in isolation; 1B decode 74 → 87 tok/s (0.85x → 0.99x).
+3. **i8mm (`SMMLA`) GEMM** on the repacked layout for batches: 3–6x faster than per-row SDOT for 2–31 rows, and used up to 192 rows for large matrices where it beats dequantize + Accelerate (1B Q4_0 pp128 0.80x → 0.93x; pp64 +65%). Small matrices keep the Accelerate path above 32 rows (it measured 25% faster there).
+4. **Q5_0 expanded losslessly to Q8_0** (same scale, int8 values in −16..15): a native Q5_0 kernel was written and tested but measured 1.75x slower than the Q8_0 kernel on the M4, even for large matrices, so it is only a fallback. This also lets SmolLM2-135M Q4_K_M layers (Q5_0 + Q8_0 parts) fuse Q/K/V, and makes its Metal decode +17% and perplexity exact.
+5. Metal receives the same values as before: `Q4_0x4` is unpacked to Q4_0 and K-quants are converted to Q8_0 at upload (perplexity bit-identical to the previous release for Q4_0 and Llama-3.2-1B Q4_K_M).
+
+Correctness of this round: kernel tests against dequantized references (exact up to float rounding, with random bits for all scale/min fields); decode-path teacher forcing on the 1B and 135M Q4_K_M files picks llama.cpp's token at every position except one near-tie each (0.12 and 0.14 logits); greedy output on 1B Q4_0 identical to `llama-simple -ngl 0`. CPU perplexity vs `llama-perplexity -ngl 0` on LICENSE: 1B Q4_K_M 7.6986 vs 7.7390, 1B Q4_0 8.9458 vs 8.9573, 135M Q4_K_M 12.8534 vs 12.8884, Q4_0 15.6772 vs 15.6971.
+
+### Earlier measurements
+
+#### Metal GEMM, fusion and F16 round (PR #11)
+
+All measured, with interleaved A/B runs for decisions. Before it, Metal pp512 was 0.60x, F16 Metal decode 0.57x and CPU 4-bit decode 0.75–0.84x.
+
 1. Metal quantized GEMM: 32x32 F32 tiles → 64x64 tiles with half-precision k-major weight tiles (1B pp512 996 → 1,388 tok/s). Rejected after A/B: register prefetching, half-precision activations, 8 simdgroups, a transposed Cᵀ formulation (3.6x slower), and a conflict-free weight-write mapping.
 2. Metal: Q/K/V and gate/up fused into single matrices, a single RoPE dispatch, and residual adds folded into the output projections (17 → 10 dispatches per layer). A first version initialised GEMM accumulators from `y` and was 3x slower (register spills); the accumulate is now a staged epilogue.
 3. Metal: F16 weights stay F16 (decode 136 → 221 tok/s on F16 files).
 4. CPU: fused Q/K/V and gate/up for batches under 32 rows (decode +6%), zero-copy via row views; prefill keeps separate projections (fusion cost 10% there).
 5. CPU: 2,048-row chunked dequantize+GEMM for prefill (1B pp128 +6%).
 6. CPU: four-row Q4_0 decode kernel with the nibble offset folded into activation sums (+5–7%); not used for Q8_0, where it was slower.
-
-### Earlier measurements
 
 #### Throughput
 

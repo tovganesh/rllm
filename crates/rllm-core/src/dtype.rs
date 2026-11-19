@@ -22,6 +22,15 @@ pub enum DType {
     Q4_K,
     /// 8-bit block quantization (block size = 32 elements in 34 bytes: 16-bit f16 scale + 32 signed int8s).
     Q8_0,
+    /// 5-bit block quantization (32 elements in 22 bytes: f16 scale, 32 high bits, 16 bytes of nibbles).
+    Q5_0,
+    /// 6-bit K-quant (256-element super-blocks of 210 bytes with 16 int8 sub-block scales).
+    Q6_K,
+    /// CPU-internal repacked `Q4_0`: groups of four rows with their blocks interleaved
+    /// (four f16 scales, then the four rows' nibbles in 8-byte chunks, stored as signed
+    /// 4-bit values). Same size as `Q4_0`; a row count that is a multiple of 4 is required,
+    /// and row views must start on a 4-row boundary.
+    Q4_0x4,
 }
 
 impl DType {
@@ -36,19 +45,21 @@ impl DType {
             DType::I8 => 1,
             DType::Q4_0 => 0,
             DType::Q4_K => 0,
-            DType::Q8_0 => 0,
+            DType::Q8_0 | DType::Q5_0 | DType::Q6_K | DType::Q4_0x4 => 0,
         }
     }
 
     /// Returns true if this data type is a block-quantized representation.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, DType::Q4_0 | DType::Q4_K | DType::Q8_0)
+        matches!(self, DType::Q4_0 | DType::Q4_K | DType::Q8_0 | DType::Q5_0 | DType::Q6_K | DType::Q4_0x4)
     }
 
     /// Returns `(block_size, bytes_per_block)` for quantized types.
     pub fn block_info(&self) -> Option<(usize, usize)> {
         match self {
-            DType::Q4_0 => Some((32, 18)),
+            DType::Q4_0 | DType::Q4_0x4 => Some((32, 18)),
+            DType::Q5_0 => Some((32, 22)),
+            DType::Q6_K => Some((256, 210)),
             DType::Q4_K => Some((256, 144)),
             DType::Q8_0 => Some((32, 34)),
             _ => None,
@@ -77,6 +88,9 @@ impl std::fmt::Display for DType {
             DType::Q4_0 => write!(f, "q4_0"),
             DType::Q4_K => write!(f, "q4_k"),
             DType::Q8_0 => write!(f, "q8_0"),
+            DType::Q5_0 => write!(f, "q5_0"),
+            DType::Q6_K => write!(f, "q6_k"),
+            DType::Q4_0x4 => write!(f, "q4_0x4"),
         }
     }
 }

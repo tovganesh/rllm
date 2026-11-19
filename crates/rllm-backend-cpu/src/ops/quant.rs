@@ -238,6 +238,22 @@ pub fn dequantize_q5_0(src: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Converts `Q5_0` blocks to `Q8_0` without loss: each 5-bit value `q - 16` is stored
+/// as an int8 with the block's own scale, so dot products are bit-identical.
+pub fn q5_0_to_q8_0(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() / 22 * 34);
+    for block in src.chunks_exact(22) {
+        out.extend_from_slice(&block[..2]);
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let q = &block[6..22];
+        for j in 0..32 {
+            let nib = if j < 16 { q[j] & 0x0F } else { q[j - 16] >> 4 };
+            out.push((((nib as u32) | (((qh >> j) & 1) << 4)) as i32 - 16) as i8 as u8);
+        }
+    }
+    out
+}
+
 /// Dequantizes `Q5_1` blocks (32 values / 24 bytes: scale, min, 32 high bits, 16 nibble bytes).
 pub fn dequantize_q5_1(src: &[u8], out: &mut [f32]) {
     for (block, y) in src.chunks_exact(24).zip(out.chunks_exact_mut(32)) {
@@ -340,6 +356,34 @@ pub fn dequantize_q6_k(src: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Dequantizes row-major data of any supported block format (or F16/BF16/F32 bytes)
+/// into `out`. `Q4_0x4` is not row-major and is handled by [`super::repack`].
+pub fn dequantize_into(dtype: rllm_core::dtype::DType, src: &[u8], out: &mut [f32]) -> rllm_core::error::Result<()> {
+    use rllm_core::dtype::DType;
+    match dtype {
+        DType::F32 => {
+            for (b, y) in src.chunks_exact(4).zip(out.iter_mut()) {
+                *y = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        }
+        DType::F16 => convert_f16(src, out),
+        DType::BF16 => convert_bf16(src, out),
+        DType::Q8_0 => dequantize_q8_0(src, out),
+        DType::Q4_0 => dequantize_q4_0(src, out),
+        DType::Q5_0 => dequantize_q5_0(src, out),
+        DType::Q4_K => dequantize_q4_k(src, out),
+        DType::Q6_K => dequantize_q6_k(src, out),
+        other => {
+            return Err(rllm_core::error::RllmError::UnsupportedOp {
+                op: "dequantize",
+                dtype: other.to_string(),
+                device: "cpu".to_string(),
+            })
+        }
+    }
+    Ok(())
+}
+
 /// Converts little-endian IEEE half-precision values to F32.
 pub fn convert_f16(src: &[u8], out: &mut [f32]) {
     for (b, y) in src.chunks_exact(2).zip(out.iter_mut()) {
@@ -433,6 +477,25 @@ mod dequant_tests {
         dequantize_q8_0(&q8, &mut deq);
         let dense: f32 = deq.iter().zip(&act).map(|(a, b)| a * b).sum();
         assert!((dense - dot_q8_0_f32(&q8, &act)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn q5_0_to_q8_0_is_lossless() {
+        let mut s = 7u64;
+        let src: Vec<u8> = (0..22 * 5)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s >> 33) as u8
+            })
+            .collect();
+        let mut src = src;
+        for b in 0..5 {
+            src[b * 22..b * 22 + 2].copy_from_slice(&f16::from_f32(0.01 * (b + 1) as f32).to_le_bytes());
+        }
+        let (mut a, mut b) = (vec![0f32; 160], vec![0f32; 160]);
+        dequantize_q5_0(&src, &mut a);
+        dequantize_q8_0(&q5_0_to_q8_0(&src), &mut b);
+        assert_eq!(a, b);
     }
 
     #[test]

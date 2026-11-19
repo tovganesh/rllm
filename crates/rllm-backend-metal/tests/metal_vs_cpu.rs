@@ -47,6 +47,7 @@ fn model(dtype: DType) -> LlamaModel<CpuBackend> {
             }
         }
         m.fuse_projections().unwrap();
+        m.pack_for_backend().unwrap();
     }
     m
 }

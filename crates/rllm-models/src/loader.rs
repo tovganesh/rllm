@@ -6,8 +6,13 @@
 //! | GGUF type | Handling |
 //! | :--- | :--- |
 //! | `F32` | used directly |
-//! | `Q8_0`, `Q4_0` | kept quantized for linear layers and the embedding table |
-//! | `F16`, `BF16`, `Q4_1`, `Q5_0`, `Q5_1`, `Q4_K`, `Q5_K`, `Q6_K` | dequantized to F32 at load |
+//! | `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q6_K` | kept as stored for linear layers and the embedding table (native integer kernels) |
+//! | `Q4_1`, `Q5_1`, `Q5_K` | converted to `Q8_0` at load (F32 with `requantize_to_q8_0: false`) |
+//! | `F16`, `BF16` | converted to F32 at load |
+//!
+//! After loading, [`LlamaModel::pack_for_backend`] lets the backend repack weights into
+//! its preferred layout (the CPU backend interleaves `Q4_0` rows for its SDOT / i8mm
+//! kernels).
 
 use crate::bpe::BpeTokenizer;
 use crate::chat::ChatTemplate;
@@ -39,8 +44,8 @@ pub struct LoadOptions {
     /// Cap on the context window (and RoPE table size). Defaults to the model's
     /// `context_length`.
     pub max_context: Option<usize>,
-    /// Convert linear weights stored in formats without a native kernel (K-quants,
-    /// Q4_1, Q5_0, Q5_1) to Q8_0 at load instead of F32. Q8_0 uses ~8.5 bits per
+    /// Convert linear weights stored in formats without a native kernel (Q4_1, Q5_1,
+    /// Q5_K) to Q8_0 at load instead of F32. Q8_0 uses ~8.5 bits per
     /// weight versus 32 for F32 and runs on the integer decode kernels; its rounding
     /// error is far below the original 4–6-bit quantization error. Default: true.
     pub requantize_to_q8_0: bool,
@@ -211,18 +216,20 @@ impl<B: Backend> LlamaModel<B> {
             kv_cache: Default::default(),
         };
         model.fuse_projections()?;
+        model.pack_for_backend()?;
         Ok(model)
     }
 }
 
-/// Loads a linear / embedding weight. Q8_0 and Q4_0 stay as stored; F32, F16 and BF16
-/// become F32; other quantized formats become Q8_0 (or F32 when `requantize` is off).
+/// Loads a linear / embedding weight. Formats with native kernels (Q8_0, Q4_0, Q5_0,
+/// Q4_K, Q6_K) stay as stored; F32, F16 and BF16 become F32; other quantized formats
+/// become Q8_0 (or F32 when `requantize` is off).
 pub(crate) fn load_weight(g: &MappedGguf, name: &str, shape: &[usize], requantize: bool) -> Result<Tensor> {
     let ty = g
         .tensor_info(name)
         .ok_or_else(|| RllmError::ModelError(format!("Missing tensor '{name}'")))?
         .ggml_type;
-    let lossy_format = !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q8_0 | GgmlType::Q4_0);
+    let lossy_format = native_dtype(ty).is_none() && !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
     let in_features = *shape.last().unwrap_or(&0);
     if !(requantize && lossy_format && in_features.is_multiple_of(32)) {
         return load_tensor(g, name, shape, true);
@@ -233,8 +240,21 @@ pub(crate) fn load_weight(g: &MappedGguf, name: &str, shape: &[usize], requantiz
     Ok(Tensor::new(Shape::new(shape.to_vec()), DType::Q8_0, Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(bytes))))
 }
 
-/// Loads one tensor, checking its shape. With `keep_quantized`, Q8_0 / Q4_0 payloads
-/// are kept as-is; every other type is converted to F32.
+/// The stored type of a GGUF tensor kept as-is because the backends have kernels for it.
+fn native_dtype(ty: GgmlType) -> Option<DType> {
+    Some(match ty {
+        GgmlType::Q8_0 => DType::Q8_0,
+        GgmlType::Q4_0 => DType::Q4_0,
+        GgmlType::Q5_0 => DType::Q5_0,
+        GgmlType::Q4_K => DType::Q4_K,
+        GgmlType::Q6_K => DType::Q6_K,
+        _ => return None,
+    })
+}
+
+/// Loads one tensor, checking its shape. With `keep_quantized`, payloads in a format
+/// with native kernels ([`native_dtype`]) are kept as-is; every other type is converted
+/// to F32.
 pub(crate) fn load_tensor(g: &MappedGguf, name: &str, shape: &[usize], keep_quantized: bool) -> Result<Tensor> {
     let info = g
         .tensor_info(name)
@@ -248,11 +268,7 @@ pub(crate) fn load_tensor(g: &MappedGguf, name: &str, shape: &[usize], keep_quan
     let bytes = g.tensor_bytes(info)?;
     let shape = Shape::new(shape.to_vec());
 
-    let quantized = match info.ggml_type {
-        GgmlType::Q8_0 => Some(DType::Q8_0),
-        GgmlType::Q4_0 => Some(DType::Q4_0),
-        _ => None,
-    };
+    let quantized = native_dtype(info.ggml_type);
     if let (true, Some(dtype)) = (keep_quantized, quantized) {
         let storage = Storage::Cpu(CpuStorage::from_bytes(bytes.to_vec()));
         return Ok(Tensor::new(shape, dtype, Device::Cpu, storage));
