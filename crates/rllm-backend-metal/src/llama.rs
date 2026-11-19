@@ -109,8 +109,22 @@ const ATTN_KB: usize = 32;
 /// 128 and 512 were up to 7% slower, no splitting 14–28% slower.
 const DECODE_CHUNK: usize = 256;
 
-/// Rows at or below which linear layers use the matrix-vector kernel.
-const MV_MAX_ROWS: usize = 8;
+/// Rows at or below which a linear layer uses matrix-vector kernels; larger batches use
+/// the small-batch GEMM (`mms`, F16/quantized weights) or the tiled GEMM. Measured
+/// end to end on Llama-3.2-1B (M4) at 3-4 rows: `mms` is ~25% faster for K-quants,
+/// `mv4` ~10% faster for Q8_0, and they tie for Q4_0. F32 weights have no `mms`.
+fn mv_max_rows(kind: WKind) -> usize {
+    match kind {
+        WKind::F32 => 8,
+        WKind::Q4K | WKind::Q6K => 2,
+        WKind::F16 | WKind::Q8 | WKind::Q4 => 4,
+    }
+}
+
+/// Rows at or below which the small-batch GEMM (`mms`) is used instead of the 64x64
+/// tiled GEMM. On Llama-3.2-1B shapes (M4) it is 2.3-3.4x faster at 8-16 rows and
+/// 1.4x at 32; the tiled GEMM wins from 64 rows.
+const MMS_MAX_ROWS: usize = 32;
 
 impl MetalLlama {
     /// Whether a Metal device is available.
@@ -148,6 +162,11 @@ impl MetalLlama {
             "mm_q4_k", "mm_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
             "rms_norm", "rope", "swiglu", "attn_reduce",
         ];
+        let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
+            .iter()
+            .flat_map(|f| [2, 4, 8].map(|r| format!("mv{r}_{f}")))
+            .chain(["f16", "q8_0", "q4_0", "q4_k", "q6_k"].iter().flat_map(|f| [1, 2, 4].map(|t| format!("mms{t}_{f}"))))
+            .collect();
         let kv_names: Vec<String> = ["f32", "f16"]
             .iter()
             .flat_map(|t| {
@@ -156,7 +175,7 @@ impl MetalLlama {
                 }))
             })
             .collect();
-        for name in names.iter().copied().chain(kv_names.iter().map(String::as_str)) {
+        for name in names.iter().copied().chain(kv_names.iter().chain(&mv_names).map(String::as_str)) {
             let f = library
                 .get_function(name, None)
                 .map_err(|e| RllmError::BackendError(format!("Metal function {name}: {e}")))?;
@@ -441,7 +460,7 @@ impl MetalLlama {
     #[allow(clippy::too_many_arguments)]
     fn linear_segments(&self, e: &Enc<'_>, segs: &[Weight], x: &Buffer, xh: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
         let ldy = segs.iter().map(|w| w.rows).sum::<usize>() as u32;
-        if m > MV_MAX_ROWS && segs.iter().any(|w| w.kind != WKind::F32) {
+        if segs.iter().any(|w| w.kind != WKind::F32 && m > mv_max_rows(w.kind)) {
             let quads = (m * segs[0].cols / 4) as u64;
             e.threads(self.pipeline("to_half"), &[Arg::B(x), Arg::B(xh)], (quads, 1, 1));
         }
@@ -458,9 +477,22 @@ impl MetalLlama {
                 Arg::U(accumulate as u32),
                 Arg::U(ldy),
             ];
-            if m <= MV_MAX_ROWS {
-                let p = self.pipeline(&format!("mv_{}", w.kind.suffix()));
+            if m <= mv_max_rows(w.kind) {
+                // One activation row: the tuned decode kernels; 2..8 rows: kernels that
+                // decode each weight chunk once for all rows.
+                let name = match m {
+                    1 => format!("mv_{}", w.kind.suffix()),
+                    2 => format!("mv2_{}", w.kind.suffix()),
+                    3 | 4 => format!("mv4_{}", w.kind.suffix()),
+                    _ => format!("mv8_{}", w.kind.suffix()),
+                };
+                let p = self.pipeline(&name);
                 e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
+            } else if w.kind != WKind::F32 && m <= MMS_MAX_ROWS {
+                let nt = m.div_ceil(8).next_power_of_two();
+                let mut args = args;
+                args[1] = Arg::B(xh);
+                e.groups(self.pipeline(&format!("mms{nt}_{}", w.kind.suffix())), &args, ((w.rows as u64).div_ceil(16), 1, 1), 64);
             } else if w.kind == WKind::F32 {
                 // Full-precision weights keep the F32 tile kernel (the large-tile kernel stores
                 // weights as half precision, which is lossless only for F16/quantized weights).
@@ -611,7 +643,9 @@ impl LanguageModel for MetalLlama {
                 ("act", rows * inter),
                 ("final", lrows * h),
                 // Half-precision copy of a linear layer's input (prefill GEMM).
-                ("xh", rows.max(lrows) * h.max(inter) / 2 + 4),
+                // At least MMS_MAX_ROWS rows: the small-batch GEMM reads whole 8-row
+                // fragments (rows past the batch only feed discarded outputs).
+                ("xh", rows.max(lrows).max(MMS_MAX_ROWS) * h.max(inter) / 2 + 4),
                 ("logits", lrows * c.vocab_size),
             ] {
                 sc.bufs.insert(name, f(len));

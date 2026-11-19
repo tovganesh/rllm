@@ -121,6 +121,29 @@ pub fn vec_dot_q6_k_q8_k(w: &[u8], a: &Q8KActivations, off: usize, nb: usize) ->
     scalar_dot_q6_k_q8_k(w, a, off, nb)
 }
 
+/// Dot products of one `Q4_K` row with `R` activation rows whose super-blocks start at
+/// `offs[r]`. Each weight super-block is unpacked once for all `R` rows.
+#[inline]
+pub fn dot_q4_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize; R], nb: usize) -> [f32; R] {
+    #[cfg(target_arch = "aarch64")]
+    if has_dotprod() {
+        // SAFETY: dotprod detected at runtime; slice lengths are asserted inside.
+        return unsafe { neon::dot_q4_k_rows(w, a, offs, nb) };
+    }
+    std::array::from_fn(|r| scalar_dot_q4_k_q8_k(w, a, offs[r], nb))
+}
+
+/// Dot products of one `Q6_K` row with `R` activation rows (see [`dot_q4_k_rows`]).
+#[inline]
+pub fn dot_q6_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize; R], nb: usize) -> [f32; R] {
+    #[cfg(target_arch = "aarch64")]
+    if has_dotprod() {
+        // SAFETY: as above.
+        return unsafe { neon::dot_q6_k_rows(w, a, offs, nb) };
+    }
+    std::array::from_fn(|r| scalar_dot_q6_k_q8_k(w, a, offs[r], nb))
+}
+
 /// Portable reference implementation of [`vec_dot_q4_k_q8_k`].
 pub fn scalar_dot_q4_k_q8_k(w: &[u8], a: &Q8KActivations, off: usize, nb: usize) -> f32 {
     let mut sum = 0f32;
@@ -298,6 +321,123 @@ mod neon {
                 s += 4;
             }
             sum += a.d[off + i] * f16_at(w, i * Q6_K_BYTES + 208) * (vaddvq_s32(isum) - 32 * isum_mins) as f32;
+        }
+        sum
+    }
+
+    /// Asserts that activation super-blocks `offs[r]..offs[r] + nb` exist for every row.
+    fn check_rows<const R: usize>(w: &[u8], bytes: usize, a: &Q8KActivations, offs: &[usize; R], nb: usize) {
+        assert!(w.len() >= nb * bytes);
+        for &o in offs {
+            assert!(a.qs.len() >= (o + nb) * QK_K && a.bsums.len() >= (o + nb) * 16 && a.d.len() >= o + nb);
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    pub unsafe fn dot_q4_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize; R], nb: usize) -> [f32; R] {
+        check_rows(w, Q4_K_BYTES, a, &offs, nb);
+        let m4 = vdupq_n_u8(0x0F);
+        let mut sumf = [0f32; R];
+        for i in 0..nb {
+            let blk = w.as_ptr().add(i * Q4_K_BYTES);
+            let dw = f16_at(w, i * Q4_K_BYTES);
+            let dmw = f16_at(w, i * Q4_K_BYTES + 2);
+            let (scales, mins) = q4_k_scales_mins(std::slice::from_raw_parts(blk.add(4), 12));
+            let mins = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(mins.as_ptr())));
+            let mut sumi = [vdupq_n_s32(0); R];
+            for r in 0..R {
+                let bs = a.bsums.as_ptr().add((offs[r] + i) * 16);
+                let q8sums = vpaddq_s16(vld1q_s16(bs), vld1q_s16(bs.add(8)));
+                let prod = vaddq_s32(
+                    vmull_s16(vget_low_s16(q8sums), vget_low_s16(mins)),
+                    vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)),
+                );
+                sumf[r] -= a.d[offs[r] + i] * dmw * vaddvq_s32(prod) as f32;
+            }
+            for j in 0..4 {
+                let b0 = vld1q_u8(blk.add(16 + 32 * j));
+                let b1 = vld1q_u8(blk.add(32 + 32 * j));
+                let l0 = vreinterpretq_s8_u8(vandq_u8(b0, m4));
+                let l1 = vreinterpretq_s8_u8(vandq_u8(b1, m4));
+                let h0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(b0));
+                let h1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(b1));
+                let (s0, s1) = (scales[2 * j] as i32, scales[2 * j + 1] as i32);
+                for r in 0..R {
+                    let q8 = a.qs.as_ptr().add((offs[r] + i) * QK_K + 64 * j);
+                    let lo = sdot(sdot(vdupq_n_s32(0), l0, vld1q_s8(q8)), l1, vld1q_s8(q8.add(16)));
+                    let hi = sdot(sdot(vdupq_n_s32(0), h0, vld1q_s8(q8.add(32))), h1, vld1q_s8(q8.add(48)));
+                    sumi[r] = vmlaq_n_s32(vmlaq_n_s32(sumi[r], lo, s0), hi, s1);
+                }
+            }
+            for r in 0..R {
+                sumf[r] += a.d[offs[r] + i] * dw * vaddvq_s32(sumi[r]) as f32;
+            }
+        }
+        sumf
+    }
+
+    #[target_feature(enable = "dotprod")]
+    pub unsafe fn dot_q6_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize; R], nb: usize) -> [f32; R] {
+        check_rows(w, Q6_K_BYTES, a, &offs, nb);
+        let m4 = vdupq_n_u8(0x0F);
+        let m3 = vdupq_n_u8(0x03);
+        let mut sum = [0f32; R];
+        for i in 0..nb {
+            let blk = w.as_ptr().add(i * Q6_K_BYTES);
+            let sc = blk.add(192) as *const i8;
+            let scales = vld1q_s8(sc);
+            let (s_lo, s_hi) = (vmovl_s8(vget_low_s8(scales)), vmovl_s8(vget_high_s8(scales)));
+            let mut isum = [vdupq_n_s32(0); R];
+            let mut mins = [0i32; R];
+            for r in 0..R {
+                let bs = a.bsums.as_ptr().add((offs[r] + i) * 16);
+                let (b_lo, b_hi) = (vld1q_s16(bs), vld1q_s16(bs.add(8)));
+                let prod = vaddq_s32(
+                    vaddq_s32(vmull_s16(vget_low_s16(b_lo), vget_low_s16(s_lo)), vmull_s16(vget_high_s16(b_lo), vget_high_s16(s_lo))),
+                    vaddq_s32(vmull_s16(vget_low_s16(b_hi), vget_low_s16(s_hi)), vmull_s16(vget_high_s16(b_hi), vget_high_s16(s_hi))),
+                );
+                mins[r] = vaddvq_s32(prod);
+            }
+            for half in 0..2 {
+                let qh = blk.add(128 + 32 * half);
+                let ql = blk.add(64 * half);
+                let h0 = vld1q_u8(qh);
+                let h1 = vld1q_u8(qh.add(16));
+                let l = [vld1q_u8(ql), vld1q_u8(ql.add(16)), vld1q_u8(ql.add(32)), vld1q_u8(ql.add(48))];
+                for part in 0..2 {
+                    let q: [int8x16_t; 4] = if part == 0 {
+                        let hb = [
+                            vshlq_n_u8::<4>(vandq_u8(h0, m3)),
+                            vshlq_n_u8::<4>(vandq_u8(h1, m3)),
+                            vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(h0), m3)),
+                            vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(h1), m3)),
+                        ];
+                        std::array::from_fn(|k| vreinterpretq_s8_u8(vorrq_u8(vandq_u8(l[k], m4), hb[k])))
+                    } else {
+                        let hb = [
+                            vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(h0), m3)),
+                            vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(h1), m3)),
+                            vshlq_n_u8::<4>(vshrq_n_u8::<6>(h0)),
+                            vshlq_n_u8::<4>(vshrq_n_u8::<6>(h1)),
+                        ];
+                        std::array::from_fn(|k| vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(l[k]), hb[k])))
+                    };
+                    let s = 8 * half + 4 * part;
+                    let scs: [i32; 4] = std::array::from_fn(|k| *sc.add(s + k) as i32);
+                    for r in 0..R {
+                        let q8 = a.qs.as_ptr().add((offs[r] + i) * QK_K + 128 * half + 64 * part);
+                        let mut acc = isum[r];
+                        for k in 0..4 {
+                            acc = vmlaq_n_s32(acc, sdot(vdupq_n_s32(0), q[k], vld1q_s8(q8.add(16 * k))), scs[k]);
+                        }
+                        isum[r] = acc;
+                    }
+                }
+            }
+            let dw = f16_at(w, i * Q6_K_BYTES + 208);
+            for r in 0..R {
+                sum[r] += a.d[offs[r] + i] * dw * (vaddvq_s32(isum[r]) - 32 * mins[r]) as f32;
+            }
         }
         sum
     }

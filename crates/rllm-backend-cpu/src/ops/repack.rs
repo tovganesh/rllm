@@ -18,11 +18,12 @@
 
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use super::qdot::{quantize_activations, Q8Activations, QK};
+use super::qdot::{quantize_activations, quantize_activations_impl, Q8Activations, QK};
 use half::f16;
 use rayon::prelude::*;
 
 const Q4_0_BYTES: usize = 18;
+const Q8_0_BYTES: usize = 34;
 /// Bytes of one interleaved 4-row block.
 pub const GROUP_BLOCK_BYTES: usize = 4 * Q4_0_BYTES;
 
@@ -255,6 +256,52 @@ pub fn gemm_q4_0x4(weight: &[u8], x: &[f32], out: &mut [f32], m: usize, n: usize
     });
 }
 
+/// `out[M, N] = X[M, K] · W[N, K]ᵀ` for a row-major `Q8_0` weight using `SMMLA`, or
+/// `None` without i8mm. Pairs of weight rows are interleaved on the fly (64-bit zips),
+/// so no repacked copy of the weight is needed. Rows past the last multiple of four
+/// are computed with the SDOT multi-row kernel.
+pub fn gemm_q8_0_i8mm(weight: &[u8], x: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) -> Option<()> {
+    if !has_i8mm() {
+        return None;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let nb = k / QK;
+        let row_bytes = nb * Q8_0_BYTES;
+        debug_assert_eq!(weight.len(), n * row_bytes);
+        debug_assert_eq!(x.len(), m * k);
+        let a = quantize_activations_impl(x, false);
+        let packed = pack_pairs(&a, m, nb);
+        let groups = n / 4;
+        let ptr = OutPtr(out.as_mut_ptr());
+        let groups_per_task = (super::gemv_rows_per_task(row_bytes) / (4 * m.div_ceil(4))).max(1);
+        let task = |t: usize| {
+            let g0 = t * groups_per_task;
+            let g1 = (g0 + groups_per_task).min(groups);
+            // SAFETY: i8mm detected; the task writes only columns 4*g0..4*g1.
+            unsafe { neon::gemm_q8_0_i8mm_task(weight, row_bytes, &packed, m, n, nb, g0, g1, ptr.get()) };
+        };
+        let tasks = groups.div_ceil(groups_per_task);
+        if m < SMALL_BATCH_ROWS {
+            crate::pool::for_each_index(tasks, task);
+        } else {
+            (0..tasks).into_par_iter().for_each(task);
+        }
+        for j in 4 * groups..n {
+            let w = &weight[j * row_bytes..(j + 1) * row_bytes];
+            for i in 0..m {
+                out[i * n + j] = super::qdot::vec_dot_q8_0_q8(w, &a, i * nb, nb);
+            }
+        }
+        Some(())
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (weight, x, out, m, n, k);
+        None
+    }
+}
+
 /// Activations of rows `2p, 2p+1` interleaved in 8-byte chunks per block (the `SMMLA`
 /// left operand), with per-lane scales `[d0, d0, d1, d1] / 16`. An odd last row is
 /// paired with zeros.
@@ -315,6 +362,14 @@ mod neon {
     #[inline(always)]
     unsafe fn f16x4(p: *const u8) -> float32x4_t {
         let h = vld1_u8(p);
+        let out: float32x4_t;
+        asm!("fcvtl {o:v}.4s, {i:v}.4h", o = out(vreg) out, i = in(vreg) h, options(pure, nomem, nostack));
+        out
+    }
+
+    /// Four f16 bit patterns as f32 (`FCVTL`).
+    #[inline(always)]
+    unsafe fn f16x4_from(h: uint16x4_t) -> float32x4_t {
         let out: float32x4_t;
         asm!("fcvtl {o:v}.4s, {i:v}.4h", o = out(vreg) out, i = in(vreg) h, options(pure, nomem, nostack));
         out
@@ -454,6 +509,102 @@ mod neon {
         }
         for t in 0..TP {
             // acc01 = [x0·r0, x0·r1, x1·r0, x1·r1], acc23 likewise for rows r2, r3.
+            let row0 = 2 * (p0 + t);
+            vst1q_f32(out.add(row0 * n + 4 * g), vcombine_f32(vget_low_f32(acc01[t]), vget_low_f32(acc23[t])));
+            if row0 + 1 < m {
+                vst1q_f32(out.add((row0 + 1) * n + 4 * g), vcombine_f32(vget_high_f32(acc01[t]), vget_high_f32(acc23[t])));
+            }
+        }
+    }
+    /// Weight-row groups `g0..g1` (4 rows each) of a row-major `Q8_0` matrix against all
+    /// `m` activation rows, up to 4 row pairs at a time.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "dotprod,i8mm")]
+    pub unsafe fn gemm_q8_0_i8mm_task(
+        weight: &[u8],
+        row_bytes: usize,
+        packed: &PackedPairs,
+        m: usize,
+        n: usize,
+        nb: usize,
+        g0: usize,
+        g1: usize,
+        out: *mut f32,
+    ) {
+        assert!(weight.len() >= 4 * g1 * row_bytes);
+        let pairs = m.div_ceil(2);
+        assert!(packed.qs.len() >= pairs * nb * 64 && packed.scales.len() >= pairs * nb * 4);
+        let mut p = 0;
+        while p < pairs {
+            let tp = (pairs - p).min(4);
+            for g in g0..g1 {
+                let w = weight.as_ptr().add(4 * g * row_bytes);
+                match tp {
+                    4 => tile_q8_0::<4>(w, row_bytes, packed, nb, p, g, m, n, out),
+                    3 => tile_q8_0::<3>(w, row_bytes, packed, nb, p, g, m, n, out),
+                    2 => tile_q8_0::<2>(w, row_bytes, packed, nb, p, g, m, n, out),
+                    _ => tile_q8_0::<1>(w, row_bytes, packed, nb, p, g, m, n, out),
+                }
+            }
+            p += tp;
+        }
+    }
+
+    /// Weight rows `4g..4g+4` × `TP` activation row pairs over all `nb` blocks.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn tile_q8_0<const TP: usize>(
+        w: *const u8,
+        row_bytes: usize,
+        packed: &PackedPairs,
+        nb: usize,
+        p0: usize,
+        g: usize,
+        m: usize,
+        n: usize,
+        out: *mut f32,
+    ) {
+        let rows = [w, w.add(row_bytes), w.add(2 * row_bytes), w.add(3 * row_bytes)];
+        let mut acc01 = [vdupq_n_f32(0.0); TP];
+        let mut acc23 = [vdupq_n_f32(0.0); TP];
+        // Packed activation scales are d/16 (shared with the Q4_0x4 kernel).
+        let sixteen = vdupq_n_f32(16.0);
+        for b in 0..nb {
+            let o = b * Q8_0_BYTES;
+            let ld = |r: usize, i: usize| vreinterpretq_s64_s8(vld1q_s8(rows[r].add(o + 2 + 16 * i) as *const i8));
+            let zip = |lo: int64x2_t, hi: int64x2_t| (vreinterpretq_s8_s64(vzip1q_s64(lo, hi)), vreinterpretq_s8_s64(vzip2q_s64(lo, hi)));
+            // c{chunk}_{rows}: 8 values of each of two rows, the SMMLA right operand.
+            let (c0_01, c1_01) = zip(ld(0, 0), ld(1, 0));
+            let (c2_01, c3_01) = zip(ld(0, 1), ld(1, 1));
+            let (c0_23, c1_23) = zip(ld(2, 0), ld(3, 0));
+            let (c2_23, c3_23) = zip(ld(2, 1), ld(3, 1));
+            // The four rows' f16 scales gathered into one vector and widened (FCVTL).
+            let mut h = vdup_n_u16(0);
+            h = vset_lane_u16::<0>(std::ptr::read_unaligned(rows[0].add(o) as *const u16), h);
+            h = vset_lane_u16::<1>(std::ptr::read_unaligned(rows[1].add(o) as *const u16), h);
+            h = vset_lane_u16::<2>(std::ptr::read_unaligned(rows[2].add(o) as *const u16), h);
+            h = vset_lane_u16::<3>(std::ptr::read_unaligned(rows[3].add(o) as *const u16), h);
+            let d = vmulq_f32(f16x4_from(h), sixteen);
+            let d01 = vcombine_f32(vget_low_f32(d), vget_low_f32(d));
+            let d23 = vcombine_f32(vget_high_f32(d), vget_high_f32(d));
+            for t in 0..TP {
+                let pb = (p0 + t) * nb + b;
+                let ap = packed.qs.as_ptr().add(pb * 64);
+                let (x0, x1, x2, x3) = (vld1q_s8(ap), vld1q_s8(ap.add(16)), vld1q_s8(ap.add(32)), vld1q_s8(ap.add(48)));
+                let mut i01 = smmla(vdupq_n_s32(0), x0, c0_01);
+                let mut i23 = smmla(vdupq_n_s32(0), x0, c0_23);
+                i01 = smmla(i01, x1, c1_01);
+                i23 = smmla(i23, x1, c1_23);
+                i01 = smmla(i01, x2, c2_01);
+                i23 = smmla(i23, x2, c2_23);
+                i01 = smmla(i01, x3, c3_01);
+                i23 = smmla(i23, x3, c3_23);
+                let xs = vld1q_f32(packed.scales.as_ptr().add(pb * 4));
+                acc01[t] = vfmaq_f32(acc01[t], vcvtq_f32_s32(i01), vmulq_f32(d01, xs));
+                acc23[t] = vfmaq_f32(acc23[t], vcvtq_f32_s32(i23), vmulq_f32(d23, xs));
+            }
+        }
+        for t in 0..TP {
             let row0 = 2 * (p0 + t);
             vst1q_f32(out.add(row0 * n + 4 * g), vcombine_f32(vget_low_f32(acc01[t]), vget_low_f32(acc23[t])));
             if row0 + 1 < m {

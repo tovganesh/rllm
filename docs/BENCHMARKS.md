@@ -128,14 +128,64 @@ On the CPU rllm is 1.3–2.5x ahead at depth: its paged GQA attention reads each
 
 Completed blocks are now shared as soon as they are computed (previously only when a sequence finished), so concurrent requests with the same system prompt or chat history reuse each other's KV blocks.
 
-**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU decode of Llama-3.2-1B Q4_K_M (1.04x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x).
+#### Small batches (2–32 tokens)
+
+One forward pass over N tokens (`rllm bench --model M --prompt-tokens N`, llama-bench `-p N`): the shape of speculative-decoding verification, several sequences decoding together, and short prompts. "before" is the previous release, measured interleaved with this one (mean of 2 rounds of 5 repetitions); llama.cpp 3 repetitions.
+
+| model | device | tokens | llama.cpp t/s | before t/s | rllm t/s | vs before | rllm / llama.cpp |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | 2 | 90 | 93 | 100 | 1.08x | 1.12x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | 4 | 209 | 104 | 174 | 1.67x | 0.83x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | 8 | 290 | 118 | 239 | 2.03x | 0.82x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | 16 | 379 | 114 | 328 | 2.86x | 0.86x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | 32 | 448 | 185 | 375 | 2.02x | 0.84x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | 2 | 99 | 121 | 139 | 1.15x | 1.41x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | 4 | 134 | 132 | 177 | 1.34x | 1.32x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | 8 | 148 | 145 | 205 | 1.42x | 1.39x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | 16 | 119 | 137 | 196 | 1.43x | 1.65x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | 32 | 167 | 162 | 162 | 1.00x | 0.97x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | 2 | 130 | 171 | 171 | 1.00x | 1.32x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | 4 | 307 | 289 | 290 | 1.00x | 0.94x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | 8 | 336 | 383 | 379 | 0.99x | 1.13x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | 16 | 426 | 426 | 428 | 1.00x | 1.01x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | 32 | 494 | 435 | 434 | 1.00x | 0.88x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | 2 | 132 | 98 | 141 | 1.44x | 1.07x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | 4 | 255 | 115 | 268 | 2.32x | 1.05x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | 8 | 484 | 134 | 483 | 3.62x | 1.00x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | 16 | 858 | 325 | 708 | 2.18x | 0.82x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | 32 | 1,205 | 639 | 857 | 1.34x | 0.71x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | 2 | 182 | 146 | 167 | 1.14x | 0.92x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | 4 | 348 | 169 | 315 | 1.86x | 0.91x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | 8 | 651 | 181 | 634 | 3.50x | 0.97x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | 16 | 893 | 312 | 702 | 2.25x | 0.79x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | 32 | 1,199 | 614 | 847 | 1.38x | 0.71x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | 2 | 203 | 170 | 209 | 1.23x | 1.03x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | 4 | 399 | 202 | 309 | 1.53x | 0.77x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | 8 | 745 | 218 | 594 | 2.72x | 0.80x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | 16 | 1,033 | 326 | 677 | 2.07x | 0.66x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | 32 | 1,283 | 642 | 836 | 1.30x | 0.65x |
+
+On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0 is 0.82–0.86x from 4 tokens (llama.cpp repacks Q8_0 for i8mm; rllm interleaves rows on the fly). On Metal rllm is at 0.91–1.07x of llama.cpp up to 8 tokens for Q8_0 and Q4_K_M (Q4_0 0.77–1.03x) and 0.65–0.82x at 16–32, where the small-batch GEMM runs at ~45% of the half-precision peak.
+
+**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x).
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
 - Metal prompt processing, 0.85–0.93x (128–512 tokens). The quantized GEMM now runs at 3.0–3.2 TFLOPS on the 1B shapes, ~80% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak measured on this GPU; prefill attention is ~4% of the time.
 - CPU decode of F16 files, 0.90x: the CPU loader widens F16 weights to F32 (twice the bytes per token); llama.cpp keeps them in F16.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
+- Small batches of 16–32 tokens on Metal (0.65–0.82x) and Q8_0 batches of 4–32 tokens on the CPU (0.82–0.86x); see "Small batches" above.
 
-**Spinning decode thread pool (this round)**
+**Small-batch kernels (this round)**
+
+Before this round, a batch of 2–31 tokens cost almost as much per token as decoding them one by one on Metal, and 2x–3x more than necessary for CPU Q8_0 / K-quants: every kernel re-read and re-decoded each weight block once per token. Now each weight block is decoded once per batch (table above: up to 3.6x on Metal, 2.9x on CPU):
+
+1. **Metal, 2–4 tokens (`mv2` / `mv4`, and `mv8` for F32 weights):** the matrix-vector kernels decode a chunk of 8 weight values once and apply it to every token, with each chunk's activations loaded once per four weight rows (loading them once per weight row was ~15% slower at 4 tokens; holding 8 rows of activations in registers spilled).
+2. **Metal, 3/5–32 tokens (`mms`):** a small-batch GEMM on `simdgroup_matrix`: each simdgroup dequantizes an 8-row × 64-value weight tile into threadgroup memory as half and multiplies it with 8, 16 or 32 tokens of half-precision activations, computing Y = X·Wᵀ so activations load row-major. The 64×64 prefill GEMM was flat at ~3 ms per 1B layer for any batch up to 64 rows (too few threadgroups); `mms` takes 0.7–0.9 ms at 8 rows, 1.3 at 16, 2.2 at 32 (it loses from 64). It takes over from `mv4` at 3 tokens for K-quants (+25%) and at 5 for the other formats (`mv4` is ~10% faster for Q8_0 at 3–4).
+3. **CPU, Q4_K / Q6_K / Q8_0 multi-row SDOT kernels:** one weight row against up to 8 activation rows per call, so the K-quant scale/min unpacking and nibble splitting happen once per batch rather than per token.
+4. **CPU, Q8_0 on i8mm (`SMMLA`):** pairs of weight rows are interleaved on the fly with 64-bit zips, which is exactly SMMLA's 2×8 operand, so no repacked copy of the weight is needed; 4 weight rows × 8 activation rows per register tile. It also replaces dequantize + Accelerate for 32–191-row batches on large matrices, as for Q4_0 (Llama-3.2-1B Q8_0: 32 tokens 185 → 375 tok/s, 64 tokens 297 → 385; 128 unchanged; SmolLM2 unchanged).
+5. Tests: Metal prefill of 2–8, 12, 16, 24 and 32 tokens equals token-by-token decode for F32, F16, Q8_0, Q4_0 and mixed Q4_K/Q6_K weights (max relative difference 6e-4, from half-precision activations and K/V staging; a planted indexing bug gives 1.4); CPU batches of 1–11 rows for Q8_0 / Q4_K / Q6_K, with odd row counts and a weight row count not divisible by 4, equal per-row matrix-vector products, with and without i8mm (`RLLM_NO_I8MM=1`). Decode (one token) runs the same kernels as before.
+
+**Spinning decode thread pool (PR #17)**
 
 Decoding one token on SmolLM2-135M runs ~120 small parallel steps (~2 ms in total). With Rayon, idle workers sleep between steps and every step paid a wake-up; the profile was dominated by `__psynch_cvwait` / `swtch_pri`, not kernels. A small fork/join pool (`rllm_backend_cpu::pool`) now runs the decode-sized work — matrix-vector products, small-batch (< 32 rows) integer GEMMs and decode attention — with workers that spin for 200 µs after each job (`RLLM_SPIN_US`) before parking, so an idle process does not burn CPU. Interleaved A/B, generation tok/s (mean of 4 rounds):
 

@@ -142,6 +142,18 @@ pub fn vec_dot_x4(is_q8: bool, w: [&[u8]; 4], a: &Q8Activations, off: usize, nb:
     [dot(w[0], a, off, nb), dot(w[1], a, off, nb), dot(w[2], a, off, nb), dot(w[3], a, off, nb)]
 }
 
+/// Dot products of one `Q8_0` weight row with `R` activation rows whose blocks start
+/// at `offs[r]`; each weight block is loaded once for all rows.
+#[inline]
+pub fn dot_q8_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [usize; R], nb: usize) -> [f32; R] {
+    #[cfg(target_arch = "aarch64")]
+    if has_dotprod() {
+        // SAFETY: dotprod detected at runtime; bounds are asserted inside.
+        return unsafe { neon::dot_q8_0_rows(w, a, offs, nb) };
+    }
+    std::array::from_fn(|r| scalar_dot_q8_0_q8(w, a, offs[r], nb))
+}
+
 /// Portable reference implementation of [`vec_dot_q8_0_q8`].
 pub fn scalar_dot_q8_0_q8(w: &[u8], a: &Q8Activations, off: usize, nb: usize) -> f32 {
     let mut sum = 0f32;
@@ -220,6 +232,28 @@ mod neon {
             sum0 = vmlaq_n_f32(sum0, vcvtq_f32_s32(i0), f16_at(w, b * Q8_0_BYTES) * a.d[off + b]);
         }
         vaddvq_f32(vaddq_f32(sum0, sum1))
+    }
+
+    #[target_feature(enable = "dotprod")]
+    pub unsafe fn dot_q8_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [usize; R], nb: usize) -> [f32; R] {
+        assert!(w.len() >= nb * Q8_0_BYTES);
+        for &o in &offs {
+            assert!(a.qs.len() >= (o + nb) * QK && a.d.len() >= o + nb);
+        }
+        let wp = w.as_ptr();
+        let mut acc = [vdupq_n_f32(0.0); R];
+        for b in 0..nb {
+            let blk = wp.add(b * Q8_0_BYTES);
+            let w0 = vld1q_s8(blk.add(2) as *const i8);
+            let w1 = vld1q_s8(blk.add(18) as *const i8);
+            let dw = f16_at(w, b * Q8_0_BYTES);
+            for r in 0..R {
+                let ap = a.qs.as_ptr().add((offs[r] + b) * QK);
+                let i = sdot(sdot(vdupq_n_s32(0), w0, vld1q_s8(ap)), w1, vld1q_s8(ap.add(16)));
+                acc[r] = vmlaq_n_f32(acc[r], vcvtq_f32_s32(i), dw * a.d[offs[r] + b]);
+            }
+        }
+        acc.map(|v| vaddvq_f32(v))
     }
 
     /// Four Q8_0 weight rows against the same activations (activation blocks loaded once).
@@ -398,7 +432,43 @@ impl Acts {
             _ => unreachable!("activation quantization does not match the weight format"),
         }
     }
+
+    /// Dot products of weight row `w` with activation rows `i0..i0 + R` (each `nb`
+    /// blocks long), unpacking each weight block once where a multi-row kernel exists.
+    #[inline]
+    fn dot_rows<const R: usize>(&self, fmt: QFormat, w: &[u8], i0: usize, nb: usize) -> [f32; R] {
+        let offs: [usize; R] = std::array::from_fn(|r| (i0 + r) * nb);
+        match (self, fmt) {
+            (Acts::Q8(a), QFormat::Q8_0) => dot_q8_0_rows(w, a, offs, nb),
+            (Acts::K(a), QFormat::Q4K) => kdot::dot_q4_k_rows(w, a, offs, nb),
+            (Acts::K(a), QFormat::Q6K) => kdot::dot_q6_k_rows(w, a, offs, nb),
+            _ => offs.map(|o| self.dot(fmt, w, o, nb)),
+        }
+    }
+
+    /// `out[i] = dot(w, activation row i)` for every activation row.
+    fn dot_all_rows(&self, fmt: QFormat, w: &[u8], nb: usize, out: &mut [f32]) {
+        let mut i = 0;
+        while out.len() - i >= MULTI_ROWS {
+            out[i..i + MULTI_ROWS].copy_from_slice(&self.dot_rows::<MULTI_ROWS>(fmt, w, i, nb));
+            i += MULTI_ROWS;
+        }
+        match out.len() - i {
+            0 => {}
+            1 => out[i] = self.dot(fmt, w, i * nb, nb),
+            2 => out[i..].copy_from_slice(&self.dot_rows::<2>(fmt, w, i, nb)),
+            3 => out[i..].copy_from_slice(&self.dot_rows::<3>(fmt, w, i, nb)),
+            4 => out[i..].copy_from_slice(&self.dot_rows::<4>(fmt, w, i, nb)),
+            5 => out[i..].copy_from_slice(&self.dot_rows::<5>(fmt, w, i, nb)),
+            6 => out[i..].copy_from_slice(&self.dot_rows::<6>(fmt, w, i, nb)),
+            7 => out[i..].copy_from_slice(&self.dot_rows::<7>(fmt, w, i, nb)),
+            _ => unreachable!(),
+        }
+    }
 }
+
+/// Activation rows handled per call of a multi-row kernel.
+const MULTI_ROWS: usize = 8;
 
 /// `out[N] = W[N, K] · x[K]` for a quantized weight in format `fmt`.
 pub fn gemv_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32], n: usize, k: usize) {
@@ -437,6 +507,10 @@ pub fn linear_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32],
     let row_bytes = nb * bb;
     debug_assert_eq!(weight.len(), n * row_bytes);
     debug_assert_eq!(x.len(), m * k);
+    // Q8_0 with i8mm: SMMLA (2x2 tiles of 8-deep int8 products) on interleaved row pairs.
+    if fmt == QFormat::Q8_0 && super::repack::gemm_q8_0_i8mm(weight, x, out, m, n, k).is_some() {
+        return;
+    }
     let a = Acts::new(fmt, x); // m rows of nb blocks each, contiguous
 
     // Compute [N, M] so each task writes a contiguous slab, then transpose.
@@ -445,10 +519,7 @@ pub fn linear_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32],
     crate::pool::for_each_chunk_mut(&mut out_t, rows_per_task * m, |t, slab| {
         for (r, row) in slab.chunks_mut(m).enumerate() {
             let j = t * rows_per_task + r;
-            let w = &weight[j * row_bytes..(j + 1) * row_bytes];
-            for (i, o) in row.iter_mut().enumerate() {
-                *o = a.dot(fmt, w, i * nb, nb);
-            }
+            a.dot_all_rows(fmt, &weight[j * row_bytes..(j + 1) * row_bytes], nb, row);
         }
     });
     for j in 0..n {
@@ -557,6 +628,34 @@ mod tests {
             for r in 0..4 {
                 let want = scalar_dot_q4_0_q8(&w4[r], &a, 0, nb);
                 assert!((got[r] - want).abs() <= 1e-3 * want.abs().max(1.0), "q4 nb={nb} r={r}");
+            }
+        }
+    }
+
+    /// Batches of 1..=11 rows (multi-row SDOT kernels in groups of 8 plus every tail
+    /// size, and the Q8_0 SMMLA kernel with odd row counts and a non-multiple-of-4
+    /// weight row count) against per-row matrix-vector products.
+    #[test]
+    fn multi_row_kernels_match_per_row_gemv() {
+        use crate::ops::quant::{quantize_f32_to_q4_k, quantize_f32_to_q6_k};
+        let (n, k) = (38, 512);
+        let wf = data(n * k, 5);
+        for (fmt, w) in [
+            (QFormat::Q8_0, q8_0_weights(&wf)),
+            (QFormat::Q4K, quantize_f32_to_q4_k(&wf)),
+            (QFormat::Q6K, quantize_f32_to_q6_k(&wf)),
+        ] {
+            for m in 1..=11 {
+                let x = data(m * k, 6 + m);
+                let mut batched = vec![0f32; m * n];
+                linear_quantized(fmt, &w, &x, &mut batched, m, n, k);
+                for i in 0..m {
+                    let mut row = vec![0f32; n];
+                    gemv_quantized(fmt, &w, &x[i * k..(i + 1) * k], &mut row, n, k);
+                    for (j, (b, g)) in batched[i * n..(i + 1) * n].iter().zip(&row).enumerate() {
+                        assert!((b - g).abs() <= 1e-4 * g.abs().max(1.0), "{fmt:?} m={m} [{i},{j}]: {b} vs {g}");
+                    }
+                }
             }
         }
     }

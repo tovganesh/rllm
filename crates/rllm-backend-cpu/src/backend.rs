@@ -28,12 +28,12 @@ const DEQUANT_CHUNK_ROWS: usize = 2048;
 /// integer dot products (llama.cpp uses the same cut-over for its BLAS path).
 pub const BATCHED_F32_MIN_ROWS: usize = 32;
 
-/// Whether a batch of `m` rows against a repacked `Q4_0` `[n, k]` weight should use the
-/// i8mm integer GEMM rather than dequantization + F32 GEMM. Measured on an M4: i8mm
-/// is 3-6x faster than per-row SDOT below 32 rows; from 32 to ~192 rows it beats
-/// dequantize + Accelerate only for large matrices (Llama-3.2-1B: +12% at 128 prompt
-/// tokens, +65% at 64), whose F32 copies spill out of cache, and loses on small ones
-/// (SmolLM2-135M: -25% at 128).
+/// Whether a batch of `m` rows against a repacked `Q4_0` or a `Q8_0` `[n, k]` weight
+/// should use the i8mm integer GEMM rather than dequantization + F32 GEMM. Measured on
+/// an M4: i8mm is 3-6x faster than per-row SDOT below 32 rows; from 32 to ~192 rows it
+/// beats dequantize + Accelerate only for large matrices (Llama-3.2-1B Q4_0: +12% at
+/// 128 prompt tokens, +65% at 64; Q8_0: 2x at 32, +29% at 64, even at 128), whose F32
+/// copies spill out of cache, and loses on small ones (SmolLM2-135M: -25% at 128).
 fn use_i8mm(m: usize, n: usize, k: usize) -> bool {
     has_i8mm() && (m < BATCHED_F32_MIN_ROWS || (m < 192 && n * k >= 1 << 22))
 }
@@ -150,7 +150,7 @@ impl Backend for CpuBackend {
         let out_slice = out.as_mut_f32_slice()?;
         let m = x_slice.len() / k;
         let repacked = dtype == DType::Q4_0x4;
-        let integer_path = m < BATCHED_F32_MIN_ROWS || (repacked && use_i8mm(m, n, k));
+        let integer_path = m < BATCHED_F32_MIN_ROWS || ((repacked || fmt == Some(QFormat::Q8_0)) && use_i8mm(m, n, k));
         if m == 1 {
             // Decode: activations quantized to Q8, integer dot products.
             match fmt {

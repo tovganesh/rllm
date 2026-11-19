@@ -269,3 +269,73 @@ fn metal_split_context_decode_matches_cpu() {
         assert!(d < 2e-3, "row {row} (context {}): relative diff {d}", all.len());
     }
 }
+
+/// Small batches use dedicated kernels: up to 4 rows (2 for K-quants, 8 for F32
+/// weights) the multi-row matrix-vector kernels (`mv2`/`mv4`/`mv8`), then up to 32 rows
+/// the small-batch simdgroup-matrix GEMM (`mms`). Prefilling `m` tokens at once must match feeding them
+/// one at a time through the single-row kernels, for every weight format (F16 weights
+/// are exact roundings of the seeded F32 ones, which Metal uploads as F16). The bound
+/// allows for the prefill attention kernel staging keys/values in half precision (see
+/// `check`) and `mms` rounding activations to half; a wrong weight or activation index
+/// gives differences of order 1.
+#[test]
+fn metal_small_batches_match_token_by_token() {
+    if !MetalLlama::is_available() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let f16_model = || {
+        let mut m = LlamaModel::new_seeded(config(), Arc::new(CpuBackend), 11).unwrap();
+        let round = |t: &mut Tensor| {
+            let v: Vec<f32> = t.to_vec::<f32>().unwrap().iter().map(|&x| half::f16::from_f32(x).to_f32()).collect();
+            *t = Tensor::from_f32(&v, t.shape().clone(), Device::Cpu).unwrap();
+        };
+        round(&mut m.embed_tokens);
+        round(&mut m.lm_head);
+        for l in &mut m.layers {
+            for w in [&mut l.self_attn.q_proj, &mut l.self_attn.k_proj, &mut l.self_attn.v_proj, &mut l.self_attn.o_proj, &mut l.mlp.gate_proj, &mut l.mlp.up_proj, &mut l.mlp.down_proj] {
+                round(w);
+            }
+        }
+        m.fuse_projections().unwrap();
+        m
+    };
+    let models = [
+        ("f32", model(DType::F32)),
+        ("f16", f16_model()),
+        ("q8_0", model(DType::Q8_0)),
+        ("q4_0", model(DType::Q4_0)),
+        ("q4_k/q6_k", model(DType::Q4_K)),
+    ];
+    let mut worst = Vec::new();
+    for (name, cpu) in models {
+        let mut max_d = 0f32;
+        let gpu = MetalLlama::from_cpu_model(&cpu).unwrap();
+        let block = 16;
+        gpu.init_kv_cache(4, block).unwrap();
+        let vocab = cpu.config.vocab_size;
+        for m in (2..=8usize).chain([12, 16, 24, 32]) {
+            let tokens: Vec<u32> = (0..m as u32).map(|i| (i * 17 + m as u32) % 96).collect();
+            let rows: Vec<usize> = (0..m).collect();
+            let batched = gpu
+                .forward_cached(&ForwardBatch {
+                    tokens: &tokens,
+                    positions: &rows,
+                    block_tables: &vec![BlockTable { block_size: block, block_ids: vec![0, 1] }; m],
+                    logits_rows: &rows,
+                })
+                .unwrap();
+            let t1 = BlockTable { block_size: block, block_ids: vec![2, 3] };
+            for (i, &tok) in tokens.iter().enumerate() {
+                let single = gpu
+                    .forward_cached(&ForwardBatch { tokens: &[tok], positions: &[i], block_tables: std::slice::from_ref(&t1), logits_rows: &[0] })
+                    .unwrap();
+                let d = max_rel_diff(&batched[i * vocab..(i + 1) * vocab], &single);
+                assert!(d < 1e-3, "{name} m={m} row {i}: relative diff {d}");
+                max_d = max_d.max(d);
+            }
+        }
+        worst.push(format!("{name} {max_d:.1e}"));
+    }
+    eprintln!("max relative diffs: {}", worst.join(", "));
+}
