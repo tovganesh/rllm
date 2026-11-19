@@ -47,8 +47,28 @@ Progress during P3 on the 41-token chat prompt (Q8_0): prefill 340 → ~1,050 to
 
 **Remaining gaps:** decode is 15–35% behind llama.cpp (it repacks Q4_0 weights for wider SIMD kernels and uses native K-quant kernels and an F16 KV cache). Non-Apple platforms have no vendor BLAS (portable GEMM fallback) and x86 has no SIMD int8 kernels yet (portable scalar fallback). Measurements from this single machine are snapshots, not a formal benchmark; background load affects them noticeably.
 
+### Metal (Apple GPU)
+
+Apple M4 (10-core GPU), `rllm --device metal bench --model … --prompt-tokens {128,512} --generate-tokens 128` (median of 3) vs `llama-bench -ngl 99`. Tokens/s:
+
+| Model | Engine | pp128 | pp512 | tg128 |
+| :--- | :--- | ---: | ---: | ---: |
+| SmolLM2-135M Q8_0 | llama.cpp Metal | 9,879 | 10,838 | 347 |
+| | rllm Metal | 6,127 | 6,518 | 270 |
+| Llama-3.2-1B Q8_0 | llama.cpp CPU (`-ngl 0`) | 467 | 393 | 54 |
+| | rllm CPU | 385 | 510 | 52 |
+| | llama.cpp Metal | 1,598 | 1,658 | **67.5** |
+| | rllm Metal | 986 | 987 | **67.3** |
+
+For a 135M model, GPU decode is limited by per-token submission overhead and is slower than the CPU for both engines' best settings; at 1B, decode is memory-bound and rllm matches llama.cpp. Prefill on Metal is ~60% of llama.cpp's: profiling showed attention dominating at first (58% of prefill at 512 tokens), which the tiled kernel fixed (pp512 3,500 → 6,500 tok/s on 135M); the remaining gap is the GEMM kernel (a 64×32 tile variant was measured ~4% slower and not adopted).
+
+Correctness on Metal: perplexity vs `llama-perplexity -ngl 99` — Q8_0 +0.02%, Q4_0 +0.02%, F16 +0.00%, Q4_K_M +0.57%, Q5_K_M +0.23% (K-quants are converted to Q8_0 at load; llama.cpp runs them natively); Llama-3.2-1B +0.006%. Greedy output identical to `llama-completion -ngl 99` for SmolLM2-135M and Llama-3.2-1B (4 prompts × 32 tokens each). Metal vs rllm CPU on synthetic models: max relative logit difference < 1e-4 (F32, Q8_0, Q4_0).
+
+`rllm bench --model` mirrors llama-bench: pp = one forward pass over N random tokens, tg = per-token time of N single-token decode steps; `rllm perplexity` additionally spends time on CPU log-softmax and is not a throughput benchmark.
+
 ### Tuning knobs
 
+- `--device cpu|metal` — where the LLM runs.
 - `--threads N` / `RAYON_NUM_THREADS` — worker threads (default: performance cores on Apple Silicon, otherwise all cores).
 - `RLLM_TASK_BYTES` — weight bytes per parallel task in matrix-vector products (default 131072).
 
@@ -97,7 +117,8 @@ Once a real model runs correctly:
 ## 5. Reproduce
 
 ```bash
-# Real model (see README for the download command)
+# Real model (see README for the download command); add `--device metal` for the GPU
+cargo run --release -p rllm-cli -- bench --model models/SmolLM2-135M-Instruct-Q8_0.gguf --prompt-tokens 512 --generate-tokens 128
 cargo run --release -p rllm-cli -- perplexity --model models/SmolLM2-135M-Instruct-Q8_0.gguf --file LICENSE --ctx 512
 cargo run --release -p rllm-cli -- generate --model models/SmolLM2-135M-Instruct-Q8_0.gguf \
   --raw --prompt "Once upon a time" --temperature 0 --max-tokens 128

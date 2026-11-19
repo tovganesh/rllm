@@ -109,14 +109,17 @@ impl BpeTokenizer {
         let flag = |k: &str| g.get(k).and_then(GgufValue::as_bool);
         tok.bos_token_id = id("tokenizer.ggml.bos_token_id");
         tok.eos_token_id = id("tokenizer.ggml.eos_token_id");
-        tok.add_bos = flag("tokenizer.ggml.add_bos_token").unwrap_or(false);
+        // Without explicit metadata, llama.cpp adds BOS for the Llama 3 pre-tokenizer
+        // family (e.g. Llama 3.x GGUFs have no add_bos_token key but expect BOS).
+        let llama3_family = matches!(pre, "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "pixtral");
+        tok.add_bos = flag("tokenizer.ggml.add_bos_token").unwrap_or(llama3_family);
         tok.add_eos = flag("tokenizer.ggml.add_eos_token").unwrap_or(false);
 
         let mut stops: Vec<u32> = ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"]
             .iter()
             .filter_map(|k| id(k))
             .collect();
-        for marker in ["<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>", "<|eom_id|>"] {
+        for marker in ["<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>", "<|end_of_text|>", "<|eom_id|>"] {
             if let Some(&i) = tok.token_to_id.get(marker) {
                 if tok.is_special[i as usize] {
                     stops.push(i);

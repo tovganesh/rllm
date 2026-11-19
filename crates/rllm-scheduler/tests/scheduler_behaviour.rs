@@ -33,7 +33,7 @@ fn model() -> Arc<LlamaModel<CpuBackend>> {
     Arc::new(LlamaModel::new_seeded(config(), Arc::new(CpuBackend), 7).unwrap())
 }
 
-fn scheduler(total_blocks: usize, max_batch_size: usize) -> ContinuousBatchScheduler<CpuBackend> {
+fn scheduler(total_blocks: usize, max_batch_size: usize) -> ContinuousBatchScheduler {
     ContinuousBatchScheduler::new(
         SchedulerConfig {
             max_batch_size,
@@ -60,7 +60,7 @@ fn seq(id: u64, prompt: &[u32], max_tokens: usize) -> Sequence {
 }
 
 /// Steps the scheduler until idle and returns every sequence's generated tokens.
-fn run_to_completion(s: &ContinuousBatchScheduler<CpuBackend>) -> HashMap<u64, Vec<u32>> {
+fn run_to_completion(s: &ContinuousBatchScheduler) -> HashMap<u64, Vec<u32>> {
     let mut out: HashMap<u64, Vec<u32>> = HashMap::new();
     for _ in 0..1000 {
         for (id, tok) in s.step().unwrap() {

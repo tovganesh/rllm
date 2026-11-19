@@ -63,7 +63,7 @@ impl Default for ServerLimits {
 /// Global shared application state across HTTP request handlers.
 pub struct AppState {
     /// Engine running the local LLM (`None` when inference is not served here).
-    pub engine: Option<EngineHandle<CpuBackend>>,
+    pub engine: Option<EngineHandle>,
     /// Tokenizer of the loaded model. `None` for synthetic models, which fall back to
     /// placeholder token IDs.
     pub tokenizer: Option<Arc<BpeTokenizer>>,

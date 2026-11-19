@@ -96,16 +96,16 @@ pub struct Retrieval {
 }
 
 /// A local LLM used to write grounded answers.
-pub struct LlmGenerator<B: Backend> {
+pub struct LlmGenerator {
     /// Engine running the model.
-    pub engine: EngineHandle<B>,
+    pub engine: EngineHandle,
     /// The model's tokenizer.
     pub tokenizer: Arc<BpeTokenizer>,
     /// The model's chat template.
     pub chat_template: Arc<ChatTemplate>,
 }
 
-impl<B: Backend> Clone for LlmGenerator<B> {
+impl Clone for LlmGenerator {
     fn clone(&self) -> Self {
         Self {
             engine: self.engine.clone(),
@@ -128,12 +128,12 @@ pub struct RagEngine<B: Backend> {
     /// Minimum dense cosine similarity for a passage to count as relevant.
     pub min_dense_similarity: f32,
     /// Local LLM for generated answers; `None` gives extractive answers.
-    pub generator: Option<LlmGenerator<B>>,
+    pub generator: Option<LlmGenerator>,
 }
 
 impl<B: Backend> RagEngine<B> {
     /// Creates an engine. Without a `generator`, answers are extractive.
-    pub fn new(embedder: Arc<TextEmbedder<B>>, generator: Option<LlmGenerator<B>>) -> Self {
+    pub fn new(embedder: Arc<TextEmbedder<B>>, generator: Option<LlmGenerator>) -> Self {
         let dim = embedder.dim();
         let min_dense_similarity = match embedder.calibrated_dense_threshold() {
             Some(t) => t,
@@ -271,7 +271,7 @@ impl<B: Backend> RagEngine<B> {
 
         let (answer, answer_source, generated_tokens) = match &self.generator {
             Some(generator) => {
-                let max_pos = generator.engine.scheduler().model.config.max_position_embeddings;
+                let max_pos = generator.engine.scheduler().model.config().max_position_embeddings;
                 // Drop the weakest sources until the prompt leaves room for the answer.
                 let prompt_tokens = loop {
                     let prompt = generator.chat_template.render(&grounded_messages(query, &citations), true)?;

@@ -240,3 +240,29 @@ fn perplexity_matches_llama_cpp_across_weight_formats() {
         assert!(rel.abs() < 0.01, "[{name}] perplexity {got:.4} differs from llama.cpp {expected:.4} by {:.2}%", rel * 100.0);
     }
 }
+
+/// Llama 3.2 (llama-bpe pre-tokenizer, 128k vocab, BOS added by default) against
+/// llama-tokenize. Skipped when `models/Llama-3.2-1B-Instruct-Q8_0.gguf` is absent.
+#[test]
+fn llama32_tokenizer_matches_llama_cpp() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/Llama-3.2-1B-Instruct-Q8_0.gguf");
+    if !path.exists() {
+        eprintln!("skipping: {} not found", path.display());
+        return;
+    }
+    let g = rllm_models::MappedGguf::open(&path).unwrap();
+    let tok = rllm_models::BpeTokenizer::from_gguf(&g.header).unwrap();
+    assert!(tok.add_bos, "Llama 3 tokenizers add BOS by default");
+    assert!(tok.stop_token_ids.contains(&tok.token_id("<|eot_id|>").unwrap()));
+    assert!(tok.stop_token_ids.contains(&tok.token_id("<|end_of_text|>").unwrap()));
+    let mut failures = Vec::new();
+    for case in fixture("llama32_tokenizer.json")["cases"].as_array().unwrap() {
+        let text = case["text"].as_str().unwrap();
+        let expected: Vec<u32> = case["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let got = tok.encode(text, true, true);
+        if got != expected {
+            failures.push(format!("{text:?}\n  expected {expected:?}\n  got      {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+}

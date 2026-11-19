@@ -11,8 +11,8 @@ use benchmark::{run_comprehensive_benchmark, BenchmarkOptions};
 use clap::{Parser, Subcommand};
 use rllm_backend_cpu::CpuBackend;
 use rllm_models::{
-    BertConfig, ChatMessage, GgufBundle, LlamaConfig, LlamaModel, LoadOptions, StreamDecoder,
-    TextEmbedder,
+    BertConfig, ChatMessage, GgufBundle, LanguageModel, LlamaConfig, LlamaModel, LoadOptions,
+    StreamDecoder, TextEmbedder,
 };
 use rllm_rag::{LlmGenerator, RagEngine};
 use rllm_scheduler::{
@@ -33,6 +33,11 @@ struct Cli {
     /// cores; RAYON_NUM_THREADS is also honoured)
     #[arg(long, global = true)]
     threads: Option<usize>,
+
+    /// Device for the LLM: `cpu`, or `metal` (Apple GPU, macOS only). Embedding models
+    /// always run on the CPU.
+    #[arg(long, global = true, default_value = "cpu")]
+    device: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -158,6 +163,16 @@ enum Commands {
 
         #[arg(long, default_value_t = 1)]
         warmup: usize,
+
+        /// Benchmark a real GGUF model instead of a synthetic preset, mirroring
+        /// llama-bench: pp = one forward pass over --prompt-tokens tokens, tg = time per
+        /// generated token over --generate-tokens tokens (batch size 1).
+        #[arg(long)]
+        model: Option<std::path::PathBuf>,
+
+        /// Repetitions per measurement for --model (the median is reported)
+        #[arg(long, default_value_t = 3)]
+        repetitions: usize,
     },
 
     /// Run end-to-end RAG interactive demonstration with citations and relevance verification
@@ -189,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let threads = rllm_backend_cpu::threads::init_thread_pool(cli.threads);
     tracing::info!("Using {threads} CPU worker threads");
+    let device = LlmDevice::parse(&cli.device)?;
 
     match cli.command {
         Commands::Serve {
@@ -231,14 +247,14 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or(model.clone());
                     tokenizer = Some(Arc::new(bundle.tokenizer));
                     chat_template = Some(Arc::new(bundle.chat_template));
-                    Arc::new(bundle.model)
+                    device.executor(bundle.model)?
                 } else {
                     let llama_cfg = match model.as_str() {
                         "edge-4gb" => LlamaConfig::edge_4gb(),
                         "1b" => LlamaConfig::llama_3_2_1b(),
                         _ => LlamaConfig::tiny_test_config(),
                     };
-                    Arc::new(LlamaModel::new_random(llama_cfg, backend.clone())?)
+                    device.executor(LlamaModel::new_random(llama_cfg, backend.clone())?)?
                 };
                 let block_size = 16;
                 let sched_cfg = SchedulerConfig {
@@ -322,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
             max_context,
         } => {
             run_generate(GenerateArgs {
+                device,
                 model,
                 prompt,
                 system,
@@ -336,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Perplexity { model, file, ctx } => {
-            run_perplexity(&model, &file, ctx)?;
+            run_perplexity(&model, &file, ctx, device)?;
         }
 
         Commands::Bench {
@@ -345,7 +362,13 @@ async fn main() -> anyhow::Result<()> {
             prompt_tokens,
             generate_tokens,
             warmup,
+            model,
+            repetitions,
         } => {
+            if let Some(path) = model {
+                run_model_bench(&path, prompt_tokens, generate_tokens, repetitions.max(1), device)?;
+                return Ok(());
+            }
             let opts = BenchmarkOptions {
                 preset,
                 batch_size,
@@ -375,7 +398,7 @@ async fn main() -> anyhow::Result<()> {
                             total_blocks: 256,
                             ..SchedulerConfig::default()
                         },
-                        Arc::new(b.model),
+                        device.executor(b.model)?,
                     )?;
                     Some(LlmGenerator {
                         engine: EngineHandle::start(Arc::new(scheduler), EngineConfig::default()),
@@ -439,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct GenerateArgs {
+    device: LlmDevice,
     model: std::path::PathBuf,
     prompt: String,
     system: Option<String>,
@@ -484,7 +508,7 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
             total_blocks: needed.div_ceil(block_size),
             max_prefill_tokens: prompt_len.max(1),
         },
-        Arc::new(bundle.model),
+        args.device.executor(bundle.model)?,
     )?;
 
     let sampling = SamplingParams {
@@ -534,13 +558,14 @@ fn load_embedder(path: Option<&std::path::Path>, backend: Arc<CpuBackend>) -> an
 }
 
 /// `rllm perplexity`: mirrors `llama-perplexity` so results can be compared directly.
-fn run_perplexity(model: &std::path::Path, file: &std::path::Path, ctx: usize) -> anyhow::Result<()> {
+fn run_perplexity(model: &std::path::Path, file: &std::path::Path, ctx: usize, device: LlmDevice) -> anyhow::Result<()> {
     let bundle = GgufBundle::load(model, Arc::new(CpuBackend), &LoadOptions { max_context: Some(ctx), ..LoadOptions::default() })?;
     let text = std::fs::read_to_string(file)?;
     let tokens = bundle.tokenizer.encode(&text, true, false);
     let bos = if bundle.tokenizer.add_bos { bundle.tokenizer.bos_token_id } else { None };
     let start = Instant::now();
-    let p = rllm_models::perplexity(&bundle.model, &tokens, ctx, bos)?;
+    let lm = device.executor(bundle.model)?;
+    let p = rllm_models::perplexity(lm.as_ref(), &tokens, ctx, bos)?;
     let secs = start.elapsed().as_secs_f64();
     println!(
         "{} chunks of {} tokens, {} scored: PPL = {:.4} ({:.2}s, {:.0} tok/s)",
@@ -551,5 +576,90 @@ fn run_perplexity(model: &std::path::Path, file: &std::path::Path, ctx: usize) -
         secs,
         (p.chunks * ctx) as f64 / secs
     );
+    Ok(())
+}
+
+/// Where the LLM runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmDevice {
+    Cpu,
+    Metal,
+}
+
+impl LlmDevice {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "metal" | "gpu" => Ok(Self::Metal),
+            other => anyhow::bail!("unknown --device '{other}' (expected cpu or metal)"),
+        }
+    }
+
+    /// Wraps a CPU-loaded model for this device.
+    fn executor(self, model: LlamaModel<CpuBackend>) -> anyhow::Result<Arc<dyn LanguageModel>> {
+        match self {
+            Self::Cpu => Ok(Arc::new(model)),
+            Self::Metal => {
+                #[cfg(target_os = "macos")]
+                {
+                    let gpu = rllm_backend_metal::MetalLlama::from_cpu_model(&model)?;
+                    tracing::info!("LLM running on {}", gpu.device_name());
+                    Ok(Arc::new(gpu))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = model;
+                    anyhow::bail!("--device metal is only available on macOS")
+                }
+            }
+        }
+    }
+}
+
+/// `rllm bench --model`: llama-bench-style prompt-processing and generation throughput.
+fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
+    use rllm_core::backend::BlockTable;
+    use rllm_models::ForwardBatch;
+
+    let ctx = pp + tg + 1;
+    let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(ctx.max(16)), ..LoadOptions::default() })?;
+    let vocab = bundle.model.config.vocab_size as u32;
+    let lm = device.executor(bundle.model)?;
+    let block = 16;
+    let blocks = ctx.div_ceil(block);
+    lm.init_kv_cache(blocks, block)?;
+    let table = BlockTable { block_size: block, block_ids: (0..blocks).collect() };
+    // Deterministic pseudo-random prompt tokens, as llama-bench uses random tokens.
+    let tokens: Vec<u32> = (0..pp as u32).map(|i| (i.wrapping_mul(2654435761) >> 8) % vocab).collect();
+    let positions: Vec<usize> = (0..pp).collect();
+    let tables = vec![table.clone(); pp];
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+
+    // Warm-up (shader/pipeline caches, page faults).
+    lm.forward_cached(&ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &tables, logits_rows: &[pp - 1] })?;
+
+    let mut pp_rates = Vec::new();
+    for _ in 0..reps {
+        let t = Instant::now();
+        lm.forward_cached(&ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &tables, logits_rows: &[pp - 1] })?;
+        pp_rates.push(pp as f64 / t.elapsed().as_secs_f64());
+    }
+    let mut tg_rates = Vec::new();
+    for _ in 0..reps {
+        let t = Instant::now();
+        for i in 0..tg {
+            let tok = [(i as u32 * 7919) % vocab];
+            lm.forward_cached(&ForwardBatch { tokens: &tok, positions: &[i], block_tables: std::slice::from_ref(&table), logits_rows: &[0] })?;
+        }
+        tg_rates.push(tg as f64 / t.elapsed().as_secs_f64());
+    }
+    println!("| model | device | test | t/s |");
+    println!("| --- | --- | --- | ---: |");
+    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    println!("| {name} | {} | pp{pp} | {:.1} |", lm.device_name(), median(pp_rates));
+    println!("| {name} | {} | tg{tg} | {:.1} |", lm.device_name(), median(tg_rates));
     Ok(())
 }

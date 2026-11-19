@@ -42,7 +42,7 @@ flowchart TD
     subgraph ComputeLayer ["Backends"]
         Trait["Backend trait (rllm-core) ✅"]
         CPU["rllm-backend-cpu ✅ (NEON SDOT, Accelerate; AVX2/AVX-512 📋)"]
-        Metal["rllm-backend-metal ⛔"]
+        Metal["rllm-backend-metal ✅ (MetalLlama executor)"]
         CUDA["rllm-backend-cuda 📋"]
     end
 
@@ -57,12 +57,12 @@ flowchart TD
 
 ## 2. Target Hardware Tiers
 
-These are design goals. Today only the CPU backend executes; there is no Metal or CUDA execution path.
+These are design goals. Today the CPU backend and a Metal executor (Apple GPUs) execute; there is no CUDA path.
 
 | Tier | Target platforms | Intended techniques | Today |
 | :--- | :--- | :--- | :--- |
 | Edge / smartphone | iOS, Android (ARM64) | Q4/Q8 block quantization, mmap weights, NEON, Metal | NEON F32 dot/GEMV and scalar Q4_0/Q8_0 GEMV on CPU |
-| Workstation / unified memory | Apple Silicon | Metal compute pipelines, zero-copy unified memory | MSL source only; no dispatch |
+| Workstation / unified memory | Apple Silicon | Metal compute pipelines, unified memory | `MetalLlama`: whole-model command buffers, shared-memory weights, GPU KV cache |
 | GPU cluster | NVIDIA data-center GPUs | CUDA, FlashAttention, tensor parallelism | Not started |
 
 ---
@@ -73,7 +73,7 @@ These are design goals. Today only the CPU backend executes; there is no Metal o
 crates/
 ├── rllm-core/          # Tensor, Shape, DType, Device, Storage, Backend trait, errors
 ├── rllm-backend-cpu/   # CPU kernels
-├── rllm-backend-metal/ # Metal backend stub + MSL shaders
+├── rllm-backend-metal/ # MetalLlama: Apple GPU executor + MSL kernels
 ├── rllm-models/        # LlamaModel, BertEmbeddingModel, GgufFile, Tokenizer, configs
 ├── rllm-scheduler/     # BlockAllocator, PrefixCache, ContinuousBatchScheduler, Sampler, Sequence
 ├── rllm-rag/           # TextChunker, HnswIndex, Bm25Index, HybridIndex, reranker, grounding, RagEngine
@@ -89,7 +89,7 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 
 ### 4.1 Tensor & Backend Abstraction (`rllm-core`) — ✅
 
-- `Tensor` holds a shape, strides, dtype, device, byte offset and a `Storage` (`Cpu`, `Metal`, `Cuda`). Only `Cpu` storage holds data; `Metal`/`Cuda` variants are placeholders.
+- `Tensor` holds a shape, strides, dtype, device, byte offset and a `Storage` (`Cpu`, `Metal`, `Cuda`). Only `Cpu` storage holds data; GPU execution does not go through per-operation tensors but through whole-model executors (see 4.2b).
 - `reshape` and `transpose` are zero-copy views. `as_f32_slice` rejects non-contiguous views; `contiguous()` materialises them. CPU `matmul` recognises a transposed contiguous weight (`W.transpose(0, 1)`) and computes `A·Wᵀ` with row dot products without copying.
 - `CpuStorage` is 64-byte aligned.
 - `Backend` is an object-safe trait with: `matmul`, `rms_norm`, `rope`, `swiglu`, `softmax`, `embedding`, `paged_attention`, `gemv_quantized`.
@@ -102,6 +102,16 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 - **Parallelism:** the forward pass runs inside the Rayon pool (`rayon::scope`), so inner kernels use work-stealing. Element-wise kernels below 16 Ki elements run on one thread; matrix-vector products split into ~128 KiB weight slabs (`RLLM_TASK_BYTES`). `threads::init_thread_pool` defaults to the number of performance cores on Apple Silicon.
 - **PagedAttention:** one work item per (row, KV head) computes every query head of the GQA group in one pass over that head's cached keys and values, walking the block table block by block. One row per prompt token gives causal prefill; one row per sequence gives batched decode.
 - F32 dot products use NEON FMA on aarch64. RMSNorm, LayerNorm, RoPE, SwiGLU, GELU and softmax are scalar / auto-vectorised.
+
+### 4.2b Metal executor (`rllm-backend-metal`) — ✅
+
+GPU execution is a whole-model executor rather than a per-operation `Backend`: dispatching hundreds of small operations per token with a host round-trip each would be slower than the CPU. `MetalLlama::from_cpu_model` copies a loaded model's weights once into shared-memory Metal buffers and implements `LanguageModel`, so the scheduler, engine, server and RAG use it unchanged (`--device metal`).
+
+- **One command buffer per forward pass.** Embedding lookup, every layer (RMSNorm, Q/K/V projections, RoPE, KV-cache write, attention, output projection, residuals, SwiGLU MLP) and the final norm + LM head on the requested rows are encoded into a single serial compute encoder; the host waits once and reads the logits from shared memory.
+- **Linear layers:** F32 / Q8_0 / Q4_0 weights in GGUF block layout. Up to 8 rows use a matrix-vector kernel (one simdgroup per 4 output rows); larger batches use a 32×32-tile GEMM with weights dequantized into threadgroup memory and 8×8 `simdgroup_float8x8` multiply-accumulates. Activations stay F32 (as in llama.cpp's Metal backend).
+- **Attention:** consecutive prompt rows of one sequence are grouped into tiles of up to 8 and processed FlashAttention-style (one simdgroup per head and tile, K/V read once per tile as 8×8 fragments from the paged cache, per-row online softmax with causal masking). Single rows (decode) use a kernel where four simdgroups split the keys in 32-position tiles and merge their partial softmax states.
+- **KV cache:** per-layer private GPU buffers in the same paged layout as the CPU, zero-initialised; block size must be a multiple of 8.
+- **Constraints:** head_dim a multiple of 32 and at most 128; hidden and intermediate sizes multiples of 32. Shaders are compiled at load with `newLibraryWithSource`.
 
 ### 4.3 Models (`rllm-models`) — ✅
 
@@ -118,6 +128,7 @@ A `rllm-backend-cuda` crate is planned but does not exist.
 
 - **Paged KV cache:** per-layer K/V tensors of shape `[total_blocks, num_kv_heads, block_size, head_dim]`; `BlockAllocator` hands out block IDs from a free list with reference counts.
 - **Radix prefix cache:** a token trie that records a physical block ID at every `block_size` boundary; `match_prefix` returns the longest fully cached block-aligned prefix. The cache holds one allocator reference per cached block, so cached blocks are never on the free list; when the pool is exhausted, least-recently-used leaf blocks not used by any sequence are evicted. Matching happens at admission and always leaves at least one token to compute. Only full blocks are shared (no copy-on-write of partial blocks yet).
+- **Model interface:** the scheduler drives any `LanguageModel` (`config`, `init_kv_cache`, `forward_cached`); the model owns its paged KV cache. `LlamaModel<CpuBackend>` and `MetalLlama` implement it.
 - **Continuous batching:** `step()` admits waiting sequences while blocks are available, ensures capacity for the next token, runs one batched decode, samples, and retires finished sequences. Each step prefills newly admitted sequences (subject to `max_prefill_tokens`) together with decoding running ones; under KV pressure the newest sequence is preempted and later recomputed; a sequence larger than the whole pool finishes with `Length`.
 - **Engine thread:** `EngineHandle::start` spawns one thread that steps the scheduler while any sequence is waiting or running and sleeps on a condition variable otherwise. `EngineHandle::submit` validates the request, rejects it with `SubmitError::Overloaded` if `max_waiting` sequences are already queued, and returns a `GenerationStream` of `SequenceEvent`s (`Token`, then exactly one `Finished(reason)` or `Error`). Tokens are delivered through each sequence's own channel, so they reach the right owner whichever thread steps.
 - **Cancellation:** dropping a `GenerationStream` closes its channel. At the next step the scheduler drops cancelled waiting sequences and retires cancelled running ones as `Finished(Abort)`, freeing their KV blocks (computed full blocks go to the prefix cache).

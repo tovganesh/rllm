@@ -16,7 +16,8 @@ pub struct BlockTable {
 
 /// Hardware backend abstraction interface.
 ///
-/// Implemented by `CpuBackend`, `MetalBackend`, and `CudaBackend`.
+/// Implemented by `CpuBackend`. (GPU execution uses whole-model executors such as
+/// `rllm_backend_metal::MetalLlama` instead of per-operation dispatch.)
 /// Provides high-level dispatch for fundamental neural network primitives
 /// optimized for autoregressive decoding and continuous batching.
 pub trait Backend: Send + Sync + 'static {

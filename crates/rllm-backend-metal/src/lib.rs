@@ -1,11 +1,16 @@
 //! # `rllm-backend-metal`
 //!
-//! Apple Silicon & iOS Metal backend for hardware-accelerated LLM execution.
+//! Apple GPU executor for LLaMA-architecture models ([`MetalLlama`]), implementing
+//! [`rllm_models::LanguageModel`] so it plugs into the continuous-batching scheduler.
+//! The whole forward pass is encoded into a single Metal command buffer; weights and the
+//! paged KV cache live in GPU-visible memory.
 //!
-//! Exploits unified memory architecture (UMA) where CPU and GPU share physical RAM,
-//! allowing zero-copy tensor passing and Metal Shading Language (MSL) compute shaders.
+//! Only available on macOS; on other platforms the crate is empty.
 
-pub mod backend;
+#[cfg(target_os = "macos")]
+mod llama;
+#[cfg(target_os = "macos")]
 pub mod shaders;
 
-pub use backend::MetalBackend;
+#[cfg(target_os = "macos")]
+pub use llama::MetalLlama;
