@@ -8,6 +8,7 @@ use crate::block_allocator::BlockAllocator;
 use crate::prefix_cache::PrefixCache;
 use crate::sampler::Sampler;
 use crate::sequence::{FinishReason, Sequence, SequenceEvent, SequenceStatus};
+use crate::speculative::{lookup_draft, PassCosts, SpeculationConfig};
 use parking_lot::Mutex;
 use rllm_core::{
     backend::BlockTable,
@@ -32,7 +33,14 @@ pub struct SchedulerConfig {
     /// Soft cap on prompt tokens prefilled per step. A single sequence whose prompt
     /// exceeds this is still admitted on its own, so long prompts cannot starve.
     pub max_prefill_tokens: usize,
+    /// Prompt-lookup speculative decoding; off by default (see [`crate::speculative`]).
+    pub speculation: SpeculationConfig,
 }
+
+/// Most rows that decoding sequences (newest token plus drafts) may add to one step
+/// while speculating. Verification pays off while the batch stays in the
+/// memory-bound small-batch regime; past it, extra rows cost real compute.
+const SPECULATION_MAX_DECODE_ROWS: usize = 32;
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -41,6 +49,7 @@ impl Default for SchedulerConfig {
             block_size: 16,
             total_blocks: 1024,
             max_prefill_tokens: 2048,
+            speculation: SpeculationConfig::default(),
         }
     }
 }
@@ -51,6 +60,7 @@ struct EngineState {
     allocator: BlockAllocator,
     prefix_cache: PrefixCache,
     num_preemptions: u64,
+    pass_costs: PassCosts,
 }
 
 /// Monotonic counters describing scheduler activity (exported on `/metrics`).
@@ -72,6 +82,10 @@ pub struct SchedulerMetrics {
     pub cached_prompt_tokens: AtomicU64,
     /// Tokens generated.
     pub generated_tokens: AtomicU64,
+    /// Draft tokens proposed by prompt-lookup speculation and run through the model.
+    pub draft_tokens: AtomicU64,
+    /// Draft tokens that matched the sampled token (each saves one forward pass).
+    pub accepted_draft_tokens: AtomicU64,
     /// Forward passes executed.
     pub forward_passes: AtomicU64,
     /// Total time spent in forward passes, in microseconds.
@@ -96,7 +110,8 @@ impl SchedulerMetrics {
 ///   reusing any block-aligned prefix found in the radix cache), and
 /// - the newest token of every sequence already decoding,
 ///
-/// then samples one token per sequence.
+/// then samples one token per sequence. With speculation enabled, decoding sequences
+/// also run draft tokens and may accept several tokens per step.
 pub struct ContinuousBatchScheduler {
     /// Scheduler configuration parameters.
     pub config: SchedulerConfig,
@@ -136,6 +151,7 @@ impl ContinuousBatchScheduler {
                 allocator: BlockAllocator::new(block_size, total_blocks),
                 prefix_cache: PrefixCache::new(block_size),
                 num_preemptions: 0,
+                pass_costs: PassCosts::new(SPECULATION_MAX_DECODE_ROWS),
             }),
             next_id: AtomicU64::new(1),
             metrics: SchedulerMetrics::default(),
@@ -218,6 +234,7 @@ impl ContinuousBatchScheduler {
             allocator,
             prefix_cache,
             num_preemptions,
+            pass_costs,
         } = &mut *state;
 
         // 0. Drop sequences whose owner has gone away (client disconnects).
@@ -236,13 +253,19 @@ impl ContinuousBatchScheduler {
         }
         self.retire_finished(running, allocator, prefix_cache);
 
-        // 1. Make room for one more token in every running (decoding) sequence,
-        //    preempting the most recently admitted sequences if the pool is exhausted.
+        // 1. Make room for one more token in every running (decoding) sequence, plus
+        //    its speculative drafts, preempting the most recently admitted sequences if
+        //    the pool is exhausted (drafts are dropped first).
+        self.propose_drafts(running, pass_costs);
         let mut i = 0;
         while i < running.len() {
-            let needed = running[i].total_tokens();
+            let needed = running[i].total_tokens() + running[i].draft_tokens.len();
             if ensure_capacity(allocator, prefix_cache, &mut running[i].block_table, needed).is_ok() {
                 i += 1;
+                continue;
+            }
+            if !running[i].draft_tokens.is_empty() {
+                running[i].draft_tokens.clear();
                 continue;
             }
             if running.len() == 1 {
@@ -261,6 +284,7 @@ impl ContinuousBatchScheduler {
             *num_preemptions += 1;
             allocator.free_table(&mut victim.block_table);
             victim.num_computed_tokens = 0;
+            victim.draft_tokens.clear();
             victim.status = SequenceStatus::Waiting;
             waiting.push_front(victim);
         }
@@ -310,11 +334,14 @@ impl ContinuousBatchScheduler {
             return Ok(Vec::new());
         }
 
-        // 3. Flatten every sequence's uncomputed tokens into one batch.
+        // 3. Flatten every sequence's uncomputed tokens (and drafts) into one batch.
+        //    A sequence with `d` drafts gets `d + 1` logits rows: one after its newest
+        //    token and one after each draft token.
         let mut tokens = Vec::new();
         let mut positions = Vec::new();
         let mut row_tables = Vec::new();
         let mut logits_rows = Vec::with_capacity(running.len());
+        let mut num_drafts = 0usize;
         for seq in running.iter() {
             for pos in seq.num_computed_tokens..seq.total_tokens() {
                 tokens.push(seq.token_at(pos));
@@ -322,12 +349,20 @@ impl ContinuousBatchScheduler {
                 row_tables.push(seq.block_table.clone());
             }
             logits_rows.push(tokens.len() - 1);
+            for (j, &t) in seq.draft_tokens.iter().enumerate() {
+                tokens.push(t);
+                positions.push(seq.total_tokens() + j);
+                row_tables.push(seq.block_table.clone());
+                logits_rows.push(tokens.len() - 1);
+            }
+            num_drafts += seq.draft_tokens.len();
         }
 
         let decode_rows = running.iter().filter(|s| s.total_tokens() - s.num_computed_tokens == 1 && !s.output_tokens.is_empty()).count();
         self.metrics
             .prefill_tokens
-            .fetch_add((tokens.len() - decode_rows) as u64, Ordering::Relaxed);
+            .fetch_add((tokens.len() - decode_rows - num_drafts) as u64, Ordering::Relaxed);
+        self.metrics.draft_tokens.fetch_add(num_drafts as u64, Ordering::Relaxed);
         let started = Instant::now();
         let logits_slice = self.model.forward_cached(&ForwardBatch {
             tokens: &tokens,
@@ -336,18 +371,43 @@ impl ContinuousBatchScheduler {
             logits_rows: &logits_rows,
         })?;
         self.metrics.forward_passes.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .forward_time_us
-            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let elapsed = started.elapsed();
+        self.metrics.forward_time_us.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        if self.config.speculation.enabled() && tokens.len() == decode_rows + num_drafts {
+            pass_costs.record(tokens.len(), elapsed.as_secs_f64() * 1e6);
+        }
 
-        // 4. Sample the next token of every sequence.
+        // 4. Sample the next token of every sequence. With drafts, keep sampling from
+        //    the following rows while the sampled token equals the draft token: that
+        //    draft's KV entry is then valid and the next row conditions on it.
         let vocab_size = self.model.config().vocab_size;
         let max_pos = self.model.config().max_position_embeddings;
         let mut generated = Vec::with_capacity(running.len());
         let block_size = self.config.block_size;
-        for (idx, seq) in running.iter_mut().enumerate() {
+        let mut row = 0usize;
+        let mut accepted = 0u64;
+        for seq in running.iter_mut() {
             let before = seq.num_computed_tokens;
             seq.num_computed_tokens = seq.total_tokens();
+            let drafts = std::mem::take(&mut seq.draft_tokens);
+            let accepted_before = accepted;
+            let rows = row..row + drafts.len() + 1;
+            row = rows.end;
+            for (i, r) in rows.enumerate() {
+                let seq_logits = &logits_slice[r * vocab_size..(r + 1) * vocab_size];
+                let token = Sampler::sample(seq_logits, &seq.sampling_params, &seq.output_tokens);
+                seq.append_token(token);
+                if seq.status == SequenceStatus::Running && seq.total_tokens() >= max_pos {
+                    seq.status = SequenceStatus::Finished(FinishReason::Length);
+                }
+                generated.push((seq.id, token));
+                if seq.status != SequenceStatus::Running || drafts.get(i) != Some(&token) {
+                    break;
+                }
+                seq.num_computed_tokens += 1;
+                accepted += 1;
+            }
+            seq.draft_stats.record(drafts.len(), (accepted - accepted_before) as usize);
             // Share newly completed blocks right away (not only when the sequence
             // finishes), so concurrent requests with the same prefix — a system prompt,
             // a chat history — reuse them. Full blocks are never written again: later
@@ -358,20 +418,60 @@ impl ContinuousBatchScheduler {
                     allocator.inc_ref(bid);
                 }
             }
-            let seq_logits = &logits_slice[idx * vocab_size..(idx + 1) * vocab_size];
-            let token = Sampler::sample(seq_logits, &seq.sampling_params, &seq.output_tokens);
-            seq.append_token(token);
-            if seq.status == SequenceStatus::Running && seq.total_tokens() >= max_pos {
-                seq.status = SequenceStatus::Finished(FinishReason::Length);
-            }
-            generated.push((seq.id, token));
         }
+        self.metrics.accepted_draft_tokens.fetch_add(accepted, Ordering::Relaxed);
         self.metrics.generated_tokens.fetch_add(generated.len() as u64, Ordering::Relaxed);
 
         // 5. Retire finished sequences.
         self.retire_finished(running, allocator, prefix_cache);
 
         Ok(generated)
+    }
+
+    /// Fills `draft_tokens` of every decoding sequence by prompt lookup, keeping the
+    /// decode rows of the step within [`SPECULATION_MAX_DECODE_ROWS`] and each draft
+    /// at the length with the best expected throughput ([`PassCosts::choose_draft_len`]).
+    fn propose_drafts(&self, running: &mut [Sequence], costs: &PassCosts) {
+        let spec = &self.config.speculation;
+        if !spec.enabled() {
+            return;
+        }
+        let max_pos = self.model.config().max_position_embeddings;
+        let mut rows = running.len();
+        let mut expected = rows as f32;
+        for seq in running.iter_mut() {
+            seq.draft_tokens.clear();
+            let total = seq.total_tokens();
+            if seq.output_tokens.is_empty() || total - seq.num_computed_tokens != 1 {
+                continue;
+            }
+            // Never draft past what the sequence may still generate: the step's last
+            // sampled token needs no KV entry, so at most `remaining - 1` drafts help.
+            let remaining = seq.sampling_params.max_tokens.saturating_sub(seq.output_tokens.len());
+            let budget = spec
+                .max_draft_tokens
+                .min(remaining.saturating_sub(1))
+                .min(max_pos.saturating_sub(total + 1))
+                .min(SPECULATION_MAX_DECODE_ROWS.saturating_sub(rows));
+            if budget == 0 {
+                continue;
+            }
+            let mut draft = lookup_draft(&seq.all_tokens(), spec.min_ngram, spec.max_ngram, budget);
+            if draft.is_empty() {
+                continue;
+            }
+            let a = seq.draft_stats.acceptance();
+            if spec.adaptive {
+                draft.truncate(costs.choose_draft_len(rows, expected, a, draft.len()));
+            }
+            if draft.is_empty() {
+                seq.draft_stats.decay();
+                continue;
+            }
+            rows += draft.len();
+            expected += crate::speculative::expected_tokens(a, draft.len()) - 1.0;
+            seq.draft_tokens = draft;
+        }
     }
 
     /// Retires finished sequences: hands their computed full blocks to the prefix cache

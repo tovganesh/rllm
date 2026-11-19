@@ -14,6 +14,7 @@ pub mod prefix_cache;
 pub mod sampler;
 pub mod scheduler;
 pub mod sequence;
+pub mod speculative;
 
 pub use block_allocator::BlockAllocator;
 pub use engine::{EngineConfig, EngineHandle, GenerationStream, SubmitError};
@@ -21,6 +22,7 @@ pub use prefix_cache::PrefixCache;
 pub use sampler::{Sampler, SamplingParams};
 pub use scheduler::{ContinuousBatchScheduler, SchedulerConfig, SchedulerMetrics};
 pub use sequence::{FinishReason, Sequence, SequenceEvent, SequenceStatus};
+pub use speculative::{lookup_draft, DraftStats, PassCosts, SpeculationConfig};
 
 #[cfg(test)]
 mod tests {

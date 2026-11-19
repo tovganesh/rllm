@@ -17,6 +17,7 @@ use rllm_models::{
 use rllm_rag::{LlmGenerator, RagEngine};
 use rllm_scheduler::{
     ContinuousBatchScheduler, EngineConfig, EngineHandle, SamplingParams, SchedulerConfig, Sequence,
+    SpeculationConfig,
 };
 use std::io::Write;
 use rllm_server::{run_server, AppState, ServerLimits, ServerMetrics};
@@ -95,6 +96,16 @@ enum Commands {
         /// Largest max_tokens a request may ask for
         #[arg(long, default_value_t = 4096)]
         max_tokens_limit: usize,
+
+        /// Prompt-lookup speculative decoding (off by default): propose up to N draft
+        /// tokens per step copied from earlier context and verify them in one forward
+        /// pass. Helps when output repeats the prompt (code edits, quoting, RAG).
+        #[arg(long, default_value_t = 0)]
+        lookup_draft: usize,
+
+        /// Longest suffix n-gram matched by --lookup-draft (tries shorter ones down to 1)
+        #[arg(long, default_value_t = 3)]
+        lookup_ngram: usize,
     },
 
     /// Generate text from a GGUF model
@@ -104,8 +115,12 @@ enum Commands {
         model: std::path::PathBuf,
 
         /// User prompt (or raw text with --raw)
+        #[arg(long, required_unless_present = "prompt_file", conflicts_with = "prompt_file")]
+        prompt: Option<String>,
+
+        /// Read the prompt from a file instead of --prompt
         #[arg(long)]
-        prompt: String,
+        prompt_file: Option<std::path::PathBuf>,
 
         /// Optional system message (chat mode only)
         #[arg(long)]
@@ -134,6 +149,16 @@ enum Commands {
         /// Cap on the model context window
         #[arg(long, default_value_t = 4096)]
         max_context: usize,
+
+        /// Prompt-lookup speculative decoding (off by default): propose up to N draft
+        /// tokens per step copied from earlier context and verify them in one forward
+        /// pass. Helps when output repeats the prompt (code edits, quoting, RAG).
+        #[arg(long, default_value_t = 0)]
+        lookup_draft: usize,
+
+        /// Longest suffix n-gram matched by --lookup-draft (tries shorter ones down to 1)
+        #[arg(long, default_value_t = 3)]
+        lookup_ngram: usize,
     },
 
     /// Measure perplexity of a GGUF model on a text file (llama.cpp's protocol:
@@ -241,6 +266,8 @@ async fn main() -> anyhow::Result<()> {
             min_dense_similarity,
             max_waiting,
             max_tokens_limit,
+            lookup_draft,
+            lookup_ngram,
         } => {
             use rllm_server::ServiceMode;
             let mode = match service.to_lowercase().as_str() {
@@ -283,6 +310,7 @@ async fn main() -> anyhow::Result<()> {
                     max_batch_size,
                     block_size,
                     total_blocks: kv_cache_tokens.div_ceil(block_size).max(1),
+                    speculation: speculation(lookup_draft, lookup_ngram),
                     ..SchedulerConfig::default()
                 };
                 let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, llama_model)?);
@@ -350,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Generate {
             model,
             prompt,
+            prompt_file,
             system,
             raw,
             max_tokens,
@@ -358,7 +387,15 @@ async fn main() -> anyhow::Result<()> {
             top_k,
             repetition_penalty,
             max_context,
+            lookup_draft,
+            lookup_ngram,
         } => {
+            let prompt = match (prompt, prompt_file) {
+                (Some(p), _) => p,
+                (None, Some(f)) => std::fs::read_to_string(&f)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", f.display()))?,
+                (None, None) => anyhow::bail!("--prompt or --prompt-file is required"),
+            };
             run_generate(GenerateArgs {
                 device,
                 model,
@@ -371,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
                 top_k,
                 repetition_penalty,
                 max_context,
+                speculation: speculation(lookup_draft, lookup_ngram),
             })?;
         }
 
@@ -500,6 +538,17 @@ struct GenerateArgs {
     top_k: usize,
     repetition_penalty: f32,
     max_context: usize,
+    speculation: SpeculationConfig,
+}
+
+/// Prompt-lookup settings from `--lookup-draft` / `--lookup-ngram`.
+fn speculation(max_draft_tokens: usize, max_ngram: usize) -> SpeculationConfig {
+    SpeculationConfig {
+        max_draft_tokens,
+        min_ngram: 1,
+        max_ngram: max_ngram.max(1),
+        adaptive: true,
+    }
 }
 
 /// `rllm generate`: load a GGUF model and stream a completion to stdout.
@@ -534,6 +583,7 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
             block_size,
             total_blocks: needed.div_ceil(block_size),
             max_prefill_tokens: prompt_len.max(1),
+            speculation: args.speculation.clone(),
         },
         args.device.executor(bundle.model)?,
     )?;
@@ -573,6 +623,17 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
         generated.len(),
         if decode_secs > 0.0 { decode_tokens as f64 / decode_secs } else { 0.0 },
     );
+    if args.speculation.enabled() {
+        let m = &scheduler.metrics;
+        let drafted = m.draft_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        let accepted = m.accepted_draft_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        let passes = m.forward_passes.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1);
+        eprintln!(
+            "[rllm] prompt lookup: {accepted}/{drafted} draft tokens accepted ({:.0}%), {:.2} tokens per decode pass",
+            100.0 * accepted as f64 / drafted.max(1) as f64,
+            decode_tokens as f64 / passes.max(1) as f64,
+        );
+    }
     Ok(())
 }
 
@@ -744,6 +805,7 @@ fn run_prefix_bench(path: &std::path::Path, prompt: usize, shared: usize, reps: 
                 block_size,
                 total_blocks: (3 * prompt).div_ceil(block_size) + 4,
                 max_prefill_tokens: prompt + 1,
+                ..SchedulerConfig::default()
             },
             lm.clone(),
         )?;

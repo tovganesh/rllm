@@ -4,6 +4,7 @@
 //! completion reason, and optional streaming token senders.
 
 use crate::sampler::SamplingParams;
+use crate::speculative::DraftStats;
 use rllm_core::backend::BlockTable;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
@@ -61,6 +62,11 @@ pub struct Sequence {
     /// Number of leading tokens whose keys/values are already in the KV cache
     /// (from prefix-cache reuse or earlier forward passes).
     pub num_computed_tokens: usize,
+    /// Speculative draft tokens to verify after the newest token in the next forward
+    /// pass (prompt lookup; empty unless speculation is enabled).
+    pub draft_tokens: Vec<u32>,
+    /// Recent draft acceptance, used to pick the draft length.
+    pub draft_stats: DraftStats,
 }
 
 impl Sequence {
@@ -84,6 +90,8 @@ impl Sequence {
             sampling_params,
             sender,
             num_computed_tokens: 0,
+            draft_tokens: Vec::new(),
+            draft_stats: DraftStats::default(),
         }
     }
 

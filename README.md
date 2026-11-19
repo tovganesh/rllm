@@ -52,7 +52,7 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | Radix-tree prefix cache | ✅ | Block-granular tree, ref-counted blocks, LRU leaf eviction. Blocks are shared as soon as they are computed, so concurrent requests reuse a common system prompt or chat history. Time to first token with a warm 2k-token prefix: 14x faster on CPU, 23x on Metal (Llama-3.2-1B). |
 | Continuous batching (iteration-level) | ✅ | A dedicated engine thread steps the scheduler; each step mixes prefill of new sequences with decode of running ones, and preempts (recompute) under KV pressure. Requests receive tokens and a terminal event over their own channel; disconnecting cancels the sequence and frees its KV blocks. 8 concurrent requests run 2.8× faster than sequential on SmolLM2-135M. |
 | Sampler (temperature, top-k, top-p, repetition penalty) | ✅ | |
-| Speculative decoding | 📋 | |
+| Speculative decoding | 🟡 | Prompt lookup (n-gram drafts from the sequence's own context, no draft model), opt-in with `--lookup-draft N`. Drafts are verified in the same batched forward pass. The output distribution is unchanged for any sampler, and the draft length adapts to measured pass costs and acceptance. 1.3–4.1× faster decode on Llama-3.2-1B when the answer copies its input (code edits, quoting); within 3% otherwise. Draft-model speculation is not implemented. |
 
 ### RAG
 
@@ -99,7 +99,7 @@ Remaining limitations:
 - **P0 — Correctness:** ✅ done — projection layout, causal prefill, per-token RoPE, prefix-cache block ownership, aligned storage, input bounds, numerical reference tests.
 - **P1 — Real models:** ✅ done — GGUF loading, BPE and WordPiece tokenizers, chat templates, `rllm generate`, real-model chat completions, BERT embedding models, LLM-generated RAG answers with verified citations.
 - **P2 — Serving:** ✅ done — dedicated engine thread with per-request channels, SSE streaming, cancellation on disconnect, queue/`max_tokens`/body limits with 429s, structured errors, Prometheus metrics, graceful shutdown.
-- **P3 — Performance & backends:** 🟡 CPU and Metal done — int8 `SDOT` kernels, Accelerate GEMM, parallelism tuning, a spinning decode thread pool, small-batch (2–32 token) kernels, GQA-grouped attention, native Q4_K / Q6_K kernels on CPU and Metal, repacked Q4_0 with i8mm, a Metal executor with tiled attention, perplexity/greedy parity tests against llama.cpp CPU and Metal. Remaining: faster Metal GEMM (and small batches of 16–32 tokens), F16 weights on CPU, Q5_K kernels, GQA-shared Metal decode attention, x86 SIMD, CUDA.
+- **P3 — Performance & backends:** 🟡 CPU and Metal done — int8 `SDOT` kernels, Accelerate GEMM, parallelism tuning, a spinning decode thread pool, small-batch (2–32 token) kernels, prompt-lookup speculative decoding, GQA-grouped attention, native Q4_K / Q6_K kernels on CPU and Metal, repacked Q4_0 with i8mm, a Metal executor with tiled attention, perplexity/greedy parity tests against llama.cpp CPU and Metal. Remaining: faster Metal GEMM (and small batches of 16–32 tokens), F16 weights on CPU, Q5_K kernels, GQA-shared Metal decode attention, x86 SIMD, CUDA.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the target design and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for benchmark status.
 

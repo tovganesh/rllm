@@ -175,7 +175,33 @@ On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 - Small batches of 16–32 tokens on Metal (0.65–0.82x) and Q8_0 batches of 4–32 tokens on the CPU (0.82–0.86x); see "Small batches" above.
 
-**Small-batch kernels (this round)**
+**Prompt-lookup speculative decoding (this round, opt-in)**
+
+`--lookup-draft N` on `rllm generate` and `rllm serve` turns on n-gram speculation. Each decoding sequence looks up the most recent earlier occurrence of its last 3, 2 or 1 tokens in its own prompt and output, and proposes up to N following tokens as a draft. The drafts are verified in the same forward pass, using the small-batch kernels above. Tokens are sampled row by row and kept while they equal the draft, so the output distribution is unchanged for any sampler. The scheduler picks the draft length from measured pass costs by row count and each sequence's recent acceptance, so drafting backs off where verification is expensive (CPU K-quants: 8 rows cost ~3× one row) or drafts keep failing.
+
+The benchmark is Llama-3.2-1B, greedy, decode tok/s, mean of 2 interleaved rounds. "edit" asks for a 20-line Rust function back with a variable renamed (output copies the prompt). "story" asks for a short story (nothing to copy). `llama-lookup` is llama.cpp's prompt-lookup example (`--spec-draft-n-max 16`), fed the same chat-formatted prompt as raw text, so its output can differ slightly (Q4_0 Metal: 131 tokens against rllm's 155).
+
+| device | model | prompt | rllm | rllm `--lookup-draft 15` | speedup | llama-lookup |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| Metal | Q8_0 | edit | 66.5 | **273** | **4.1x** | 220 |
+| Metal | Q4_K_M | edit | 100 | 181 | 1.8x | 219 (175 / 263) |
+| Metal | Q4_0 | edit | 108 | **287** | **2.7x** | 117 |
+| CPU | Q8_0 | edit | 51.7 | **117** | **2.3x** | 109 |
+| CPU | Q4_K_M | edit | 79.0 | 103 | 1.3x | 70.1 |
+| CPU | Q4_0 | edit | 82.4 | **175** | **2.1x** | 111 |
+| Metal | Q8_0 | story | 66.6 | 68.2 | 1.02x | 63.8 |
+| Metal | Q4_K_M | story | 102 | 99.9 | 0.98x | 87.9 |
+| Metal | Q4_0 | story | 110 | 108 | 0.98x | 99.7 |
+| CPU | Q8_0 | story | 52.1 | 52.2 | 1.00x | 44.2 |
+| CPU | Q4_K_M | story | 79.3 | 78.7 | 0.99x | 47.6 |
+| CPU | Q4_0 | story | 83.4 | 81.0 | 0.97x | 64.8 |
+
+1. On Q8_0 and Q4_0 edit, 5–7 tokens are accepted per verification pass. The 1B Q4_K_M model writes more of its own prose around the code, so fewer drafts match (~2.7 tokens per pass).
+2. **Cost-aware draft length:** with fixed-length drafts (the first version), 8 drafts on Metal (9 rows, the next kernel tier) were 25% slower than 7. CPU Q4_K_M was 9% *slower* than no speculation at 7 drafts and 43% slower at 15. The adaptive length fixes both. On text with nothing to copy, it stays within 3% of plain decoding, where `llama-lookup` loses 5–40%.
+3. Greedy output with speculation is byte-identical to plain decoding on Metal for 1B Q8_0 / Q4_K_M / Q4_0 and SmolLM2 F16 (both prompts). On the CPU it is identical in 6 of 8 cases. In the other two (story, Q8_0 and Q4_0), a near-tie after ~50 tokens is broken differently, because verification runs the batched kernels, whose rounding differs from the one-row kernels. llama.cpp's speculation has the same property.
+4. Tests use a stub model that keeps a paged *token* store in place of the KV cache, so any bookkeeping error changes its output. Speculative greedy output equals plain output with 1, 4 and 15 drafts, with batching, prefix sharing, preemption, `max_tokens` and stop tokens. No token is computed twice. Under temperature sampling, the rate at which the intended token is sampled stays at the model's 0.7. Planted bugs all fail: draft positions off by one, accepting drafts without comparing, a sampler that prefers plausible drafts, forgetting accepted KV, and keeping drafts across preemption.
+
+**Small-batch kernels (PR #18)**
 
 Before this round, a batch of 2–31 tokens cost almost as much per token as decoding them one by one on Metal, and 2x–3x more than necessary for CPU Q8_0 / K-quants: every kernel re-read and re-decoded each weight block once per token. Now each weight block is decoded once per batch (table above: up to 3.6x on Metal, 2.9x on CPU):
 
@@ -303,6 +329,7 @@ Correctness on Metal: perplexity vs `llama-perplexity -ngl 99` — Q8_0 +0.02%, 
 ### Tuning knobs
 
 - `--device cpu|metal` — where the LLM runs.
+- `--lookup-draft N` / `--lookup-ngram M` (`generate`, `serve`) — prompt-lookup speculation with at most N drafts per step, matching suffixes of up to M tokens (default 3); off by default.
 - `--threads N` / `RAYON_NUM_THREADS` — worker threads (default: performance cores on Apple Silicon, otherwise all cores).
 - `RLLM_TASK_BYTES` — weight bytes per parallel task in matrix-vector products (default 131072).
 
