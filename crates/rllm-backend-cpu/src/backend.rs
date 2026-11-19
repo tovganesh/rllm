@@ -402,11 +402,9 @@ impl Backend for CpuBackend {
         let group_len = heads_per_group * head_dim;
         let max_ctx = context_lens.iter().copied().max().unwrap_or(1);
         let min_items = (crate::ops::ELEMENTWISE_GRAIN / (max_ctx * group_len).max(1)).max(1);
-        out_slice
-            .par_chunks_mut(group_len)
-            .with_min_len(min_items)
-            .enumerate()
-            .for_each(|(idx, out_group)| {
+        let run_items = |t: usize, items: &mut [f32]| {
+            for (j, out_group) in items.chunks_mut(group_len).enumerate() {
+                let idx = t * min_items + j;
                 let row = idx / num_heads_kv;
                 let kv_head = idx % num_heads_kv;
                 let q_group = &q_slice[idx * group_len..(idx + 1) * group_len];
@@ -422,7 +420,15 @@ impl Backend for CpuBackend {
                     scale,
                     out_group,
                 );
-            });
+            }
+        };
+        // Decode-sized batches use the spinning pool; prefill stays on Rayon (the two
+        // pools share the performance cores, and spinning workers would slow it down).
+        if num_rows < BATCHED_F32_MIN_ROWS {
+            crate::pool::for_each_chunk_mut(out_slice, min_items * group_len, run_items);
+        } else {
+            out_slice.par_chunks_mut(min_items * group_len).enumerate().for_each(|(t, items)| run_items(t, items));
+        }
 
         Ok(out)
     }

@@ -30,27 +30,27 @@ Exact token parity across engines is only expected where both use the same arith
 
 | model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
 | --- | --- | --- | ---: | ---: | ---: |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 | 476 | 405 | 0.85x |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 | 390 | 507 | 1.30x |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 | 54 | 51 | 0.95x |
-| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | pp128 | 164 | 393 | 2.39x |
-| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | pp512 | 155 | 502 | 3.25x |
-| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | tg128 | 78 | 82 | 1.04x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp128 | 489 | 457 | 0.93x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp512 | 395 | 503 | 1.28x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | tg128 | 88 | 87 | 0.99x |
-| SmolLM2-135M-Instruct-Q8_0 | cpu | pp128 | 1,881 | 3,033 | 1.61x |
-| SmolLM2-135M-Instruct-Q8_0 | cpu | pp512 | 1,293 | 2,311 | 1.79x |
-| SmolLM2-135M-Instruct-Q8_0 | cpu | tg128 | 400 | 362 | 0.90x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp128 | 1,369 | 3,019 | 2.21x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp512 | 1,084 | 2,313 | 2.13x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | tg128 | 439 | 380 | 0.87x |
-| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp128 | 1,912 | 2,958 | 1.55x |
-| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp512 | 1,300 | 2,312 | 1.78x |
-| SmolLM2-135M-Instruct-Q4_0.requant | cpu | tg128 | 561 | 505 | 0.90x |
-| SmolLM2-135M-Instruct-F16.requant | cpu | pp128 | 1,196 | 3,052 | 2.55x |
-| SmolLM2-135M-Instruct-F16.requant | cpu | pp512 | 1,205 | 2,332 | 1.94x |
-| SmolLM2-135M-Instruct-F16.requant | cpu | tg128 | 132 | 120 | 0.91x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp128 | 1,945 | 3,014 | 1.55x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | pp512 | 1,279 | 2,532 | 1.98x |
+| SmolLM2-135M-Instruct-Q4_0.requant | cpu | tg128 | 553 | 581 | 1.05x |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | pp128 | 1,902 | 3,047 | 1.60x |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | pp512 | 1,284 | 2,510 | 1.95x |
+| SmolLM2-135M-Instruct-Q8_0 | cpu | tg128 | 394 | 405 | 1.03x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp128 | 1,298 | 3,024 | 2.33x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | pp512 | 1,105 | 2,504 | 2.27x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | cpu | tg128 | 442 | 428 | 0.97x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | pp128 | 1,179 | 3,118 | 2.65x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | pp512 | 1,218 | 2,504 | 2.06x |
+| SmolLM2-135M-Instruct-F16.requant | cpu | tg128 | 127 | 114 | 0.90x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp128 | 484 | 456 | 0.94x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp512 | 386 | 517 | 1.34x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | tg128 | 88 | 89 | 1.01x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | pp128 | 167 | 391 | 2.34x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | pp512 | 154 | 519 | 3.36x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | cpu | tg128 | 76 | 82 | 1.08x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 | 467 | 408 | 0.87x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 | 387 | 528 | 1.36x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 | 53 | 53 | 1.00x |
 
 #### Metal
 
@@ -132,10 +132,23 @@ Completed blocks are now shared as soon as they are computed (previously only wh
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
 - Metal prompt processing, 0.85–0.93x (128–512 tokens). The quantized GEMM now runs at 3.0–3.2 TFLOPS on the 1B shapes, ~80% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak measured on this GPU; prefill attention is ~4% of the time.
-- CPU decode on SmolLM2-135M, 0.87–0.91x. At ~2 ms per token across ~120 small matrix-vector products, the profile is dominated by thread wake-up/fork-join latency rather than kernels (llama.cpp's thread pool spins between ops).
+- CPU decode of F16 files, 0.90x: the CPU loader widens F16 weights to F32 (twice the bytes per token); llama.cpp keeps them in F16.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 
-**F16 KV cache and split-context decode (this round)**
+**Spinning decode thread pool (this round)**
+
+Decoding one token on SmolLM2-135M runs ~120 small parallel steps (~2 ms in total). With Rayon, idle workers sleep between steps and every step paid a wake-up; the profile was dominated by `__psynch_cvwait` / `swtch_pri`, not kernels. A small fork/join pool (`rllm_backend_cpu::pool`) now runs the decode-sized work — matrix-vector products, small-batch (< 32 rows) integer GEMMs and decode attention — with workers that spin for 200 µs after each job (`RLLM_SPIN_US`) before parking, so an idle process does not burn CPU. Interleaved A/B, generation tok/s (mean of 4 rounds):
+
+| model | before | after |
+| --- | ---: | ---: |
+| SmolLM2-135M Q4_0 | 472 | 558 (**+18%**) |
+| SmolLM2-135M Q8_0 | 347 | 398 (**+15%**) |
+| SmolLM2-135M Q4_K_M | 351 | 408 (**+16%**) |
+| Llama-3.2-1B Q8_0 | 51.5 | 52.9 (+3%) |
+
+Spin time swept: 0 (park immediately, Rayon-like) gives the old speed; 50 µs – 5 ms all give the full gain. Prefill stays on Rayon: a first version also moved prefill attention to the pool, and spinning workers then competed with Rayon's GEMM threads on the same cores (SmolLM2 pp64 −30%). Outputs are bit-identical to the previous release (only scheduling changed).
+
+**F16 KV cache and split-context decode (PR #16)**
 
 Interleaved A/B against the previous release (Llama-3.2-1B Q4_0, `rllm bench --depth D`, tok/s, mean of 2 rounds):
 

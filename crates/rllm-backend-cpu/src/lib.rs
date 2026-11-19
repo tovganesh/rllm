@@ -7,6 +7,7 @@
 
 pub mod backend;
 pub mod ops;
+pub mod pool;
 pub mod threads;
 
 pub use backend::CpuBackend;

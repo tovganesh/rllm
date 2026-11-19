@@ -174,6 +174,9 @@ pub fn vec_dot_q4_0x4(grp: &[u8], a: &Q8Activations, off: usize, nb: usize) -> [
     scalar_dot_q4_0x4(grp, a, off, nb)
 }
 
+/// Batches below this many rows run on the low-latency decode pool.
+const SMALL_BATCH_ROWS: usize = 32;
+
 /// Raw pointer that tasks writing disjoint output elements may share.
 #[derive(Clone, Copy)]
 struct OutPtr(*mut f32);
@@ -196,7 +199,8 @@ pub fn gemv_q4_0x4(weight: &[u8], x: &[f32], out: &mut [f32], n: usize, k: usize
     debug_assert_eq!(weight.len(), n / 4 * group_bytes);
     let a = quantize_activations(x);
     let groups_per_task = (super::gemv_rows_per_task(nb * Q4_0_BYTES) / 4).max(2);
-    out.par_chunks_mut(4 * groups_per_task).enumerate().for_each(|(t, chunk)| {
+    // Decode path: run on the low-latency spinning pool (see `crate::pool`).
+    crate::pool::for_each_chunk_mut(out, 4 * groups_per_task, |t, chunk| {
         for (g, o) in chunk.chunks_exact_mut(4).enumerate() {
             let gi = t * groups_per_task + g;
             o.copy_from_slice(&vec_dot_q4_0x4(&weight[gi * group_bytes..(gi + 1) * group_bytes], &a, 0, nb));
@@ -222,17 +226,24 @@ pub fn gemm_q4_0x4(weight: &[u8], x: &[f32], out: &mut [f32], m: usize, n: usize
         // walks all activation rows.
         let threads = rayon::current_num_threads().max(1);
         let groups_per_task = groups.div_ceil(threads * 4).max(1);
-        (0..groups.div_ceil(groups_per_task)).into_par_iter().for_each(|t| {
+        let task = |t: usize| {
             let g0 = t * groups_per_task;
             let g1 = (g0 + groups_per_task).min(groups);
             // SAFETY: i8mm detected; the task writes only columns 4*g0..4*g1.
             unsafe { neon::gemm_i8mm_task(weight, group_bytes, &packed, m, n, nb, g0, g1, ptr.get()) };
-        });
+        };
+        // Small batches (decode) on the spinning pool; prefill-sized ones on Rayon.
+        let tasks = groups.div_ceil(groups_per_task);
+        if m < SMALL_BATCH_ROWS {
+            crate::pool::for_each_index(tasks, task);
+        } else {
+            (0..tasks).into_par_iter().for_each(task);
+        }
         return;
     }
 
     let groups_per_task = (super::gemv_rows_per_task(nb * Q4_0_BYTES) / (4 * m)).max(1);
-    (0..groups.div_ceil(groups_per_task)).into_par_iter().for_each(|t| {
+    crate::pool::for_each_index(groups.div_ceil(groups_per_task), |t| {
         for g in t * groups_per_task..((t + 1) * groups_per_task).min(groups) {
             let grp = &weight[g * group_bytes..(g + 1) * group_bytes];
             for i in 0..m {
