@@ -13,7 +13,6 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use half::f16;
-use rayon::prelude::*;
 
 /// Values per quantization block.
 pub const QK: usize = 32;
@@ -410,7 +409,8 @@ pub fn gemv_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32], n
     let a = Acts::new(fmt, x);
     let rows_per_task = super::gemv_rows_per_task(row_bytes).next_multiple_of(4);
     let row = |j: usize| &weight[j * row_bytes..(j + 1) * row_bytes];
-    out.par_chunks_mut(rows_per_task).enumerate().for_each(|(t, chunk)| {
+    // Decode path: run on the low-latency spinning pool (see `crate::pool`).
+    crate::pool::for_each_chunk_mut(out, rows_per_task, |t, chunk| {
         let j0 = t * rows_per_task;
         let mut r = 0;
         // Four rows at a time for (unrepacked) Q4_0 only: +3-5% decode on an M4, while
@@ -442,7 +442,7 @@ pub fn linear_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32],
     // Compute [N, M] so each task writes a contiguous slab, then transpose.
     let rows_per_task = (super::gemv_rows_per_task(row_bytes) / m).max(1);
     let mut out_t = vec![0f32; n * m];
-    out_t.par_chunks_mut(rows_per_task * m).enumerate().for_each(|(t, slab)| {
+    crate::pool::for_each_chunk_mut(&mut out_t, rows_per_task * m, |t, slab| {
         for (r, row) in slab.chunks_mut(m).enumerate() {
             let j = t * rows_per_task + r;
             let w = &weight[j * row_bytes..(j + 1) * row_bytes];

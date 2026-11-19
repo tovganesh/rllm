@@ -7,7 +7,7 @@
 A modular, multi-backend LLM inference engine and hybrid RAG platform written in Rust from the ground up.
 
 > [!WARNING]
-> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU or an Apple GPU (Metal), with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. On an Apple M4 its CPU prompt processing is 1.3–3.3x faster than llama.cpp's CPU backend at 512 tokens, decode on a 1B model is at parity with llama.cpp on both CPU and Metal across Q8_0 / Q4_K_M / Q4_0 (0.87–0.91x on CPU for a 135M model), and Metal prompt processing is 0.85–0.95x of llama.cpp's Metal backend. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
+> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU or an Apple GPU (Metal), with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. On an Apple M4 its CPU prompt processing is 1.3–3.3x faster than llama.cpp's CPU backend at 512 tokens, decode is at parity with llama.cpp or ahead on both CPU and Metal across Q8_0 / Q4_K_M / Q4_0 (CPU 0.97–1.08x), and Metal prompt processing is 0.85–0.95x of llama.cpp's Metal backend. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
 
 ---
 
@@ -86,7 +86,7 @@ The P0 correctness issues found in the initial review (stride-ignoring matmul on
 Remaining limitations:
 
 1. **Only LLaMA-architecture GGUF models with a byte-level BPE tokenizer load.** Qwen2 (attention biases, NeoX RoPE), Gemma, Phi, and SentencePiece tokenizers are not supported yet.
-2. **Performance gaps (Apple M4).** CPU: decode on Llama-3.2-1B is at parity or ahead (Q4_K_M 1.04x, Q4_0 0.99x, Q8_0 0.95x) and prompt processing is ahead except 128-token prompts on Q8_0/Q4_0 (0.85–0.93x); decode on the tiny SmolLM2-135M is 0.87–0.91x (thread-synchronisation overhead). Metal: decode at parity or ahead (0.96–1.30x across formats), prompt processing 0.85–0.95x. No CUDA backend; Metal runs only on macOS. See [BENCHMARKS](docs/BENCHMARKS.md).
+2. **Performance gaps (Apple M4).** CPU: decode is at parity or ahead (0.97–1.08x; F16 files 0.90x, as their weights are widened to F32) and prompt processing is ahead except 128-token prompts on 1B Q8_0/Q4_0 (0.87–0.94x). Metal: decode at parity or ahead (0.96–1.30x across formats), prompt processing 0.85–0.95x. No CUDA backend; Metal runs only on macOS. See [BENCHMARKS](docs/BENCHMARKS.md).
 3. **Q5_K weights are converted to Q8_0** (no native kernel yet), and F16 / BF16 files use 2× their size on CPU (F32).
 4. **Small models rarely write `[n]` citations.** SmolLM2-135M answers correctly from the sources but usually without citation markers; the response then carries a warning. Dense thresholds are calibrated only for bge-small-en-v1.5 and all-MiniLM-L6-v2. The reranker is lexical, not a neural cross-encoder.
 5. **No authentication, per-client rate limiting or TLS** — put rllm behind a reverse proxy for anything exposed. A single engine thread serves one model per process.
@@ -99,7 +99,7 @@ Remaining limitations:
 - **P0 — Correctness:** ✅ done — projection layout, causal prefill, per-token RoPE, prefix-cache block ownership, aligned storage, input bounds, numerical reference tests.
 - **P1 — Real models:** ✅ done — GGUF loading, BPE and WordPiece tokenizers, chat templates, `rllm generate`, real-model chat completions, BERT embedding models, LLM-generated RAG answers with verified citations.
 - **P2 — Serving:** ✅ done — dedicated engine thread with per-request channels, SSE streaming, cancellation on disconnect, queue/`max_tokens`/body limits with 429s, structured errors, Prometheus metrics, graceful shutdown.
-- **P3 — Performance & backends:** 🟡 CPU and Metal done — int8 `SDOT` kernels, Accelerate GEMM, parallelism tuning, GQA-grouped attention, native Q4_K / Q6_K kernels on CPU and Metal, repacked Q4_0 with i8mm, a Metal executor with tiled attention, perplexity/greedy parity tests against llama.cpp CPU and Metal. Remaining: faster Metal GEMM, lower-latency CPU thread pool, Q5_K kernels, GQA-shared Metal decode attention, x86 SIMD, CUDA.
+- **P3 — Performance & backends:** 🟡 CPU and Metal done — int8 `SDOT` kernels, Accelerate GEMM, parallelism tuning, a spinning decode thread pool, GQA-grouped attention, native Q4_K / Q6_K kernels on CPU and Metal, repacked Q4_0 with i8mm, a Metal executor with tiled attention, perplexity/greedy parity tests against llama.cpp CPU and Metal. Remaining: faster Metal GEMM, F16 weights on CPU, Q5_K kernels, GQA-shared Metal decode attention, x86 SIMD, CUDA.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the target design and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for benchmark status.
 
