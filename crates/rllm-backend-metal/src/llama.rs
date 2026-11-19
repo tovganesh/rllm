@@ -93,6 +93,8 @@ pub struct MetalLlama {
     layers: Vec<Layer>,
     cos: Buffer,
     sin: Buffer,
+    /// KV cache element type, `"f16"` or `"f32"` (kernel-name suffix).
+    kv_type: &'static str,
     state: Mutex<State>,
 }
 
@@ -101,6 +103,11 @@ const ATTN_TILE_ROWS: usize = 32;
 
 /// Keys per step of the prefill attention kernel (must match `ATTN_KB` in the shaders).
 const ATTN_KB: usize = 32;
+
+/// Keys per threadgroup of the decode attention kernel; longer contexts are split over
+/// several threadgroups and combined. Swept on an M4 (Llama-3.2-1B, 2k/8k context):
+/// 128 and 512 were up to 7% slower, no splitting 14–28% slower.
+const DECODE_CHUNK: usize = 256;
 
 /// Rows at or below which linear layers use the matrix-vector kernel.
 const MV_MAX_ROWS: usize = 8;
@@ -126,6 +133,12 @@ impl MetalLlama {
             )));
         }
 
+        // The KV cache follows the CPU model's setting (F16 by default for loaded models).
+        let kv_type = match model.kv_dtype {
+            DType::F16 => "f16",
+            DType::F32 => "f32",
+            other => return Err(RllmError::BackendError(format!("Metal KV cache cannot be {other} (use F16 or F32)"))),
+        };
         let library = device
             .new_library_with_source(SHADERS_MSL, &CompileOptions::new())
             .map_err(|e| RllmError::BackendError(format!("Metal shader compilation failed: {e}")))?;
@@ -133,10 +146,17 @@ impl MetalLlama {
         let names = [
             "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
             "mm_q4_k", "mm_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
-            "rms_norm", "rope", "kv_write", "attention_hd32", "attention_hd64", "attention_hd96", "attention_hd128", "attention_tile32_hd32", "attention_tile32_hd64", "attention_tile32_hd96",
-            "attention_tile32_hd128", "swiglu",
+            "rms_norm", "rope", "swiglu", "attn_reduce",
         ];
-        for name in names {
+        let kv_names: Vec<String> = ["f32", "f16"]
+            .iter()
+            .flat_map(|t| {
+                std::iter::once(format!("kv_write_{t}")).chain([32, 64, 96, 128].iter().flat_map(move |hd| {
+                    [format!("attention_hd{hd}_{t}"), format!("attention_tile32_hd{hd}_{t}")]
+                }))
+            })
+            .collect();
+        for name in names.iter().copied().chain(kv_names.iter().map(String::as_str)) {
             let f = library
                 .get_function(name, None)
                 .map_err(|e| RllmError::BackendError(format!("Metal function {name}: {e}")))?;
@@ -255,6 +275,7 @@ impl MetalLlama {
             layers,
             cos,
             sin,
+            kv_type,
             state: Mutex::new(State { kv: Vec::new(), block_size: 0, num_blocks: 0, scratch: Scratch::default() }),
         })
     }
@@ -483,7 +504,8 @@ impl LanguageModel for MetalLlama {
             return Err(RllmError::BackendError("Metal executor needs a KV block size divisible by 8".into()));
         }
         let c = &self.config;
-        let bytes = (num_blocks * c.num_key_value_heads * block_size * c.head_dim() * 4) as u64;
+        let elem = if self.kv_type == "f16" { 2 } else { 4 };
+        let bytes = (num_blocks * c.num_key_value_heads * block_size * c.head_dim() * elem) as u64;
         let mut st = self.state.lock().map_err(|_| RllmError::BackendError("Metal state poisoned".into()))?;
         st.kv = (0..c.num_hidden_layers)
             .map(|_| {
@@ -598,6 +620,14 @@ impl LanguageModel for MetalLlama {
             sc.logit_rows = lrows;
             sc.table_len = tlen;
         }
+        // Decode attention splits each row's context into chunks of DECODE_CHUNK keys
+        // (one threadgroup each); partials need a buffer sized by the longest context.
+        let max_single_ctx = singles.iter().map(|&r| batch.positions[r as usize] + 1).max().unwrap_or(0);
+        let nsplit = max_single_ctx.div_ceil(DECODE_CHUNK).max(1);
+        let part_len = (singles.len() * nq * nsplit * (hd + 2)).max(1) * 4;
+        if sc.bufs.get("attn_part").is_none_or(|buf| (buf.length() as usize) < part_len) {
+            sc.bufs.insert("attn_part", self.device.new_buffer(part_len as u64, MTLResourceOptions::StorageModePrivate));
+        }
         let b = |name: &str| &sc.bufs[name];
         write_buffer(b("tokens"), batch.tokens);
         write_buffer(b("positions"), &positions);
@@ -640,7 +670,7 @@ impl LanguageModel for MetalLlama {
                     ((hd / 2) as u64, (nq + nkv) as u64, n as u64),
                 );
                 e.threads(
-                    self.pipeline("kv_write"),
+                    self.pipeline(&format!("kv_write_{}", self.kv_type)),
                     &[
                         Arg::B(b("qkv")),
                         Arg::U(h as u32),
@@ -682,10 +712,32 @@ impl LanguageModel for MetalLlama {
                     // for the 4 x 8 x hd float output at the end.
                     let tg_bytes = (2 * ATTN_KB * hd * 2).max(4 * 8 * hd * 4) as u64;
                     e.enc.set_threadgroup_memory_length(0, tg_bytes);
-                    e.groups(self.pipeline(&format!("attention_tile32_hd{hd}")), &attn_args(b("tiles")), (nq as u64, tiles.len() as u64, 1), 128);
+                    e.groups(self.pipeline(&format!("attention_tile32_hd{hd}_{}", self.kv_type)), &attn_args(b("tiles")), (nq as u64, tiles.len() as u64, 1), 128);
                 }
                 if !singles.is_empty() {
-                    e.groups(self.pipeline(&format!("attention_hd{hd}")), &attn_args(b("singles")), (nq as u64, singles.len() as u64, 1), 128);
+                    let mut args = attn_args(b("singles"));
+                    args.extend([Arg::B(b("attn_part")), Arg::U(DECODE_CHUNK as u32), Arg::U(nsplit as u32)]);
+                    e.groups(
+                        self.pipeline(&format!("attention_hd{hd}_{}", self.kv_type)),
+                        &args,
+                        (nq as u64, singles.len() as u64, nsplit as u64),
+                        128,
+                    );
+                    if nsplit > 1 {
+                        e.groups(
+                            self.pipeline("attn_reduce"),
+                            &[
+                                Arg::B(b("attn_part")),
+                                Arg::B(b("attn")),
+                                Arg::B(b("singles")),
+                                Arg::U(nq as u32),
+                                Arg::U(hd as u32),
+                                Arg::U(nsplit as u32),
+                            ],
+                            (nq as u64, singles.len() as u64, 1),
+                            hd as u64,
+                        );
+                    }
                 }
                 self.linear(&e, &layer.o, b("attn"), b("xh"), b("hidden"), n, true);
 

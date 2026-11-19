@@ -80,26 +80,38 @@ Exact token parity across engines is only expected where both use the same arith
 
 SmolLM2-135M pp128 on Metal is noisy in this script (single runs of the same build vary by up to ~20%).
 
-#### Long context (2,048 tokens of context)
+#### Long context (2,048 and 8,192 tokens of context)
 
-`python3 scripts/bench_vs_llamacpp.py --depth 2048` (llama-bench `-d 2048`, `rllm bench --depth 2048`; 2 repetitions):
+`python3 scripts/bench_vs_llamacpp.py --depth D` (llama-bench `-d D`, `rllm bench --depth D`; 2 repetitions; F16 KV cache on both sides):
 
 | model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
 | --- | --- | --- | ---: | ---: | ---: |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 @ d2048 | 1,352 | 1,171 | 0.87x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 @ d2048 | 1,390 | 1,266 | 0.91x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 @ d2048 | 101 | 80 | 0.79x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 @ d2048 | 1,327 | 1,179 | 0.89x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 @ d2048 | 1,381 | 1,282 | 0.93x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 @ d2048 | 67 | 54 | 0.81x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp128 @ d2048 | 137 | 178 | 1.29x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp512 @ d2048 | 130 | 191 | 1.46x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | tg128 @ d2048 | 45 | 60 | 1.34x |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 @ d2048 | 137 | 171 | 1.25x |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 @ d2048 | 124 | 191 | 1.53x |
-| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 @ d2048 | 34 | 42 | 1.21x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 @ d2048 | 1,351 | 1,180 | 0.87x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 @ d2048 | 1,397 | 1,274 | 0.91x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 @ d2048 | 104 | 95 | 0.92x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 @ d2048 | 1,328 | 1,187 | 0.89x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 @ d2048 | 1,378 | 1,291 | 0.94x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 @ d2048 | 68 | 62 | 0.91x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 @ d8192 | 900 | 823 | 0.91x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 @ d8192 | 928 | 884 | 0.95x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 @ d8192 | 86 | 66 | 0.77x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 @ d8192 | 843 | 816 | 0.97x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 @ d8192 | 867 | 855 | 0.99x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 @ d8192 | 59 | 48 | 0.81x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp128 @ d2048 | 134 | 190 | 1.42x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp512 @ d2048 | 128 | 213 | 1.67x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | tg128 @ d2048 | 46 | 66 | 1.43x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 @ d2048 | 136 | 188 | 1.38x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 @ d2048 | 130 | 217 | 1.67x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 @ d2048 | 34 | 44 | 1.28x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp128 @ d8192 | 44 | 63 | 1.42x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp512 @ d8192 | 43 | 67 | 1.55x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | cpu | tg128 @ d8192 | 15 | 38 | 2.53x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp128 @ d8192 | 41 | 68 | 1.66x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | pp512 @ d8192 | 41 | 71 | 1.72x |
+| Llama-3.2-1B-Instruct-Q8_0 | cpu | tg128 @ d8192 | 15 | 29 | 1.97x |
 
-On the CPU, rllm's paged GQA attention keeps it well ahead at depth. On Metal, long-context decode is 0.79–0.81x: the decode attention kernel reads F32 keys/values (llama.cpp: F16) — the next targets are the F16 KV cache and that kernel.
+On the CPU rllm is 1.3–2.5x ahead at depth: its paged GQA attention reads each key/value once per KV head, and F16 keys/values are widened in registers. On Metal, prompt processing at depth is 0.87–0.99x and decode 0.91–0.92x at 2k and 0.77–0.81x at 8k (llama.cpp's Metal decode figures vary by ~15% between runs). The remaining 8k gap is the decode attention kernel: query heads that share a KV head (GQA) still read it separately.
 
 #### Prefix cache: time to first token
 
@@ -123,7 +135,25 @@ Completed blocks are now shared as soon as they are computed (previously only wh
 - CPU decode on SmolLM2-135M, 0.87–0.91x. At ~2 ms per token across ~120 small matrix-vector products, the profile is dominated by thread wake-up/fork-join latency rather than kernels (llama.cpp's thread pool spins between ops).
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 
-**What changed in this round** (Metal prefill; Llama-3.2-1B pp512 Q8_0 1,377 → 1,508, Q4_0 1,292 → 1,487, Q4_K_M 1,327 → 1,425 tok/s; SmolLM2 Q8_0 8,132 → 9,868):
+**F16 KV cache and split-context decode (this round)**
+
+Interleaved A/B against the previous release (Llama-3.2-1B Q4_0, `rllm bench --depth D`, tok/s, mean of 2 rounds):
+
+| device | context | pp512 before → after | tg64 before → after |
+| --- | ---: | ---: | ---: |
+| Metal | 0 | 1,490 → 1,493 (0%) | 110 → 111 (+1%) |
+| Metal | 2,048 | 1,267 → 1,274 (+1%) | 80.5 → 96.5 (**+20%**) |
+| Metal | 8,192 | 868 → 874 (+1%) | 41.8 → 66.9 (**+60%**) |
+| CPU | 0 | 504 → 519 (+3%) | 87.1 → 87.1 (0%) |
+| CPU | 2,048 | 191 → 215 (+13%) | 60.6 → 66.0 (+9%) |
+| CPU | 8,192 | 51.8 → 72.7 (**+40%**) | 32.3 → 38.1 (**+18%**) |
+
+1. **F16 KV cache by default** on CPU and Metal (`--kv-dtype f16|f32`, `LoadOptions::kv_dtype`), as llama.cpp: half the KV memory (twice the context in the same budget) and half the attention bandwidth. CPU attention reads F16 directly (NEON `FCVTL` widening inside the dot products and value accumulation); a first version converted blocks into a scratch buffer and made prefill at 2k context 11% *slower*, because every query row re-converted the whole context.
+2. **Split-context ("flash") decode attention on Metal:** each row's context is split into 256-key chunks, one threadgroup per chunk, and a reduction kernel combines the partial softmax results. With one chunk per head a single sequence only launched `nq` threadgroups. Keys are read four values at a time. Chunk size swept: 128 and 512 up to 7% slower; no splitting 14–28% slower.
+3. Accuracy: F16 and F32 caches give the same perplexity to within 0.0007 on Llama-3.2-1B and SmolLM2 (CPU and Metal, 128/512 context); greedy output on Metal identical to `llama-simple -ngl 99` for 1B Q8_0 / Q4_K_M / Q4_0 and SmolLM2, including after a ~1,300-token prompt (6 decode chunks). On the CPU, F16 and F32 caches and llama.cpp each diverge from each other at near-ties after 30–40 tokens (llama.cpp's CPU attention also rounds Q to F16); teacher-forced parity tests pass.
+4. Tests: Metal vs CPU with F16 caches on both; split-context decode at 700 tokens batched with a 20-token sequence (empty chunks) — a planted bug in the reduction fails it; scheduler greedy output with an F16 cache equals the F32 reference.
+
+**Metal prefill round (PR #14)** ( Llama-3.2-1B pp512 Q8_0 1,377 → 1,508, Q4_0 1,292 → 1,487, Q4_K_M 1,327 → 1,425 tok/s; SmolLM2 Q8_0 8,132 → 9,868):
 1. **GEMM** (`tests/gemm_bench.rs`, an ignored micro-benchmark on the 1B shapes, plus a peak probe: 3.93 TFLOPS for half x half -> float `simdgroup_matrix` products, 1.05 for float x float): k-step 32 → 64; activations converted to half once per linear layer (`to_half`) instead of once per weight tile; one 32-value weight block dequantized per thread with conflict-free tile stores (Q6_K, whose 210-byte blocks are not word-aligned, keeps four threads per block). GEMM time per layer at 512 rows: Q4_0 −11%, F16 −9%, Q8_0 −6%, Q4_K −5%, Q6_K −5%. Rejected: 64x128 tiles with 32 accumulators per simdgroup (register spills, 5.5x slower), 8 simdgroups on 64x128 (mixed), half activations alone (+1%).
 2. **Prefill attention** rewritten (3.1x faster at 1,024 tokens: 92 → 29 ms on 1B; was 8% of pp512 time): 32-row query tiles over four simdgroups sharing 32-key K/V blocks staged as half; scores computed transposed (S^T = K Q^T, so K fragments load untransposed) with two accumulators per key group (the previous single chain of 8 dependent products was latency-bound); in-simdgroup online softmax; lazy rescaling; and — the largest single step, 63 → 29 ms — the head dimension as a template parameter, so fragment arrays indexed in loops stay in registers instead of spilling. Found by ablating loads / scores / P·V with temporary shader defines.
 3. Decode attention also templated on the head dimension (+2–6% decode; larger on SmolLM2). *Correction:* this was reported as measured "at 2,048 tokens of context", but `rllm bench --model` then always decoded from position 0, so it was a short-context figure. `--depth` now exists; see "Long context" above.

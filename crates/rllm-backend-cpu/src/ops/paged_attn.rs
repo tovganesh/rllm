@@ -2,6 +2,101 @@
 
 use rllm_core::backend::BlockTable;
 
+/// A paged K or V cache in its storage type.
+#[derive(Clone, Copy)]
+pub enum KvData<'a> {
+    /// Full-precision cache.
+    F32(&'a [f32]),
+    /// Half-precision cache (converted block by block when read).
+    F16(&'a [half::f16]),
+}
+
+impl KvData<'_> {
+    /// `q · kv[start..start + q.len()]`.
+    #[inline]
+    fn dot(&self, q: &[f32], start: usize) -> f32 {
+        match self {
+            KvData::F32(s) => crate::ops::gemm::dot_f32(q, &s[start..start + q.len()]),
+            KvData::F16(s) => dot_f32_f16(q, &s[start..start + q.len()]),
+        }
+    }
+
+    /// `out += w * kv[start..start + out.len()]`.
+    #[inline]
+    fn axpy(&self, out: &mut [f32], w: f32, start: usize) {
+        match self {
+            KvData::F32(s) => {
+                let n = out.len();
+                for (o, &x) in out.iter_mut().zip(&s[start..start + n]) {
+                    *o += w * x;
+                }
+            }
+            KvData::F16(s) => axpy_f16(out, w, &s[start..start + out.len()]),
+        }
+    }
+}
+
+/// Dot product of F32 and F16 vectors of equal length (F16 widened in registers).
+pub fn dot_f32_f16(q: &[f32], k: &[half::f16]) -> f32 {
+    debug_assert_eq!(q.len(), k.len());
+    #[cfg(target_arch = "aarch64")]
+    if q.len().is_multiple_of(8) {
+        // SAFETY: NEON is always available on aarch64; lengths checked above.
+        return unsafe { neon::dot_f32_f16(q, k) };
+    }
+    q.iter().zip(k).map(|(a, b)| a * b.to_f32()).sum()
+}
+
+/// `out += w * v` with `v` in F16.
+pub fn axpy_f16(out: &mut [f32], w: f32, v: &[half::f16]) {
+    debug_assert_eq!(out.len(), v.len());
+    #[cfg(target_arch = "aarch64")]
+    if out.len().is_multiple_of(8) {
+        // SAFETY: as above.
+        return unsafe { neon::axpy_f16(out, w, v) };
+    }
+    for (o, x) in out.iter_mut().zip(v) {
+        *o += w * x.to_f32();
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+    use std::arch::asm;
+
+    /// Eight F16 values at `p` widened to two F32 vectors (`FCVTL`/`FCVTL2`, base
+    /// AArch64; Rust's f16 vector types are not stable).
+    #[inline(always)]
+    unsafe fn cvt8(p: *const half::f16) -> (float32x4_t, float32x4_t) {
+        let h = vld1q_u16(p as *const u16);
+        let (lo, hi): (float32x4_t, float32x4_t);
+        asm!("fcvtl {lo:v}.4s, {h:v}.4h", "fcvtl2 {hi:v}.4s, {h:v}.8h", h = in(vreg) h, lo = out(vreg) lo, hi = out(vreg) hi,
+             options(pure, nomem, nostack));
+        (lo, hi)
+    }
+
+    pub unsafe fn dot_f32_f16(q: &[f32], k: &[half::f16]) -> f32 {
+        let (mut a0, mut a1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        for i in (0..q.len()).step_by(8) {
+            let (lo, hi) = cvt8(k.as_ptr().add(i));
+            a0 = vfmaq_f32(a0, vld1q_f32(q.as_ptr().add(i)), lo);
+            a1 = vfmaq_f32(a1, vld1q_f32(q.as_ptr().add(i + 4)), hi);
+        }
+        vaddvq_f32(vaddq_f32(a0, a1))
+    }
+
+    pub unsafe fn axpy_f16(out: &mut [f32], w: f32, v: &[half::f16]) {
+        let wv = vdupq_n_f32(w);
+        for i in (0..out.len()).step_by(8) {
+            let (lo, hi) = cvt8(v.as_ptr().add(i));
+            let o = out.as_mut_ptr().add(i);
+            vst1q_f32(o, vfmaq_f32(vld1q_f32(o), wv, lo));
+            vst1q_f32(o.add(4), vfmaq_f32(vld1q_f32(o.add(4)), wv, hi));
+        }
+    }
+}
+
 /// Computes attention for a single query head against paged KV cache blocks.
 ///
 /// # Arguments
@@ -71,8 +166,8 @@ pub fn paged_attention_head(
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_kv_group(
     q_group: &[f32],
-    k_cache: &[f32],
-    v_cache: &[f32],
+    k_cache: KvData<'_>,
+    v_cache: KvData<'_>,
     block_table: &BlockTable,
     context_len: usize,
     kv_head_idx: usize,
@@ -96,10 +191,9 @@ pub fn paged_attention_kv_group(
         let n = block_size.min(context_len - pos);
         let base = phys * block_stride + head_off;
         for t in 0..n {
-            let k = &k_cache[base + t * head_dim..base + (t + 1) * head_dim];
             for g in 0..group {
                 let q = &q_group[g * head_dim..(g + 1) * head_dim];
-                logits[g * context_len + pos + t] = crate::ops::gemm::dot_f32(q, k) * scale;
+                logits[g * context_len + pos + t] = k_cache.dot(q, base + t * head_dim) * scale;
             }
         }
         pos += n;
@@ -127,14 +221,31 @@ pub fn paged_attention_kv_group(
         let n = block_size.min(context_len - pos);
         let base = phys * block_stride + head_off;
         for t in 0..n {
-            let v = &v_cache[base + t * head_dim..base + (t + 1) * head_dim];
             for g in 0..group {
                 let w = logits[g * context_len + pos + t];
-                for (o, &x) in out_group[g * head_dim..(g + 1) * head_dim].iter_mut().zip(v) {
-                    *o += w * x;
-                }
+                v_cache.axpy(&mut out_group[g * head_dim..(g + 1) * head_dim], w, base + t * head_dim);
             }
         }
         pos += n;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_kernels_match_scalar() {
+        for n in [8usize, 64, 128, 13] {
+            let q: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+            let k: Vec<half::f16> = (0..n).map(|i| half::f16::from_f32((i as f32 * 0.11).cos())).collect();
+            let want: f32 = q.iter().zip(&k).map(|(a, b)| a * b.to_f32()).sum();
+            assert!((dot_f32_f16(&q, &k) - want).abs() < 1e-4, "dot n={n}");
+            let mut out = q.clone();
+            axpy_f16(&mut out, 0.5, &k);
+            for i in 0..n {
+                assert!((out[i] - (q[i] + 0.5 * k[i].to_f32())).abs() < 1e-6, "axpy n={n} i={i}");
+            }
+        }
     }
 }

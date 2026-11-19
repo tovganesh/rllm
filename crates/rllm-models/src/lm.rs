@@ -8,7 +8,6 @@ use crate::config::LlamaConfig;
 use crate::llama::{ForwardBatch, LlamaModel};
 use rllm_core::{
     backend::Backend,
-    dtype::DType,
     error::{Result, RllmError},
     shape::Shape,
     tensor::Tensor,
@@ -54,8 +53,8 @@ impl<B: Backend> LanguageModel for LlamaModel<B> {
         let shape = Shape::new(vec![num_blocks, c.num_key_value_heads, block_size, c.head_dim()]);
         let mut cache = KvCache::default();
         for _ in 0..c.num_hidden_layers {
-            cache.k.push(Tensor::zeros(shape.clone(), DType::F32, dev)?);
-            cache.v.push(Tensor::zeros(shape.clone(), DType::F32, dev)?);
+            cache.k.push(Tensor::zeros(shape.clone(), self.kv_dtype, dev)?);
+            cache.v.push(Tensor::zeros(shape.clone(), self.kv_dtype, dev)?);
         }
         *self.kv_cache.lock().map_err(|_| RllmError::BackendError("KV cache lock poisoned".into()))? = cache;
         Ok(())

@@ -2,7 +2,7 @@ use crate::ops::{
     activations::swiglu_f32,
     gemm::{gemm_f32, gemm_nt_f32},
     norm::rms_norm_f32,
-    paged_attn::paged_attention_kv_group,
+    paged_attn::{paged_attention_kv_group, KvData},
     blas::{sgemm_nt, sgemm_nt_cols},
     qdot::{gemv_quantized, linear_quantized, QFormat},
     quant::{dequantize_into, gemv_q4_0_f32, gemv_q8_0_f32, q5_0_to_q8_0},
@@ -392,8 +392,8 @@ impl Backend for CpuBackend {
 
         let mut out = Tensor::zeros(q.shape().clone(), DType::F32, Device::Cpu)?;
         let q_slice = q.as_f32_slice()?;
-        let k_slice = k_cache.as_f32_slice()?;
-        let v_slice = v_cache.as_f32_slice()?;
+        let k_slice = kv_data(k_cache)?;
+        let v_slice = kv_data(v_cache)?;
         let out_slice = out.as_mut_f32_slice()?;
 
         // One work item per (row, KV head): it computes all `heads_per_group` query
@@ -457,4 +457,15 @@ impl Backend for CpuBackend {
 
         Ok(out)
     }
+}
+
+/// A paged KV cache tensor's data in its storage type.
+fn kv_data(t: &Tensor) -> Result<KvData<'_>> {
+    Ok(match t.dtype() {
+        DType::F32 => KvData::F32(t.as_f32_slice()?),
+        DType::F16 => KvData::F16(t.storage().as_cpu()?.as_slice::<half::f16>()),
+        other => {
+            return Err(RllmError::UnsupportedOp { op: "paged_attention", dtype: other.to_string(), device: "cpu".to_string() })
+        }
+    })
 }

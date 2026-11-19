@@ -363,3 +363,25 @@ fn oversized_sequence_gets_a_terminal_event_instead_of_looping() {
     assert!(toks.len() < 50);
     engine.shutdown();
 }
+
+#[test]
+fn f16_kv_cache_tracks_f32_and_keeps_greedy_output() {
+    // F16 keys/values (the default for loaded models) change logits only slightly: the
+    // scheduler's greedy output must equal the F32-cache reference on this model.
+    let mut m = LlamaModel::new_seeded(config(), Arc::new(CpuBackend), 7).unwrap();
+    m.kv_dtype = DType::F16;
+    let s = ContinuousBatchScheduler::new(
+        SchedulerConfig { max_batch_size: 4, block_size: BLOCK, total_blocks: 64, ..SchedulerConfig::default() },
+        Arc::new(m),
+    )
+    .unwrap();
+    let reference = model();
+    let prompts: Vec<Vec<u32>> = vec![PROMPT_A.to_vec(), vec![60, 50, 40, 30, 20, 10, 0]];
+    for (i, p) in prompts.iter().enumerate() {
+        s.submit_sequence(seq(i as u64, p, 8)).unwrap();
+    }
+    let out = run_to_completion(&s);
+    for (i, p) in prompts.iter().enumerate() {
+        assert_eq!(out[&(i as u64)], reference_greedy(&reference, p, 8), "sequence {i}");
+    }
+}

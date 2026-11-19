@@ -27,7 +27,7 @@ Legend: ✅ implemented · 🟡 partial / prototype · ⛔ stub · 📋 planned 
 | F16, BF16, Q4_1, Q5_1, Q5_K weights | 🟡 | Q4_1 / Q5_1 / Q5_K are converted to Q8_0 at load; F16 / BF16 become F32 (F16 again on Metal). |
 | AVX2 / AVX-512 kernels | 📋 | x86 uses portable scalar int8 kernels. |
 | PagedAttention kernel (CPU) | ✅ | Causal prefill and batched decode; parallel over (row, head). |
-| Metal executor (`--device metal`) | ✅ | Whole forward pass in one command buffer: F32 / F16 / Q8_0 / Q4_0 / Q4_K / Q6_K matrix-vector and tiled `simdgroup_matrix` GEMM kernels, FlashAttention-style tiled prefill attention (half-precision K/V tiles, in-simdgroup online softmax), GPU-resident paged KV cache. Perplexity within 0.02% of llama.cpp Metal and greedy output identical (SmolLM2-135M, Llama-3.2-1B). macOS only. |
+| Metal executor (`--device metal`) | ✅ | Whole forward pass in one command buffer: F32 / F16 / Q8_0 / Q4_0 / Q4_K / Q6_K matrix-vector and tiled `simdgroup_matrix` GEMM kernels, FlashAttention-style tiled prefill attention (half-precision K/V tiles, in-simdgroup online softmax), GPU-resident paged KV cache (F16 by default), split-context decode attention for long contexts. Perplexity within 0.02% of llama.cpp Metal and greedy output identical (SmolLM2-135M, Llama-3.2-1B). macOS only. |
 | CUDA backend | 📋 | No crate yet. |
 
 ### Models
@@ -99,7 +99,7 @@ Remaining limitations:
 - **P0 — Correctness:** ✅ done — projection layout, causal prefill, per-token RoPE, prefix-cache block ownership, aligned storage, input bounds, numerical reference tests.
 - **P1 — Real models:** ✅ done — GGUF loading, BPE and WordPiece tokenizers, chat templates, `rllm generate`, real-model chat completions, BERT embedding models, LLM-generated RAG answers with verified citations.
 - **P2 — Serving:** ✅ done — dedicated engine thread with per-request channels, SSE streaming, cancellation on disconnect, queue/`max_tokens`/body limits with 429s, structured errors, Prometheus metrics, graceful shutdown.
-- **P3 — Performance & backends:** 🟡 CPU and Metal done — int8 `SDOT` kernels, Accelerate GEMM, parallelism tuning, GQA-grouped attention, native Q4_K / Q6_K kernels on CPU and Metal, repacked Q4_0 with i8mm, a Metal executor with tiled attention, perplexity/greedy parity tests against llama.cpp CPU and Metal. Remaining: faster Metal GEMM, lower-latency CPU thread pool, Q5_K kernels, F16 KV cache, x86 SIMD, CUDA.
+- **P3 — Performance & backends:** 🟡 CPU and Metal done — int8 `SDOT` kernels, Accelerate GEMM, parallelism tuning, GQA-grouped attention, native Q4_K / Q6_K kernels on CPU and Metal, repacked Q4_0 with i8mm, a Metal executor with tiled attention, perplexity/greedy parity tests against llama.cpp CPU and Metal. Remaining: faster Metal GEMM, lower-latency CPU thread pool, Q5_K kernels, GQA-shared Metal decode attention, x86 SIMD, CUDA.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the target design and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for benchmark status.
 
