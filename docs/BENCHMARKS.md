@@ -170,11 +170,31 @@ On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0
 **Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x).
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
-- Metal prompt processing, 0.85–0.93x (128–512 tokens). The quantized GEMM now runs at 3.0–3.2 TFLOPS on the 1B shapes, ~80% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak measured on this GPU; prefill attention is ~4% of the time.
+- Metal prompt processing on Llama-3.2-1B, 0.89–0.94x (128–512 tokens); SmolLM2 F16 is at parity. The GEMMs run at 3.0–3.3 TFLOPS (~80% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and are ~90% of the time; K-quant dequantization costs the most (Q4_K_M is the slowest format). See "Metal prompt processing" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 - Small batches of 16–32 tokens on Metal: 0.86–0.91x, except Q4_0 at 0.75–0.80x. At 24 tokens rllm is ahead for Q8_0 and Q4_K_M. See "Metal 16–32-token batches" below.
 
-**Metal 16–32-token batches (this round)**
+**Metal prompt processing (this round)**
+
+Timing the forward pass with groups of kernels left out showed that on Llama-3.2-1B Q8_0 at 512 tokens, the GEMMs take 307 of 340 ms. The other 32 ms are mostly SwiGLU (8 ms), prefill attention (8 ms) and the half-precision conversions of linear-layer inputs (6 ms). llama.cpp takes 311 ms in total, so both parts needed work. On the M4, llama.cpp uses its classic simdgroup GEMM: its Metal 4 tensor-op path is enabled only from the M5, as `llama-bench -v` reports. Its 64x32 tile with 8x8-block staging, rebuilt here with our dequantizers, measured the same as our 64x64 tile at 512 tokens. Changes:
+
+1. **64x32-tile GEMM (`mml_*`) when 64x64 tiles would launch fewer than 256 threadgroups.** This covers short prompts and narrow matrices: at 128 tokens, the output and down projections get only 64 threadgroups. It is 10–14% faster there, equal on the wide gate/up matrix, and up to 5% slower for Q4_0 at 512 tokens. It is always used for F16 weights, where it is 5–10% faster at every size. Q6_K keeps the 64x64 kernel.
+2. **RMSNorm and SwiGLU write half precision.** When every segment of the next linear layer reads only the half-precision input, they write straight into its input buffer, which saves two `to_half` passes per layer. SwiGLU also writes half as many bytes.
+3. **Accumulating GEMMs keep the fast store.** The output and down projections add into the residual stream. Their full tiles now load the previous values as fragments and add them by a product with the identity matrix, instead of staging through threadgroup memory with scalar read-modify-write.
+4. **Q8_0 / Q4_0 weights are read 2 bytes at a time** instead of byte by byte: 1.5–3% faster GEMM, same F32 arithmetic. A version with half arithmetic broke the 1e-4 decode bound, because the matrix-vector kernels accumulate in F32.
+
+Interleaved A/B (tok/s, mean of 2 rounds) and llama.cpp `llama-bench -ngl 99`:
+
+| model | 128 tokens: before → after (llama.cpp) | 512 tokens: before → after (llama.cpp) |
+| --- | ---: | ---: |
+| 1B Q8_0 | 1,392 → 1,491 (1,588): **0.94x** | 1,508 → 1,560 (1,651): **0.94x** |
+| 1B Q4_K_M | 1,326 → 1,371 (1,537): 0.89x | 1,436 → 1,464 (1,592): 0.92x |
+| 1B Q4_0 | 1,384 → 1,482 (1,623): 0.91x | 1,488 → 1,548 (1,675): 0.92x |
+| SmolLM2-135M F16 | 8,512 → **10,052** (10,017): **1.00x** | 10,376 → **11,512** (11,210): **1.02x** |
+
+Rejected: storing the weight tile as 8x8 blocks with one 16-byte store per 8 values and transposed fragment loads (within ±3%). Tests: a planted operand-index bug in the 64x32 kernel fails 5 of the Metal-vs-CPU tests. The real-model Metal tests (perplexity and greedy output against llama.cpp) pass.
+
+**Metal 16–32-token batches (PR #22)**
 
 The small-batch GEMM (`mms`) loaded every 8×8 activation fragment from device memory once per 8 weight rows: at 32 tokens that is 5 loads for 4 matrix products. Two changes:
 

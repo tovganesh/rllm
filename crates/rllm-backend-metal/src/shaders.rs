@@ -44,18 +44,27 @@ inline void load8(device const uchar* w, uint row, uint k, uint ib, uint q, thre
     const float4 a = float4(r[0]), b = float4(r[1]);
     for (uint j = 0; j < 4; ++j) { out[j] = a[j]; out[4 + j] = b[j]; }
 }
+// Q8_0 / Q4_0: 2-byte loads (blocks are 2-byte aligned) instead of byte loads; the GEMM
+// is 1.5-3% faster. Products stay F32 (exact: an 8-bit integer times an F16 scale).
 inline void load8(device const uchar* w, uint row, uint k, uint ib, uint q, thread float* out, WQ8) {
     device const block_q8_0* b = (device const block_q8_0*)w + (ulong)row * (k / 32) + ib;
+    device const char2* p = (device const char2*)(b->qs + q * 8);
     const float d = float(b->d);
-    for (uint j = 0; j < 8; ++j) out[j] = d * float(b->qs[q * 8 + j]);
+    for (uint j = 0; j < 4; ++j) {
+        const char2 c = p[j];
+        out[2 * j] = d * float(c.x);
+        out[2 * j + 1] = d * float(c.y);
+    }
 }
 inline void load8(device const uchar* w, uint row, uint k, uint ib, uint q, thread float* out, WQ4) {
     device const block_q4_0* b = (device const block_q4_0*)w + (ulong)row * (k / 32) + ib;
+    device const ushort* p = (device const ushort*)(b->qs + (q % 2) * 8);
     const float d = float(b->d);
-    if (q < 2) {
-        for (uint j = 0; j < 8; ++j) out[j] = d * (float(b->qs[q * 8 + j] & 0x0F) - 8.0f);
-    } else {
-        for (uint j = 0; j < 8; ++j) out[j] = d * (float(b->qs[(q - 2) * 8 + j] >> 4) - 8.0f);
+    const uint sh = q < 2 ? 0 : 4;
+    for (uint j = 0; j < 4; ++j) {
+        const ushort c = p[j];
+        out[2 * j] = d * (float((c >> sh) & 0x0F) - 8.0f);
+        out[2 * j + 1] = d * (float((c >> (8 + sh)) & 0x0F) - 8.0f);
     }
 }
 
@@ -650,12 +659,21 @@ inline void mmq_impl(device const uchar* w, device const half* x, device float* 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Accumulation (y += ...) and partial tiles go through threadgroup staging so the
-    // k-loop above stays identical to the plain kernel (keeps accumulators in registers).
-    if (!acc_in && row0 + TQ <= m && col0 + TQ <= n) {
+    // Full tiles store directly; with accumulation (y += ...) the previous values are
+    // loaded as fragments and added by a product with the identity. Partial tiles go
+    // through threadgroup staging.
+    if (row0 + TQ <= m && col0 + TQ <= n) {
+        const simdgroup_float8x8 ident = simdgroup_float8x8(1.0f);
         for (uint a = 0; a < 4; ++a)
-            for (uint b = 0; b < 4; ++b)
-                simdgroup_store(acc[a][b], y + (ulong)(row0 + xi + a * 8) * ldy + col0 + wj + b * 8, ldy);
+            for (uint b = 0; b < 4; ++b) {
+                device float* o = y + (ulong)(row0 + xi + a * 8) * ldy + col0 + wj + b * 8;
+                if (acc_in) {
+                    simdgroup_float8x8 prev;
+                    simdgroup_load(prev, o, ldy);
+                    simdgroup_multiply_accumulate(acc[a][b], prev, ident, acc[a][b]);
+                }
+                simdgroup_store(acc[a][b], o, ldy);
+            }
     } else {
         threadgroup float* sc = (threadgroup float*)shmem;           // [TQ][TQ] floats 16 KB
         for (uint a = 0; a < 4; ++a)
@@ -685,6 +703,88 @@ MMH_KERNEL(mm_f16, WF16, false)
 MMH_KERNEL(mm_q4_k, WQ4K, false)
 MMH_KERNEL(mm_q6_k, WQ6K, true)
 
+// ── quantized / F16-weight tiled matrix-matrix, 64x32 output tile ──
+// 64 weight rows x 32 tokens per threadgroup, k-step 32, 4 simdgroups of 32 rows x 16
+// tokens (8 accumulators), both tiles stored as contiguous 8x8 blocks (6 KB, as in
+// llama.cpp's classic `kernel_mul_mm`). Used instead of the 64x64 tile when that would
+// launch fewer than 256 threadgroups (short prompts, narrow matrices: up to 14% faster
+// on Llama-3.2-1B shapes at 128 tokens) and for F16 weights (5-10% faster at any size).
+template <typename T>
+inline void mml_impl(device const uchar* w, device const half* x, device float* y,
+                     uint n, uint k, uint m, uint acc_in, uint ldy, uint2 tg, uint tid, uint sg,
+                     threadgroup half* sa, threadgroup half* sb, threadgroup float* stage) {
+    const uint r0 = tg.x * 64, r1 = tg.y * 32;
+    // weight staging: thread -> row tid/2, values 16*(tid%2) .. +16 of the 32-block
+    const uint lr0 = min(r0 + tid / 2, n - 1);
+    const uint il0 = tid % 2;
+    // activation staging: thread -> token tid/4, k offset 8*(tid%4)
+    const uint tok = tid / 4, iy = 8 * (tid % 4);
+    const bool tok_ok = r1 + tok < m;
+    device const half* xr = x + (ulong)min(r1 + tok, m - 1) * k + iy;
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint nb = k / 32;
+    for (uint b = 0; b < nb; ++b) {
+        float v0[8], v1[8];
+        load8(w, lr0, k, b, 2 * il0, v0, T());
+        load8(w, lr0, k, b, 2 * il0 + 1, v1, T());
+        half4 xa = tok_ok ? ((device const half4*)(xr + b * 32))[0] : half4(0.0h);
+        half4 xb = tok_ok ? ((device const half4*)(xr + b * 32))[1] : half4(0.0h);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // sa block ib = 8*kc + rowblock, element [k%8][row%8]
+            const uint row = tid / 2, sy = row / 8, lx = row % 8;
+            for (uint i = 0; i < 8; ++i) {
+                sa[64 * (8 * (2 * il0) + sy) + 8 * i + lx] = half(v0[i]);
+                sa[64 * (8 * (2 * il0 + 1) + sy) + 8 * i + lx] = half(v1[i]);
+            }
+            // sb block ib = 4*kc + tokblock, element [tok%8][k%8]
+            threadgroup half4* d = (threadgroup half4*)(sb + 64 * (4 * (tid % 4) + tok / 8) + 8 * (tok % 8));
+            d[0] = xa;
+            d[1] = xb;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4 * 64 * (sg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sg / 2);
+        for (uint ik = 0; ik < 4; ++ik) {
+            simdgroup_half8x8 ma[4], mb[2];
+            for (uint i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8);
+            for (uint i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8);
+            for (uint i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+    const uint rr = r0 + 32 * (sg & 1), tt = r1 + 16 * (sg >> 1);
+    if (!acc_in && r0 + 64 <= n && r1 + 32 <= m) {
+        for (uint i = 0; i < 8; ++i)
+            simdgroup_store(mc[i], y + (ulong)(tt + 8 * (i / 4)) * ldy + rr + 8 * (i % 4), ldy);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* st = stage + 32 * (sg & 1) + 16 * (sg >> 1) * 64;   // [32 tok][64 rows]
+        for (uint i = 0; i < 8; ++i) simdgroup_store(mc[i], st + 8 * (i % 4) + 8 * 64 * (i / 4), 64);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < 64 * 32; e += 128) {
+            const uint t = r1 + e / 64, r = r0 + e % 64;
+            if (t < m && r < n) {
+                device float* o = y + (ulong)t * ldy + r;
+                *o = acc_in ? *o + stage[e] : stage[e];
+            }
+        }
+    }
+}
+#define MML_KERNEL(NAME, TAG) \
+kernel void NAME(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]], \
+                 uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float stage[64 * 32]; \
+    threadgroup half* sa = (threadgroup half*)stage; \
+    threadgroup half* sb = sa + 64 * 32; \
+    mml_impl<TAG>(w, (device const half*)x, y, n, k, m, accumulate, ldy, tg, tid, sg, sa, sb, stage); }
+MML_KERNEL(mml_q8_0, WQ8)
+MML_KERNEL(mml_q4_0, WQ4)
+MML_KERNEL(mml_f16, WF16)
+MML_KERNEL(mml_q4_k, WQ4K)
+
 // ── F32 -> F16 conversion of a linear layer's input (prefill) ──
 kernel void to_half(device const float4* x [[buffer(0)]], device half4* y [[buffer(1)]],
                     uint i [[thread_position_in_grid]]) { y[i] = half4(x[i]); }
@@ -711,8 +811,11 @@ EMBED_KERNEL(embed_q4_k, WQ4K)
 EMBED_KERNEL(embed_q6_k, WQ6K)
 
 // ── RMSNorm: one threadgroup (256 threads) per output row; optional row gather ──
+// `rms_norm_h` / `swiglu_h` write half precision straight into the input buffer of the
+// next linear layer when it runs the half-precision GEMM, saving a `to_half` pass.
+template <typename OT>
 kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
-                     device float* y [[buffer(2)]], device const uint* rows [[buffer(3)]],
+                     device OT* y [[buffer(2)]], device const uint* rows [[buffer(3)]],
                      constant uint& h [[buffer(4)]], constant float& eps [[buffer(5)]],
                      constant uint& gather [[buffer(6)]],
                      uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -728,8 +831,10 @@ kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w 
     float total = 0.0f;
     for (uint i = 0; i < 8; ++i) total += partial[i];
     const float inv = rsqrt(total / float(h) + eps);
-    for (uint i = tid; i < h; i += 256) y[(ulong)r * h + i] = xr[i] * inv * w[i];
+    for (uint i = tid; i < h; i += 256) y[(ulong)r * h + i] = OT(xr[i] * inv * w[i]);
 }
+template [[host_name("rms_norm")]] kernel decltype(rms_norm<float>) rms_norm<float>;
+template [[host_name("rms_norm_h")]] kernel decltype(rms_norm<half>) rms_norm<half>;
 
 // ── RoPE (adjacent pairs) on the first `heads` heads of each row (row stride in floats) ──
 kernel void rope(device float* x [[buffer(0)]], device const float* cos_t [[buffer(1)]],
@@ -1204,11 +1309,14 @@ ATTN_TILE_KERNEL(96, _f16, half)
 ATTN_TILE_KERNEL(128, _f16, half)
 
 // ── SwiGLU on the fused gate/up buffer: out[r, j] = silu(gu[r, j]) * gu[r, inter + j] ──
-kernel void swiglu(device const float* gu [[buffer(0)]], device float* out [[buffer(1)]],
+template <typename OT>
+kernel void swiglu(device const float* gu [[buffer(0)]], device OT* out [[buffer(1)]],
                    constant uint& inter [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     const uint r = i / inter, j = i % inter;
     const float a = gu[(ulong)r * 2 * inter + j];
     const float u = gu[(ulong)r * 2 * inter + inter + j];
-    out[i] = a / (1.0f + exp(-a)) * u;
+    out[i] = OT(a / (1.0f + exp(-a)) * u);
 }
+template [[host_name("swiglu")]] kernel decltype(swiglu<float>) swiglu<float>;
+template [[host_name("swiglu_h")]] kernel decltype(swiglu<half>) swiglu<half>;
 "#;
