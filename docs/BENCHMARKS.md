@@ -174,7 +174,28 @@ On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 - Small batches of 16–32 tokens on Metal (0.65–0.82x) and Q8_0 batches of 4–32 tokens on the CPU (0.82–0.86x); see "Small batches" above.
 
-**Decode round: GQA-shared Metal attention, native F16 weights (this round)**
+**CPU thread placement (this round)**
+
+Both rllm and llama.cpp defaulted to the 4 performance cores of the M4 (4 performance + 6 efficiency). A sweep of 4–10 threads showed that this leaves Llama-3.2-1B speed unused in both engines. For example, llama.cpp 1B Q8_0 decode is 53.7 tok/s at 4 threads and 72.3 at 6, and rllm reached 71.2 at 8. SmolLM2-135M was fastest at 4 threads in both engines. Its steps are a few microseconds long, and an efficiency core holding the last task delays the whole step. So thread counts now follow the work:
+
+1. **Decode pool (spinning, dynamic task hand-out).** The model's hidden size is passed as a hint at load (`threads::hint_model_width`). Models at least 1024 wide use the performance cores plus up to as many efficiency cores (8 threads on an M4); smaller ones keep the performance cores. Choosing per job instead does not work: idle workers keep spinning, so the OS spreads all of them over both core types.
+2. **Large integer GEMMs** (Q8_0 i8mm and Q4_0x4, at least 2^29 multiply-adds: prefill of the 1B, not of SmolLM2) run on a second Rayon pool with every core. Moving all prefill to every core made SmolLM2 128-token prompts 35% slower.
+3. An explicit `--threads N` / `RAYON_NUM_THREADS` still sets everything to N.
+
+Interleaved A/B against the previous release, CPU, tok/s (mean of 2 rounds):
+
+| model | decode | 8-token batch | 128-token prompt |
+| --- | ---: | ---: | ---: |
+| Llama-3.2-1B Q8_0 | 53.2 → **70.3** (+32%) | 240 → **304** (+27%) | 391 → **563** (+44%) |
+| Llama-3.2-1B Q4_0 | 88.3 → **109** (+23%) | 374 → **434** (+16%) | 448 → **556** (+24%) |
+| Llama-3.2-1B Q4_K_M | 82.8 → **102** (+24%) | 202 → **260** (+29%) | 381 → 382 |
+| SmolLM2-135M Q8_0 | 419 → 413 | 1,899 → 1,797 (−5%, noisy) | 3,037 → 2,862 (noisy; 2nd round equal) |
+
+Against llama.cpp at its default (4 threads): 1B Q8_0 decode 1.31x, 8-token batch 1.04x, 128-token prompt 1.19x; Q4_0 decode 1.22x; Q4_K_M decode 1.30x. Against llama.cpp at its *best* thread count in the sweep (6 or 8), 1B decode is at parity: Q8_0 70.3 vs 72.3, Q4_0 109 vs 109, Q4_K_M 102 vs 93. The 8-token batch is 304 vs 350 for Q8_0 and 434 vs 416 for Q4_0.
+
+Rejected: pre-interleaving Q8_0 weights for i8mm, as llama.cpp does. A kernel variant that skipped the on-the-fly interleave was only 5–8% faster in the GEMM micro-benchmark (`repack::tests::q8_gemm_bench`), not worth a second weight format. Splitting each tile's four-deep `SMMLA` chain into two chains was 10% slower. Task blocking for 128-row batches made no difference.
+
+**Decode round: GQA-shared Metal attention, native F16 weights (PR #20)**
 
 Fresh baseline (2026-11-22, `scripts/bench_vs_llamacpp.py --reps 3`): CPU decode and prompt processing at 4,096 tokens of context are 1.4–3.2x ahead of llama.cpp in every format; at short context the gaps were CPU decode of F16 files (0.87x) and Metal decode at long context. Interleaved A/B, decode tok/s:
 
@@ -353,7 +374,12 @@ Correctness on Metal: perplexity vs `llama-perplexity -ngl 99` — Q8_0 +0.02%, 
 
 - `--device cpu|metal` — where the LLM runs.
 - `--lookup-draft N` / `--lookup-ngram M` (`generate`, `serve`) — prompt-lookup speculation with at most N drafts per step, matching suffixes of up to M tokens (default 3); off by default.
-- `--threads N` / `RAYON_NUM_THREADS` — worker threads (default: performance cores on Apple Silicon, otherwise all cores).
+- `--threads N` / `RAYON_NUM_THREADS` — worker threads for every pool. The default on Apple Silicon has three parts:
+  - the global pool uses the performance cores;
+  - large prefill GEMMs use every core;
+  - decode uses the performance cores, plus as many efficiency cores again for models with a hidden size of at least 1024.
+
+  Elsewhere the default is all cores.
 - `RLLM_TASK_BYTES` — weight bytes per parallel task in matrix-vector products (default 131072).
 
 ---

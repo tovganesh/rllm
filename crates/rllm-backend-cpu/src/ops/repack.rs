@@ -225,7 +225,7 @@ pub fn gemm_q4_0x4(weight: &[u8], x: &[f32], out: &mut [f32], m: usize, n: usize
         let packed = pack_pairs(&a, m, nb);
         // Enough tasks for load balance; each task's weights stay in cache while it
         // walks all activation rows.
-        let threads = rayon::current_num_threads().max(1);
+        let threads = crate::threads::gemm_threads(m * n * k);
         let groups_per_task = groups.div_ceil(threads * 4).max(1);
         let task = |t: usize| {
             let g0 = t * groups_per_task;
@@ -238,7 +238,7 @@ pub fn gemm_q4_0x4(weight: &[u8], x: &[f32], out: &mut [f32], m: usize, n: usize
         if m < SMALL_BATCH_ROWS {
             crate::pool::for_each_index(tasks, task);
         } else {
-            (0..tasks).into_par_iter().for_each(task);
+            crate::threads::run_large(m * n * k, || (0..tasks).into_par_iter().for_each(task));
         }
         return;
     }
@@ -285,7 +285,7 @@ pub fn gemm_q8_0_i8mm(weight: &[u8], x: &[f32], out: &mut [f32], m: usize, n: us
         if m < SMALL_BATCH_ROWS {
             crate::pool::for_each_index(tasks, task);
         } else {
-            (0..tasks).into_par_iter().for_each(task);
+            crate::threads::run_large(m * n * k, || (0..tasks).into_par_iter().for_each(task));
         }
         for j in 4 * groups..n {
             let w = &weight[j * row_bytes..(j + 1) * row_bytes];
@@ -617,6 +617,33 @@ mod neon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RAYON_NUM_THREADS=4 cargo test --release -p rllm-backend-cpu q8_gemm_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn q8_gemm_bench() {
+        let shapes = [(2048usize, 2048usize), (8192, 2048), (2048, 8192), (3072, 2048)];
+        for m in [4usize, 8, 16, 32, 128] {
+            let mut line = format!("m={m:4}");
+            let mut total = 0.0;
+            for &(n, k) in &shapes {
+                let mut w = vec![0u8; n * k / 32 * 34];
+                crate::ops::quant::quantize_f32_to_q8_0(&data(n * k, 1), &mut w);
+                let x = data(m * k, 2);
+                let mut out = vec![0f32; m * n];
+                gemm_q8_0_i8mm(&w, &x, &mut out, m, n, k).unwrap();
+                let reps = 20;
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    gemm_q8_0_i8mm(&w, &x, &mut out, m, n, k).unwrap();
+                }
+                let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                total += us;
+                line += &format!(" {:5.0}", 2.0 * (m * n * k) as f64 / us / 1e3);
+            }
+            println!("{line} GOPS  total {total:.0}us");
+        }
+    }
     use crate::ops::qdot::scalar_dot_q4_0_q8;
     use crate::ops::quant::{dequantize_q4_0, quantize_f32_to_q4_0};
 
