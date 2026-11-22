@@ -8,7 +8,8 @@
 //! | `F32` | used directly |
 //! | `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q6_K` | kept as stored for linear layers and the embedding table (native integer kernels) |
 //! | `Q4_1`, `Q5_1`, `Q5_K` | converted to `Q8_0` at load (F32 with `requantize_to_q8_0: false`) |
-//! | `F16`, `BF16` | converted to F32 at load |
+//! | `F16` | kept as F16 for linear / embedding weights (norms become F32) |
+//! | `BF16` | converted to F32 at load |
 //!
 //! After loading, [`LlamaModel::pack_for_backend`] lets the backend repack weights into
 //! its preferred layout (the CPU backend interleaves `Q4_0` rows for its SDOT / i8mm
@@ -226,13 +227,20 @@ impl<B: Backend> LlamaModel<B> {
 }
 
 /// Loads a linear / embedding weight. Formats with native kernels (Q8_0, Q4_0, Q5_0,
-/// Q4_K, Q6_K) stay as stored; F32, F16 and BF16 become F32; other quantized formats
-/// become Q8_0 (or F32 when `requantize` is off).
+/// Q4_K, Q6_K, and F16 for 2-D weights) stay as stored; F32 and BF16 become F32; other
+/// quantized formats become Q8_0 (or F32 when `requantize` is off).
 pub(crate) fn load_weight(g: &MappedGguf, name: &str, shape: &[usize], requantize: bool) -> Result<Tensor> {
-    let ty = g
+    let info = g
         .tensor_info(name)
-        .ok_or_else(|| RllmError::ModelError(format!("Missing tensor '{name}'")))?
-        .ggml_type;
+        .ok_or_else(|| RllmError::ModelError(format!("Missing tensor '{name}'")))?;
+    let ty = info.ggml_type;
+    if ty == GgmlType::F16 && shape.len() == 2 && info.shape == shape {
+        // Half the memory and decode bandwidth of F32; the CPU and Metal kernels widen
+        // values in registers.
+        let bytes = g.tensor_bytes(info)?;
+        let storage = Storage::Cpu(CpuStorage::from_bytes(bytes.to_vec()));
+        return Ok(Tensor::new(Shape::new(shape.to_vec()), DType::F16, Device::Cpu, storage));
+    }
     let lossy_format = native_dtype(ty).is_none() && !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
     let in_features = *shape.last().unwrap_or(&0);
     if !(requantize && lossy_format && in_features.is_multiple_of(32)) {

@@ -1,6 +1,7 @@
 pub mod activations;
 pub mod blas;
 pub mod gemm;
+pub mod f16w;
 pub mod kdot;
 pub mod norm;
 pub mod paged_attn;

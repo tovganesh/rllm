@@ -167,15 +167,38 @@ One forward pass over N tokens (`rllm bench --model M --prompt-tokens N`, llama-
 
 On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0 is 0.82–0.86x from 4 tokens (llama.cpp repacks Q8_0 for i8mm; rllm interleaves rows on the fly). On Metal rllm is at 0.91–1.07x of llama.cpp up to 8 tokens for Q8_0 and Q4_K_M (Q4_0 0.77–1.03x) and 0.65–0.82x at 16–32, where the small-batch GEMM runs at ~45% of the half-precision peak.
 
-**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x).
+**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x).
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
 - Metal prompt processing, 0.85–0.93x (128–512 tokens). The quantized GEMM now runs at 3.0–3.2 TFLOPS on the 1B shapes, ~80% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak measured on this GPU; prefill attention is ~4% of the time.
-- CPU decode of F16 files, 0.90x: the CPU loader widens F16 weights to F32 (twice the bytes per token); llama.cpp keeps them in F16.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 - Small batches of 16–32 tokens on Metal (0.65–0.82x) and Q8_0 batches of 4–32 tokens on the CPU (0.82–0.86x); see "Small batches" above.
 
-**Prompt-lookup speculative decoding (this round, opt-in)**
+**Decode round: GQA-shared Metal attention, native F16 weights (this round)**
+
+Fresh baseline (2026-11-22, `scripts/bench_vs_llamacpp.py --reps 3`): CPU decode and prompt processing at 4,096 tokens of context are 1.4–3.2x ahead of llama.cpp in every format; at short context the gaps were CPU decode of F16 files (0.87x) and Metal decode at long context. Interleaved A/B, decode tok/s:
+
+| change | model | device | context | before | after |
+| --- | --- | --- | ---: | ---: | ---: |
+| GQA decode attention | Llama-3.2-1B Q8_0 | Metal | 1,024 | 63.9 | 66.3 (+4%) |
+| GQA decode attention | Llama-3.2-1B Q8_0 | Metal | 4,096 | 55.6 | 61.1 (**+10%**) |
+| GQA decode attention | Llama-3.2-1B Q4_0 | Metal | 1,024 | 101 | 106 (+5%) |
+| GQA decode attention | Llama-3.2-1B Q4_0 | Metal | 4,096 | 82.6 | 94.6 (**+15%**) |
+| GQA + adaptive chunks | SmolLM2-135M Q8_0 | Metal | 1,024 | 277 | 298 (**+8%**) |
+| GQA decode attention | SmolLM2-135M Q8_0 | Metal | 4,096 | 205 | 235 (**+15%**) |
+| F16 weights stay F16 | SmolLM2-135M F16 | CPU | 0 | 112 | **238 (2.1x)**; llama.cpp 127 |
+| F16 weights stay F16 | SmolLM2-135M F16 | Metal | 0 | 230 | 228 (llama.cpp 238) |
+
+1. **GQA-shared decode attention on Metal** (`attention_gqa{2,3,4,8}_*`). The per-query-head kernel read every K/V row once per query head: 4 times on Llama-3.2-1B (32 query heads over 8 KV heads), 3 on SmolLM2. Now one threadgroup per KV head serves its whole group. Each lane scores one position for all G heads from a single key read, and each value row is read once for G heads' accumulators. Partials keep the same layout, so the split-context reduction is unchanged. `RLLM_NO_GQA_ATTN=1` selects the old kernel.
+2. **Adaptive context chunks.** With a quarter of the threadgroups, a model with few KV heads at short context left the GPU underused. When 256-key chunks would give fewer than 32 threadgroups, 128-key chunks are used. That is +10% for SmolLM2 at 1k context; at 4k, 256 stays 4% faster, and Llama-3.2-1B is unaffected.
+3. **F16 weights stay F16 on the CPU.**
+   - **Loading:** the loader used to widen F16 linear and embedding weights to F32, which doubled the bytes read per token. They now stay F16.
+   - **Decode:** NEON kernels widen 8 values at a time in registers and multiply in F32. Small batches (2–31 rows) convert each chunk once for up to 8 activation rows.
+   - **Prefill:** prefill widens weight chunks for the GEMM, as for the quantized formats. The widening is now vectorised; with the old scalar conversion, prefill was 13% slower than with F32 weights, and it is now within 2–10% (still 2.2–2.6x llama.cpp).
+   - **Metal and accuracy:** Metal uploads F16 weights directly. Results equal F32 weights up to summation order; teacher-forced and perplexity parity tests on the F16 file pass unchanged.
+4. Tests: the Metal-vs-CPU tests run the GQA kernel (2 query heads per KV head; planting a query-indexing bug fails 7 of 8). The real-model Metal tests (SmolLM2, group 3; Llama-3.2-1B, group 4) match llama.cpp's perplexity and greedy output as before. F16 kernels are checked against an F64 reference for 1–11 rows, with odd sizes using the scalar fallback.
+
+**Prompt-lookup speculative decoding (PR #19, opt-in)**
 
 `--lookup-draft N` on `rllm generate` and `rllm serve` turns on n-gram speculation. Each decoding sequence looks up the most recent earlier occurrence of its last 3, 2 or 1 tokens in its own prompt and output, and proposes up to N following tokens as a draft. The drafts are verified in the same forward pass, using the small-batch kernels above. Tokens are sampled row by row and kept while they equal the draft, so the output distribution is unchanged for any sampler. The scheduler picks the draft length from measured pass costs by row count and each sequence's recent acceptance, so drafting backs off where verification is expensive (CPU K-quants: 8 rows cost ~3× one row) or drafts keep failing.
 

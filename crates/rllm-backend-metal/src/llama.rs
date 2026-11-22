@@ -109,6 +109,13 @@ const ATTN_KB: usize = 32;
 /// 128 and 512 were up to 7% slower, no splitting 14–28% slower.
 const DECODE_CHUNK: usize = 256;
 
+/// With fewer decode-attention threadgroups than this at [`DECODE_CHUNK`], chunks of
+/// [`DECODE_CHUNK_SMALL`] keys are used instead, so a model with few KV heads still
+/// spreads a short context over the GPU (SmolLM2-135M, 3 KV heads, 1k context: +10%;
+/// at 4k, 256-key chunks are 4% faster).
+const DECODE_MIN_GROUPS: usize = 32;
+const DECODE_CHUNK_SMALL: usize = 128;
+
 /// Rows at or below which a linear layer uses matrix-vector kernels; larger batches use
 /// the small-batch GEMM (`mms`, F16/quantized weights) or the tiled GEMM. Measured
 /// end to end on Llama-3.2-1B (M4) at 3-4 rows: `mms` is ~25% faster for K-quants,
@@ -125,6 +132,10 @@ fn mv_max_rows(kind: WKind) -> usize {
 /// tiled GEMM. On Llama-3.2-1B shapes (M4) it is 2.3-3.4x faster at 8-16 rows and
 /// 1.4x at 32; the tiled GEMM wins from 64 rows.
 const MMS_MAX_ROWS: usize = 32;
+
+/// Query heads per KV head with a dedicated GQA decode attention kernel
+/// (`attention_gqa{G}_*`); other models use the per-query-head kernel.
+const GQA_GROUPS: [usize; 4] = [2, 3, 4, 8];
 
 impl MetalLlama {
     /// Whether a Metal device is available.
@@ -175,7 +186,14 @@ impl MetalLlama {
                 }))
             })
             .collect();
-        for name in names.iter().copied().chain(kv_names.iter().chain(&mv_names).map(String::as_str)) {
+        // GQA decode attention for this model's group size, when instantiated.
+        let group = c.num_attention_heads / c.num_key_value_heads;
+        let gqa_names: Vec<String> = if GQA_GROUPS.contains(&group) {
+            ["f32", "f16"].iter().map(|t| format!("attention_gqa{group}_hd{hd}_{t}")).collect()
+        } else {
+            Vec::new()
+        };
+        for name in names.iter().copied().chain(kv_names.iter().chain(&mv_names).chain(&gqa_names).map(String::as_str)) {
             let f = library
                 .get_function(name, None)
                 .map_err(|e| RllmError::BackendError(format!("Metal function {name}: {e}")))?;
@@ -197,6 +215,7 @@ impl MetalLlama {
             let t = converted.as_ref().unwrap_or(t);
             let kind = match t.dtype() {
                 DType::F32 => WKind::F32,
+                DType::F16 => WKind::F16,
                 DType::Q8_0 => WKind::Q8,
                 DType::Q4_0 => WKind::Q4,
                 DType::Q4_K => WKind::Q4K,
@@ -224,9 +243,6 @@ impl MetalLlama {
             })
         };
         let vec_buf = |t: &Tensor| -> Result<Buffer> { Ok(new_buffer_with(&device, as_bytes(t.as_f32_slice()?))) };
-        // Row-concatenation of matrices with equal column counts. Raw blocks are
-        // concatenated when every part has the same storage type; otherwise all parts
-        // are dequantized to F32.
         // Row-concatenation of matrices with equal column counts: consecutive parts with
         // the same storage format are concatenated as raw blocks into one segment.
         let upload_concat = |parts: &[&Tensor]| -> Result<Vec<Weight>> {
@@ -657,7 +673,13 @@ impl LanguageModel for MetalLlama {
         // Decode attention splits each row's context into chunks of DECODE_CHUNK keys
         // (one threadgroup each); partials need a buffer sized by the longest context.
         let max_single_ctx = singles.iter().map(|&r| batch.positions[r as usize] + 1).max().unwrap_or(0);
-        let nsplit = max_single_ctx.div_ceil(DECODE_CHUNK).max(1);
+        let attn_heads = if GQA_GROUPS.contains(&(nq / nkv)) && std::env::var_os("RLLM_NO_GQA_ATTN").is_none() { nkv } else { nq };
+        let decode_chunk = if attn_heads * singles.len() * max_single_ctx.div_ceil(DECODE_CHUNK) < DECODE_MIN_GROUPS {
+            DECODE_CHUNK_SMALL
+        } else {
+            DECODE_CHUNK
+        };
+        let nsplit = max_single_ctx.div_ceil(decode_chunk).max(1);
         let part_len = (singles.len() * nq * nsplit * (hd + 2)).max(1) * 4;
         if sc.bufs.get("attn_part").is_none_or(|buf| (buf.length() as usize) < part_len) {
             sc.bufs.insert("attn_part", self.device.new_buffer(part_len as u64, MTLResourceOptions::StorageModePrivate));
@@ -750,13 +772,13 @@ impl LanguageModel for MetalLlama {
                 }
                 if !singles.is_empty() {
                     let mut args = attn_args(b("singles"));
-                    args.extend([Arg::B(b("attn_part")), Arg::U(DECODE_CHUNK as u32), Arg::U(nsplit as u32)]);
-                    e.groups(
-                        self.pipeline(&format!("attention_hd{hd}_{}", self.kv_type)),
-                        &args,
-                        (nq as u64, singles.len() as u64, nsplit as u64),
-                        128,
-                    );
+                    args.extend([Arg::B(b("attn_part")), Arg::U(decode_chunk as u32), Arg::U(nsplit as u32)]);
+                    let name = if attn_heads == nkv && nkv != nq {
+                        format!("attention_gqa{}_hd{hd}_{}", nq / nkv, self.kv_type)
+                    } else {
+                        format!("attention_hd{hd}_{}", self.kv_type)
+                    };
+                    e.groups(self.pipeline(&name), &args, (attn_heads as u64, singles.len() as u64, nsplit as u64), 128);
                     if nsplit > 1 {
                         e.groups(
                             self.pipeline("attn_reduce"),

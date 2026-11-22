@@ -465,6 +465,19 @@ pub fn dequantize_into(dtype: rllm_core::dtype::DType, src: &[u8], out: &mut [f3
 
 /// Converts little-endian IEEE half-precision values to F32.
 pub fn convert_f16(src: &[u8], out: &mut [f32]) {
+    let n = (src.len() / 2).min(out.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Eight values per FCVTL/FCVTL2 pair (the scalar loop below is ~8x slower and
+        // made prefill with F16 weights 13% slower than with F32 weights).
+        let main = n - n % 8;
+        // SAFETY: `main` values are in bounds of both slices; unaligned loads/stores.
+        unsafe { super::f16w::widen(src.as_ptr(), out.as_mut_ptr(), main) };
+        for (b, y) in src[2 * main..2 * n].chunks_exact(2).zip(out[main..n].iter_mut()) {
+            *y = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for (b, y) in src.chunks_exact(2).zip(out.iter_mut()) {
         *y = f16::from_le_bytes([b[0], b[1]]).to_f32();
     }
