@@ -172,9 +172,26 @@ On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0
 **Behind:**
 - Metal prompt processing, 0.85–0.93x (128–512 tokens). The quantized GEMM now runs at 3.0–3.2 TFLOPS on the 1B shapes, ~80% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak measured on this GPU; prefill attention is ~4% of the time.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
-- Small batches of 16–32 tokens on Metal (0.65–0.82x) and Q8_0 batches of 4–32 tokens on the CPU (0.82–0.86x); see "Small batches" above.
+- Small batches of 16–32 tokens on Metal: 0.86–0.91x, except Q4_0 at 0.75–0.80x. At 24 tokens rllm is ahead for Q8_0 and Q4_K_M. See "Metal 16–32-token batches" below.
 
-**CPU thread placement (this round)**
+**Metal 16–32-token batches (this round)**
+
+The small-batch GEMM (`mms`) loaded every 8×8 activation fragment from device memory once per 8 weight rows: at 32 tokens that is 5 loads for 4 matrix products. Two changes:
+
+1. **Two row groups per simdgroup from 16 tokens.** Each simdgroup now dequantizes 16 weight rows, and each activation fragment serves two products. Per Llama-3.2-1B layer (`tests/gemm_bench.rs`), this is 12–22% faster at 16 tokens and 18–23% at 32. Four row groups was mixed; at 8 tokens one group stays faster, as does F16 at 16.
+2. **Exact token fragments.** 17–24 tokens used to be padded to 32 (four 8-token fragments). They now use three, which is 19–31% faster per layer.
+
+End to end (`rllm bench --prompt-tokens N`, tok/s, previous release → this one; llama.cpp `llama-bench -ngl 99`):
+
+| model | 16 tokens | 24 tokens | 32 tokens |
+| --- | ---: | ---: | ---: |
+| 1B Q8_0 | 700 → 779 (llama.cpp 854) | 642 → **951** (899) | 850 → 1,048 (1,180) |
+| 1B Q4_K_M | 697 → 761 (872) | 634 → **926** (895) | 840 → 1,020 (1,182) |
+| 1B Q4_0 | 678 → 760 (1,012) | 627 → 913 (954) | 831 → 1,008 (1,259) |
+
+rllm is now ahead of llama.cpp at 24 tokens for Q8_0 and Q4_K_M (1.03–1.06x). Elsewhere in this range it is at 0.86–0.91x, except Q4_0 (0.75–0.96x). Tests: the batch-vs-token-by-token Metal test covers 12, 16, 24 and 32 tokens in every format; a planted row-indexing bug in the two-group store fails it.
+
+**CPU thread placement (PR #21)**
 
 Both rllm and llama.cpp defaulted to the 4 performance cores of the M4 (4 performance + 6 efficiency). A sweep of 4–10 threads showed that this leaves Llama-3.2-1B speed unused in both engines. For example, llama.cpp 1B Q8_0 decode is 53.7 tok/s at 4 threads and 72.3 at 6, and rllm reached 71.2 at 8. SmolLM2-135M was fastest at 4 threads in both engines. Its steps are a few microseconds long, and an efficiency core holding the last task delays the whole step. So thread counts now follow the work:
 

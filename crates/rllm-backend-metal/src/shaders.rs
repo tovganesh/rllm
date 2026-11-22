@@ -443,70 +443,80 @@ MVN_ALL(MvQ6K, "q6_k")
 // Rows of `x` past `m` are read but only feed output rows that are never written, so
 // `x` needs 8*NT readable rows.
 // One step of `mms`: B blocks (32*B values) starting at block ib0.
-template <typename T, uint NT, uint B>
-inline void mms_step(device const uchar* w, device const half* x, uint row, uint k, uint ib0, uint lr, uint lq,
+template <typename T, uint NT, uint B, uint RG>
+inline void mms_step(device const uchar* w, device const half* x, thread const uint* rows, uint k, uint ib0, uint lr, uint lq,
                      threadgroup half* sw, thread simdgroup_float8x8* acc) {
     constexpr uint KW = 32 * B;
     // All weight loads of the tile are issued before any is used.
-    float wv[B][8];
-    for (uint b = 0; b < B; ++b) load8(w, row, k, ib0 + b, lq, wv[b], T());
-    for (uint b = 0; b < B; ++b)
-        for (uint j = 0; j < 8; ++j) sw[lr * KW + b * 32 + lq * 8 + j] = half(wv[b][j]);
+    float wv[RG][B][8];
+    for (uint g = 0; g < RG; ++g)
+        for (uint b = 0; b < B; ++b) load8(w, rows[g], k, ib0 + b, lq, wv[g][b], T());
+    for (uint g = 0; g < RG; ++g)
+        for (uint b = 0; b < B; ++b)
+            for (uint j = 0; j < 8; ++j) sw[(g * 8 + lr) * KW + b * 32 + lq * 8 + j] = half(wv[g][b][j]);
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    // acc[t] (tokens x rows) += X[t*8.., kk..] (row-major, from device) * W[rows, kk..]^T
-    // (transposed load from threadgroup memory).
+    // acc[t][g] (tokens x rows) += X[t*8.., kk..] (row-major, from device) * W[rows, kk..]^T
+    // (transposed load from threadgroup memory). Each X fragment serves RG row groups.
     for (uint kk = 0; kk < KW; kk += 8) {
-        simdgroup_half8x8 wt;
-        simdgroup_load(wt, sw + kk, KW, ulong2(0, 0), true);
+        simdgroup_half8x8 wt[RG];
+        for (uint g = 0; g < RG; ++g) simdgroup_load(wt[g], sw + g * 8 * KW + kk, KW, ulong2(0, 0), true);
         for (uint t = 0; t < NT; ++t) {
             simdgroup_half8x8 xm;
             simdgroup_load(xm, x + (ulong)(t * 8) * k + ib0 * 32 + kk, k);
-            simdgroup_multiply_accumulate(acc[t], xm, wt, acc[t]);
+            for (uint g = 0; g < RG; ++g) simdgroup_multiply_accumulate(acc[t * RG + g], xm, wt[g], acc[t * RG + g]);
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-template <typename T, uint NT, uint SG, uint BPI>
+template <typename T, uint NT, uint SG, uint BPI, uint RG>
 kernel void mms(device const uchar* w [[buffer(0)]], device const half* x [[buffer(1)]],
                 device float* y [[buffer(2)]], constant uint& n [[buffer(3)]],
                 constant uint& k [[buffer(4)]], constant uint& m [[buffer(5)]],
                 constant uint& accumulate [[buffer(6)]], constant uint& ldy [[buffer(7)]],
                 uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                 uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup half sw_all[SG][8 * 32 * BPI];
+    threadgroup half sw_all[SG][RG * 8 * 32 * BPI];
     threadgroup float so_all[SG][64];
     threadgroup half* sw = sw_all[sg];
     threadgroup float* so = so_all[sg];
-    const uint row0 = (tg * SG + sg) * 8;
+    const uint row0 = (tg * SG + sg) * 8 * RG;
     if (row0 >= n) return;
     const uint lr = lane / 4, lq = lane % 4;
-    const uint row = min(row0 + lr, n - 1);  // rows past n are computed and discarded
+    uint rows[RG];
+    for (uint g = 0; g < RG; ++g) rows[g] = min(row0 + g * 8 + lr, n - 1);  // rows past n are computed and discarded
     const uint nb = k / 32;
-    simdgroup_float8x8 acc[NT];
-    for (uint t = 0; t < NT; ++t) acc[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc[NT * RG];
+    for (uint t = 0; t < NT * RG; ++t) acc[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     uint ib = 0;
-    for (; ib + BPI <= nb; ib += BPI) mms_step<T, NT, BPI>(w, x, row, k, ib, lr, lq, sw, acc);
-    for (; ib < nb; ++ib) mms_step<T, NT, 1>(w, x, row, k, ib, lr, lq, sw, acc);
+    for (; ib + BPI <= nb; ib += BPI) mms_step<T, NT, BPI, RG>(w, x, rows, k, ib, lr, lq, sw, acc);
+    for (; ib < nb; ++ib) mms_step<T, NT, 1, RG>(w, x, rows, k, ib, lr, lq, sw, acc);
     for (uint t = 0; t < NT; ++t) {
-        simdgroup_store(acc[t], so, 8);  // so[token * 8 + r]
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint e = lane; e < 64; e += 32) {
-            const uint r = e % 8, tok = t * 8 + e / 8;
-            if (tok < m && row0 + r < n) {
-                device float* o = y + (ulong)tok * ldy + row0 + r;
-                *o = accumulate ? *o + so[e] : so[e];
+        for (uint g = 0; g < RG; ++g) {
+            simdgroup_store(acc[t * RG + g], so, 8);  // so[token * 8 + r]
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < 64; e += 32) {
+                const uint r = g * 8 + e % 8, tok = t * 8 + e / 8;
+                if (tok < m && row0 + r < n) {
+                    device float* o = y + (ulong)tok * ldy + row0 + r;
+                    *o = accumulate ? *o + so[e] : so[e];
+                }
             }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
-// 2 simdgroups x 8 weight rows per threadgroup, 2 blocks per step (swept on an M4:
-// 1 or 4 simdgroups and 1, 4 or 8 blocks per step were up to 20% slower).
-typedef decltype(mms<WQ8, 1, 2, 2>) mms_t;
-#define MMS(TAG, SUF, NT) template [[host_name("mms" #NT "_" SUF)]] kernel mms_t mms<TAG, NT, 2, 2>;
-#define MMS_ALL(TAG, SUF) MMS(TAG, SUF, 1) MMS(TAG, SUF, 2) MMS(TAG, SUF, 4)
+// 2 simdgroups x 8·RG weight rows per threadgroup, 2 blocks per step (swept on an M4:
+// 1 or 4 simdgroups and 1, 4 or 8 blocks per step were up to 20% slower). With 16-32
+// tokens, RG = 2 row groups per simdgroup reuse each activation fragment twice
+// (-12 to -23% per Llama-3.2-1B layer; RG = 4 was mixed); at 8 tokens RG = 1 is faster
+// (and for F16 weights at 16 tokens). NT = 3 token fragments for 17-24 tokens: padding
+// 24 tokens to 32 made a layer 19-31% slower.
+typedef decltype(mms<WQ8, 1, 2, 2, 1>) mms_t;
+#define MMS(TAG, SUF, NT) template [[host_name("mms" #NT "_" SUF)]] kernel mms_t mms<TAG, NT, 2, 2, 1>;
+#define MMSR(TAG, SUF, NT, RG) template [[host_name("mms" #NT "r" #RG "_" SUF)]] kernel mms_t mms<TAG, NT, 2, 2, RG>;
+#define MMS_ALL(TAG, SUF) MMS(TAG, SUF, 1) MMS(TAG, SUF, 2) MMSR(TAG, SUF, 2, 2) MMSR(TAG, SUF, 3, 2) MMSR(TAG, SUF, 4, 2)
 MMS_ALL(WQ8, "q8_0")
 MMS_ALL(WQ4, "q4_0")
 MMS_ALL(WF16, "f16")

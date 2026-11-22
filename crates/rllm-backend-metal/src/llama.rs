@@ -176,7 +176,9 @@ impl MetalLlama {
         let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
             .iter()
             .flat_map(|f| [2, 4, 8].map(|r| format!("mv{r}_{f}")))
-            .chain(["f16", "q8_0", "q4_0", "q4_k", "q6_k"].iter().flat_map(|f| [1, 2, 4].map(|t| format!("mms{t}_{f}"))))
+            .chain(["f16", "q8_0", "q4_0", "q4_k", "q6_k"].iter().flat_map(|f| {
+                ["mms1", "mms2", "mms2r2", "mms3r2", "mms4r2"].map(|t| format!("{t}_{f}"))
+            }))
             .collect();
         let kv_names: Vec<String> = ["f32", "f16"]
             .iter()
@@ -505,10 +507,14 @@ impl MetalLlama {
                 let p = self.pipeline(&name);
                 e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
             } else if w.kind != WKind::F32 && m <= MMS_MAX_ROWS {
-                let nt = m.div_ceil(8).next_power_of_two();
+                let nt = m.div_ceil(8);
+                // Row groups per simdgroup (see the `mms` kernel): 2 from 16 tokens,
+                // except for F16 weights at 16.
+                let rg = if nt == 1 || (nt == 2 && w.kind == WKind::F16) { 1 } else { 2 };
+                let name = if rg == 1 { format!("mms{nt}_{}", w.kind.suffix()) } else { format!("mms{nt}r{rg}_{}", w.kind.suffix()) };
                 let mut args = args;
                 args[1] = Arg::B(xh);
-                e.groups(self.pipeline(&format!("mms{nt}_{}", w.kind.suffix())), &args, ((w.rows as u64).div_ceil(16), 1, 1), 64);
+                e.groups(self.pipeline(&name), &args, ((w.rows as u64).div_ceil(16 * rg as u64), 1, 1), 64);
             } else if w.kind == WKind::F32 {
                 // Full-precision weights keep the F32 tile kernel (the large-tile kernel stores
                 // weights as half precision, which is lossless only for F16/quantized weights).
