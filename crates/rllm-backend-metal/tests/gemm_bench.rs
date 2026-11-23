@@ -5,7 +5,8 @@
 //! `GEMM_KERNELS="mm_q4_0:64:64:128,variant:64:32:128"` (name:rows-per-tile:tokens-per-tile:threads),
 //! `GEMM_EXTRA=path.metal` appends experimental kernels to the library,
 //! `GEMM_FMT=q4_0|q8_0|q4_k|q6_k|f16`, `GEMM_M` = activation rows (default 512), `GEMM_ACC=1`
-//! accumulates into the output (`y += …`). Prints
+//! accumulates into the output (`y += …`),
+//! `GEMM_REPS` = timed dispatches per kernel and shape (default 20; use more for small `GEMM_M`). Prints
 //! time and TFLOPS per shape and the max relative difference against the first kernel.
 #![cfg(target_os = "macos")]
 
@@ -99,8 +100,8 @@ fn gemm_bench() {
                 cb.commit();
                 cb.wait_until_completed();
             };
-            run(3);
-            let reps = 20;
+            let reps: usize = std::env::var("GEMM_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+            run(reps.min(20));
             let t = Instant::now();
             run(reps);
             let dt = t.elapsed().as_secs_f64() / reps as f64;

@@ -47,10 +47,15 @@ fn config_k() -> LlamaConfig {
 }
 
 fn model(dtype: DType) -> LlamaModel<CpuBackend> {
+    model_with(config(), config_k(), dtype)
+}
+
+/// As [`model`] with explicit configs for the K-quant mix and the other formats.
+fn model_with(cfg: LlamaConfig, cfg_k: LlamaConfig, dtype: DType) -> LlamaModel<CpuBackend> {
     if dtype == DType::Q4_K {
-        return model_k_mixed();
+        return model_k_mixed(cfg_k);
     }
-    let mut m = LlamaModel::new_seeded(config(), Arc::new(CpuBackend), 11).unwrap();
+    let mut m = LlamaModel::new_seeded(cfg, Arc::new(CpuBackend), 11).unwrap();
     if dtype != DType::F32 {
         m.embed_tokens = quantize(&m.embed_tokens, dtype);
         m.lm_head = quantize(&m.lm_head, dtype);
@@ -67,8 +72,8 @@ fn model(dtype: DType) -> LlamaModel<CpuBackend> {
 
 /// Q4_K_M-like mix: Q4_K q/k/o/gate/up, Q6_K v/down and embeddings, so fused Q/K/V
 /// has mixed formats (two segments on Metal).
-fn model_k_mixed() -> LlamaModel<CpuBackend> {
-    let mut m = LlamaModel::new_seeded(config_k(), Arc::new(CpuBackend), 11).unwrap();
+fn model_k_mixed(cfg: LlamaConfig) -> LlamaModel<CpuBackend> {
+    let mut m = LlamaModel::new_seeded(cfg, Arc::new(CpuBackend), 11).unwrap();
     m.embed_tokens = quantize(&m.embed_tokens, DType::Q6_K);
     m.lm_head = quantize(&m.lm_head, DType::Q6_K);
     for l in &mut m.layers {
@@ -271,8 +276,11 @@ fn metal_split_context_decode_matches_cpu() {
 }
 
 /// Small batches use dedicated kernels: up to 4 rows (2 for K-quants, 8 for F32
-/// weights) the multi-row matrix-vector kernels (`mv2`/`mv4`/`mv8`), then up to 32 rows
-/// the small-batch simdgroup-matrix GEMM (`mms`). Prefilling `m` tokens at once must match feeding them
+/// weights) the multi-row matrix-vector kernels (`mv2`/`mv4`/`mv8`), then up to 24 rows
+/// the small-batch GEMMs (`mms`; `mmh` at 9-16 rows on matrices of 2048+ rows), then the
+/// tiled GEMM with fused SwiGLU. The models here have 2112-row (2048 for K-quants)
+/// gate/up matrices so `mmh` runs, and a 96-wide hidden size (3 blocks) so its
+/// one-block-per-stage variant does too. Prefilling `m` tokens at once must match feeding them
 /// one at a time through the single-row kernels, for every weight format (F16 weights
 /// are exact roundings of the seeded F32 ones, which Metal uploads as F16). The bound
 /// allows for the prefill attention kernel staging keys/values in half precision (see
@@ -284,8 +292,11 @@ fn metal_small_batches_match_token_by_token() {
         eprintln!("skipping: no Metal device");
         return;
     }
+    let wide = LlamaConfig { hidden_size: 96, num_attention_heads: 3, num_key_value_heads: 1, intermediate_size: 1056, ..config() };
+    let wide_k = LlamaConfig { intermediate_size: 1024, ..config_k() };
+    let model = |dtype| model_with(wide.clone(), wide_k.clone(), dtype);
     let f16_model = || {
-        let mut m = LlamaModel::new_seeded(config(), Arc::new(CpuBackend), 11).unwrap();
+        let mut m = LlamaModel::new_seeded(wide.clone(), Arc::new(CpuBackend), 11).unwrap();
         let round = |t: &mut Tensor| {
             let v: Vec<f32> = t.to_vec::<f32>().unwrap().iter().map(|&x| half::f16::from_f32(x).to_f32()).collect();
             *t = Tensor::from_f32(&v, t.shape().clone(), Device::Cpu).unwrap();
@@ -314,7 +325,7 @@ fn metal_small_batches_match_token_by_token() {
         let block = 16;
         gpu.init_kv_cache(4, block).unwrap();
         let vocab = cpu.config.vocab_size;
-        for m in (2..=8usize).chain([12, 16, 24, 32]) {
+        for m in (2..=9usize).chain([12, 16, 20, 24, 28, 32]) {
             let tokens: Vec<u32> = (0..m as u32).map(|i| (i * 17 + m as u32) % 96).collect();
             let rows: Vec<usize> = (0..m).collect();
             let batched = gpu

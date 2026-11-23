@@ -148,10 +148,19 @@ fn mv_max_rows(kind: WKind) -> usize {
     }
 }
 
-/// Rows at or below which the small-batch GEMM (`mms`) is used instead of the 64x64
-/// tiled GEMM. On Llama-3.2-1B shapes (M4) it is 2.3-3.4x faster at 8-16 rows and
-/// 1.4x at 32; the tiled GEMM wins from 64 rows.
-const MMS_MAX_ROWS: usize = 32;
+/// Rows at or below which the small-batch kernels are used instead of the tiled GEMM:
+/// `mms` up to 8 rows and from 17, `mmh` (16-token tile) for 9-16. Per Llama-3.2-1B
+/// layer (M4): `mmh` is 5-9% faster than `mms` at 12-16 rows; at 25-32 rows the 64x32
+/// tiled GEMM is 15-20% faster than `mms`, at 24 `mms` is 10% faster.
+const MMS_MAX_ROWS: usize = 24;
+/// Row range of the 16-token-tile GEMM (`mmh_*`), used on matrices with at least
+/// `MMH_MIN_GROUPS` 64-row tiles: on SmolLM2-135M (576-row matrices, 9 threadgroups)
+/// it was 12-14% slower than `mms`.
+const MMH_ROWS: std::ops::RangeInclusive<usize> = 9..=16;
+const MMH_MIN_GROUPS: usize = 32;
+/// Rows of `x` the small-batch kernels may read (whole 8-row fragments; rows past the
+/// batch only feed discarded outputs).
+const SMALL_BATCH_READ_ROWS: usize = 24;
 
 /// The 64x32-tile GEMM (`mml_*`) is used for all formats but Q6_K, and for Q6_K when the
 /// 64x64 one would launch fewer threadgroups than this (M4, Llama-3.2-1B shapes: 64x32
@@ -203,7 +212,7 @@ impl MetalLlama {
             .iter()
             .flat_map(|f| [2, 4, 8].map(|r| format!("mv{r}_{f}")))
             .chain(["f16", "q8_0", "q4_0", "q4_k", "q6_k"].iter().flat_map(|f| {
-                ["mms1", "mms2", "mms2r2", "mms3r2", "mms4r2"].map(|t| format!("{t}_{f}"))
+                ["mms1", "mms2", "mms2r2", "mms3r2", "mmh", "mmh1"].map(|t| format!("{t}_{f}"))
             }))
             .collect();
         let kv_names: Vec<String> = ["f32", "f16"]
@@ -552,10 +561,15 @@ impl MetalLlama {
                 };
                 let p = self.pipeline(&name);
                 e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
+            } else if w.kind != WKind::F32 && MMH_ROWS.contains(&m) && w.rows.div_ceil(64) >= MMH_MIN_GROUPS {
+                let stage = if (w.cols / 32).is_multiple_of(2) { "mmh" } else { "mmh1" };
+                let mut args = args;
+                args[1] = Arg::B(xh);
+                e.groups(self.pipeline(&format!("{stage}_{}", w.kind.suffix())), &args, ((w.rows as u64).div_ceil(64), 1, 1), 128);
             } else if w.kind != WKind::F32 && m <= MMS_MAX_ROWS {
-                let nt = m.div_ceil(8);
-                // Row groups per simdgroup (see the `mms` kernel): 2 from 16 tokens,
+                // `mms`: m/8 token fragments; two row groups per simdgroup from 16 tokens,
                 // except for F16 weights at 16.
+                let nt = m.div_ceil(8);
                 let rg = if nt == 1 || (nt == 2 && w.kind == WKind::F16) { 1 } else { 2 };
                 let name = if rg == 1 { format!("mms{nt}_{}", w.kind.suffix()) } else { format!("mms{nt}r{rg}_{}", w.kind.suffix()) };
                 let mut args = args;
@@ -774,9 +788,9 @@ impl LanguageModel for MetalLlama {
                 ("act", rows * inter),
                 ("final", lrows * h),
                 // Half-precision copy of a linear layer's input (prefill GEMM).
-                // At least MMS_MAX_ROWS rows: the small-batch GEMM reads whole 8-row
+                // At least SMALL_BATCH_READ_ROWS rows: the small-batch GEMM reads whole 8-row
                 // fragments (rows past the batch only feed discarded outputs).
-                ("xh", rows.max(lrows).max(MMS_MAX_ROWS) * h.max(inter) / 2 + 4),
+                ("xh", rows.max(lrows).max(SMALL_BATCH_READ_ROWS) * h.max(inter) / 2 + 4),
                 ("logits", lrows * c.vocab_size),
             ] {
                 sc.bufs.insert(name, f(len));

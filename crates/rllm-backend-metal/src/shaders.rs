@@ -56,15 +56,18 @@ inline void load8(device const uchar* w, uint row, uint k, uint ib, uint q, thre
         out[2 * j + 1] = d * float(c.y);
     }
 }
+// Q4_0 nibbles are masked in place and scaled by d, d/16, d/256 or d/4096 (powers of
+// two, so every product and the -8d offset are exact: bit-identical to shifting).
 inline void load8(device const uchar* w, uint row, uint k, uint ib, uint q, thread float* out, WQ4) {
     device const block_q4_0* b = (device const block_q4_0*)w + (ulong)row * (k / 32) + ib;
     device const ushort* p = (device const ushort*)(b->qs + (q % 2) * 8);
     const float d = float(b->d);
-    const uint sh = q < 2 ? 0 : 4;
+    const float d1 = q < 2 ? d : d / 16.0f, d2 = d1 / 256.0f, md = -8.0f * d;
+    const ushort mask0 = q < 2 ? 0x000F : 0x00F0, mask1 = mask0 << 8;
     for (uint j = 0; j < 4; ++j) {
         const ushort c = p[j];
-        out[2 * j] = d * (float((c >> sh) & 0x0F) - 8.0f);
-        out[2 * j + 1] = d * (float((c >> (8 + sh)) & 0x0F) - 8.0f);
+        out[2 * j] = d1 * float(c & mask0) + md;
+        out[2 * j + 1] = d2 * float(c & mask1) + md;
     }
 }
 
@@ -564,15 +567,16 @@ kernel void mms(device const uchar* w [[buffer(0)]], device const half* x [[buff
 }
 
 // 2 simdgroups x 8·RG weight rows per threadgroup, 2 blocks per step (swept on an M4:
-// 1 or 4 simdgroups and 1, 4 or 8 blocks per step were up to 20% slower). With 16-32
-// tokens, RG = 2 row groups per simdgroup reuse each activation fragment twice
-// (-12 to -23% per Llama-3.2-1B layer; RG = 4 was mixed); at 8 tokens RG = 1 is faster
-// (and for F16 weights at 16 tokens). NT = 3 token fragments for 17-24 tokens: padding
-// 24 tokens to 32 made a layer 19-31% slower.
+// 1 or 4 simdgroups and 1, 4 or 8 blocks per step were up to 20% slower). Used for up
+// to 8 tokens (NT = 1, RG = 1) and for 17-24 (NT = 3 token fragments, RG = 2 row groups
+// per simdgroup so each activation fragment serves two products: -12 to -23% per
+// Llama-3.2-1B layer; padding 24 tokens to 32 was 19-31% slower). 9-16 tokens use
+// `mmh` on matrices of at least 2048 rows and NT = 2 here otherwise; 25 and more the
+// tiled GEMM.
 typedef decltype(mms<WQ8, 1, 2, 2, 1>) mms_t;
 #define MMS(TAG, SUF, NT) template [[host_name("mms" #NT "_" SUF)]] kernel mms_t mms<TAG, NT, 2, 2, 1>;
 #define MMSR(TAG, SUF, NT, RG) template [[host_name("mms" #NT "r" #RG "_" SUF)]] kernel mms_t mms<TAG, NT, 2, 2, RG>;
-#define MMS_ALL(TAG, SUF) MMS(TAG, SUF, 1) MMS(TAG, SUF, 2) MMSR(TAG, SUF, 2, 2) MMSR(TAG, SUF, 3, 2) MMSR(TAG, SUF, 4, 2)
+#define MMS_ALL(TAG, SUF) MMS(TAG, SUF, 1) MMS(TAG, SUF, 2) MMSR(TAG, SUF, 2, 2) MMSR(TAG, SUF, 3, 2)
 MMS_ALL(WQ8, "q8_0")
 MMS_ALL(WQ4, "q4_0")
 MMS_ALL(WF16, "f16")
@@ -835,10 +839,14 @@ inline void mml_impl(device const uchar* w, device const half* x, device float* 
                 out[(ulong)(r1 + t) * ldy + j] = half(g / (1.0f + exp(-g)) * u);
             }
         }
-    } else if (r0 + 64 <= n && r1 + 32 <= m) {
-        // Accumulation adds the previous values through a product with the identity.
+    } else if (r0 + 64 <= n && (r1 + 32 <= m || m % 8 == 0)) {
+        // Whole 8x8 fragments store directly (with a token count that is a multiple of 8,
+        // each fragment is entirely inside or outside the batch: 16- and 24-token
+        // batches need no staging). Accumulation adds the previous values through a
+        // product with the identity.
         const simdgroup_float8x8 ident = simdgroup_float8x8(1.0f);
         for (uint i = 0; i < 8; ++i) {
+            if (tt + 8 * (i / 4) >= m) continue;
             device float* o = y + (ulong)(tt + 8 * (i / 4)) * ldy + rr + 8 * (i % 4);
             if (acc_in) {
                 simdgroup_float8x8 prev;
@@ -875,6 +883,103 @@ MML_ALL(WQ4, q4_0)
 MML_ALL(WF16, f16)
 MML_ALL(WQ4K, q4_k)
 MML_ALL(WQ6K, q6_k)
+
+// ── quantized / F16-weight GEMM for 9-16 tokens: 64 rows x 16 tokens per threadgroup ──
+// The `mml` scheme with a 16-token tile: 4 simdgroups of 16 weight rows x 16 tokens (4
+// accumulators), so no products are spent on an empty half of a 32-token tile. Per
+// Llama-3.2-1B layer on an M4 it is 5-9% faster than `mms` at 12-16 tokens (`mms`
+// stays faster at 8 and 17-24 tokens, `mml` from 25). One block per stage was within
+// ±4%.
+template <typename T, uint NB>
+inline void mmh_stage(device const uchar* w, device const half* xr, bool tok_ok, uint lr0, uint k, uint b,
+                      uint tid, uint sg, threadgroup half* sa, threadgroup half* sb, thread simdgroup_float8x8* mc) {
+    const uint il0 = tid % 2, row = tid / 2, sy = row / 8, lx = row % 8, tok = tid / 8;
+    float v[NB][16];
+    half4 xa[NB];
+    for (uint s = 0; s < NB; ++s) {
+        load16(w, lr0, k, b + s, il0, v[s], T());
+        xa[s] = tok_ok ? ((device const half4*)(xr + (b + s) * 32))[0] : half4(0.0h);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 0; s < NB; ++s) {
+        // sa as in `mml`; sb: block 2*kc + tokblock, element [tok%8][k%8]
+        threadgroup half* a = sa + s * 64 * 32;
+        for (uint i = 0; i < 8; ++i) {
+            a[64 * (8 * (2 * il0) + sy) + 8 * i + lx] = half(v[s][i]);
+            a[64 * (8 * (2 * il0 + 1) + sy) + 8 * i + lx] = half(v[s][8 + i]);
+        }
+        const uint kc = (tid % 8) / 2;
+        *(threadgroup half4*)(sb + s * 16 * 32 + 64 * (2 * kc + tok / 8) + 8 * (tok % 8) + 4 * (tid % 2)) = xa[s];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 0; s < NB; ++s) {
+        for (uint kc = 0; kc < 4; ++kc) {
+            simdgroup_half8x8 ma[2], mb[2];
+            for (uint i = 0; i < 2; ++i) simdgroup_load(ma[i], sa + s * 64 * 32 + 64 * (8 * kc + 2 * sg + i), 8);
+            for (uint j = 0; j < 2; ++j) simdgroup_load(mb[j], sb + s * 16 * 32 + 64 * (2 * kc + j), 8);
+            for (uint j = 0; j < 2; ++j)
+                for (uint i = 0; i < 2; ++i) simdgroup_multiply_accumulate(mc[2 * j + i], mb[j], ma[i], mc[2 * j + i]);
+        }
+    }
+}
+
+template <typename T, uint NB>
+kernel void mmh(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]],
+                uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half sa[2 * 64 * 32];   // 8 KB (NB <= 2), reused for output staging
+    threadgroup half sb[2 * 16 * 32];
+    device const half* xh = (device const half*)x;
+    const uint r0 = tg.x * 64, r1 = tg.y * 16;
+    // weight staging: thread -> row tid/2, values 16*(tid%2) .. +16 of each 32-block;
+    // activations: thread -> token tid/8, k offset 4*(tid%8)
+    const uint lr0 = min(r0 + tid / 2, n - 1);
+    const uint tok = tid / 8;
+    const bool tok_ok = r1 + tok < m;
+    device const half* xr = xh + (ulong)min(r1 + tok, m - 1) * k + 4 * (tid % 8);
+    simdgroup_float8x8 mc[4];
+    for (uint i = 0; i < 4; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint nb = k / 32;
+    for (uint b = 0; b < nb; b += NB) mmh_stage<T, NB>(w, xr, tok_ok, lr0, k, b, tid, sg, sa, sb, mc);
+    // mc[2j + i]: tokens r1 + 8j.., rows r0 + 16 sg + 8i..
+    if (r0 + 64 <= n && m % 8 == 0) {
+        const simdgroup_float8x8 ident = simdgroup_float8x8(1.0f);
+        for (uint j = 0; j < 2; ++j) {
+            if (r1 + 8 * j >= m) continue;
+            for (uint i = 0; i < 2; ++i) {
+                device float* o = y + (ulong)(r1 + 8 * j) * ldy + r0 + 16 * sg + 8 * i;
+                if (accumulate) {
+                    simdgroup_float8x8 prev;
+                    simdgroup_load(prev, o, ldy);
+                    simdgroup_multiply_accumulate(mc[2 * j + i], prev, ident, mc[2 * j + i]);
+                }
+                simdgroup_store(mc[2 * j + i], o, ldy);
+            }
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* st = (threadgroup float*)sa;   // [16 tok][64 rows]
+        for (uint j = 0; j < 2; ++j)
+            for (uint i = 0; i < 2; ++i) simdgroup_store(mc[2 * j + i], st + 8 * j * 64 + 16 * sg + 8 * i, 64);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < 16 * 64; e += 128) {
+            const uint t = r1 + e / 64, r = r0 + e % 64;
+            if (t < m && r < n) {
+                device float* o = y + (ulong)t * ldy + r;
+                *o = accumulate ? *o + st[e] : st[e];
+            }
+        }
+    }
+}
+// Two blocks per stage, or one for rows with an odd number of blocks (`mmh1_*`).
+typedef decltype(mmh<WQ8, 2>) mmh_t;
+#define MMH_ALL(TAG, SUF) \
+    template [[host_name("mmh_" #SUF)]] kernel mmh_t mmh<TAG, 2>; \
+    template [[host_name("mmh1_" #SUF)]] kernel mmh_t mmh<TAG, 1>;
+MMH_ALL(WQ8, q8_0)
+MMH_ALL(WQ4, q4_0)
+MMH_ALL(WF16, f16)
+MMH_ALL(WQ4K, q4_k)
+MMH_ALL(WQ6K, q6_k)
 
 // ── F32 -> F16 conversion of a linear layer's input (prefill) ──
 kernel void to_half(device const float4* x [[buffer(0)]], device half4* y [[buffer(1)]],
