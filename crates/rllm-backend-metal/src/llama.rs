@@ -133,6 +133,11 @@ fn mv_max_rows(kind: WKind) -> usize {
 /// 1.4x at 32; the tiled GEMM wins from 64 rows.
 const MMS_MAX_ROWS: usize = 32;
 
+/// The 64x32-tile GEMM (`mml_*`) is used when the 64x64 one would launch fewer
+/// threadgroups than this (M4, Llama-3.2-1B shapes: faster at 128-256 tokens on narrow
+/// matrices, equal on wide ones, up to 5% slower for Q4_0 at 512 tokens).
+const MML_MAX_TILES: usize = 256;
+
 /// Query heads per KV head with a dedicated GQA decode attention kernel
 /// (`attention_gqa{G}_*`); other models use the per-query-head kernel.
 const GQA_GROUPS: [usize; 4] = [2, 3, 4, 8];
@@ -170,8 +175,8 @@ impl MetalLlama {
         let mut pipelines = HashMap::new();
         let names = [
             "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
-            "mm_q4_k", "mm_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
-            "rms_norm", "rope", "swiglu", "attn_reduce",
+            "mm_q4_k", "mm_q6_k", "mml_q8_0", "mml_q4_0", "mml_f16", "mml_q4_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
+            "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "attn_reduce",
         ];
         let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
             .iter()
@@ -468,7 +473,7 @@ impl MetalLlama {
     /// `y[m, rows] = x[m, cols] · Wᵀ`, or `y += …` when `accumulate`.
     #[allow(clippy::too_many_arguments)]
     fn linear(&self, e: &Enc<'_>, w: &Weight, x: &Buffer, xh: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
-        self.linear_segments(e, std::slice::from_ref(w), x, xh, y, m, accumulate);
+        self.linear_segments(e, std::slice::from_ref(w), x, xh, y, m, accumulate, false);
     }
 
     /// Linear layer whose weight rows are split into segments (possibly of different
@@ -476,9 +481,12 @@ impl MetalLlama {
     /// For prefill-sized batches the input is converted to half precision once into
     /// `xh`, which the tiled GEMM kernels read.
     #[allow(clippy::too_many_arguments)]
-    fn linear_segments(&self, e: &Enc<'_>, segs: &[Weight], x: &Buffer, xh: &Buffer, y: &Buffer, m: usize, accumulate: bool) {
+    /// With `half_ready`, `xh` already holds the input in half precision (written by the
+    /// previous kernel; only valid when [`Self::reads_only_half`]) and `x` is not read.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_segments(&self, e: &Enc<'_>, segs: &[Weight], x: &Buffer, xh: &Buffer, y: &Buffer, m: usize, accumulate: bool, half_ready: bool) {
         let ldy = segs.iter().map(|w| w.rows).sum::<usize>() as u32;
-        if segs.iter().any(|w| w.kind != WKind::F32 && m > mv_max_rows(w.kind)) {
+        if !half_ready && segs.iter().any(|w| w.kind != WKind::F32 && m > mv_max_rows(w.kind)) {
             let quads = (m * segs[0].cols / 4) as u64;
             e.threads(self.pipeline("to_half"), &[Arg::B(x), Arg::B(xh)], (quads, 1, 1));
         }
@@ -520,13 +528,45 @@ impl MetalLlama {
                 // weights as half precision, which is lossless only for F16/quantized weights).
                 e.groups(self.pipeline("mm_f32"), &args, ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1), 128);
             } else {
-                let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
                 let mut args = args;
                 args[1] = Arg::B(xh);
-                e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1), 128);
+                // 64x32 tiles when 64x64 tiles would underfill the GPU, and for F16.
+                let tiles = w.rows.div_ceil(64) * m.div_ceil(64);
+                if w.kind != WKind::Q6K && (tiles < MML_MAX_TILES || w.kind == WKind::F16) {
+                    let p = self.pipeline(&format!("mml_{}", w.kind.suffix()));
+                    e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(32), 1), 128);
+                } else {
+                    let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
+                    e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1), 128);
+                }
             }
             col += w.rows as u64;
         }
+    }
+
+    /// Whether every segment of a linear layer reads only the half-precision input (`xh`)
+    /// for `m` rows, so the producer may write half precision directly.
+    fn reads_only_half(segs: &[Weight], m: usize) -> bool {
+        segs.iter().all(|w| w.kind != WKind::F32 && m > mv_max_rows(w.kind))
+    }
+
+    /// RMSNorm into `y` (F32), or into `xh` as half precision when the next linear
+    /// layer reads only that; returns whether it wrote `xh`.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_for(&self, e: &Enc<'_>, x: &Buffer, w: &Buffer, y: &Buffer, xh: &Buffer, rows: usize, next: &[Weight]) -> bool {
+        let half = Self::reads_only_half(next, rows);
+        let c = &self.config;
+        let args = [
+            Arg::B(x),
+            Arg::B(w),
+            Arg::B(if half { xh } else { y }),
+            Arg::B(x),
+            Arg::U(c.hidden_size as u32),
+            Arg::F(c.rms_norm_eps),
+            Arg::U(0),
+        ];
+        e.groups(self.pipeline(if half { "rms_norm_h" } else { "rms_norm" }), &args, (rows as u64, 1, 1), 256);
+        half
     }
 
     fn rms(&self, e: &Enc<'_>, x: &Buffer, w: &Buffer, y: &Buffer, rows: usize, gather: Option<&Buffer>) {
@@ -716,8 +756,8 @@ impl LanguageModel for MetalLlama {
                 let (kc, vc) = &st.kv[li];
                 // Attention block: norm -> fused QKV -> RoPE on q and k heads -> KV write ->
                 // attention -> output projection accumulated into the residual stream.
-                self.rms(&e, b("hidden"), &layer.attn_norm, b("normed"), n, None);
-                self.linear_segments(&e, &layer.qkv, b("normed"), b("xh"), b("qkv"), n, false);
+                let ready = self.rms_for(&e, b("hidden"), &layer.attn_norm, b("normed"), b("xh"), n, &layer.qkv);
+                self.linear_segments(&e, &layer.qkv, b("normed"), b("xh"), b("qkv"), n, false, ready);
                 e.threads(
                     self.pipeline("rope"),
                     &[
@@ -805,14 +845,16 @@ impl LanguageModel for MetalLlama {
 
                 // MLP block: norm -> fused gate/up -> SwiGLU -> down projection accumulated
                 // into the residual stream.
-                self.rms(&e, b("hidden"), &layer.ffn_norm, b("normed"), n, None);
-                self.linear_segments(&e, &layer.gate_up, b("normed"), b("xh"), b("gu"), n, false);
+                let ready = self.rms_for(&e, b("hidden"), &layer.ffn_norm, b("normed"), b("xh"), n, &layer.gate_up);
+                self.linear_segments(&e, &layer.gate_up, b("normed"), b("xh"), b("gu"), n, false, ready);
+                let down = std::slice::from_ref(&layer.down);
+                let ready = Self::reads_only_half(down, n);
                 e.threads(
-                    self.pipeline("swiglu"),
-                    &[Arg::B(b("gu")), Arg::B(b("act")), Arg::U(inter as u32)],
+                    self.pipeline(if ready { "swiglu_h" } else { "swiglu" }),
+                    &[Arg::B(b("gu")), Arg::B(if ready { b("xh") } else { b("act") }), Arg::U(inter as u32)],
                     ((n * inter) as u64, 1, 1),
                 );
-                self.linear(&e, &layer.down, b("act"), b("xh"), b("hidden"), n, true);
+                self.linear_segments(&e, down, b("act"), b("xh"), b("hidden"), n, true, ready);
             }
 
             // Final norm on the requested rows only, then the LM head.
