@@ -288,13 +288,36 @@ fn metal_split_context_decode_matches_cpu() {
 /// gives differences of order 1.
 #[test]
 fn metal_small_batches_match_token_by_token() {
+    let wide = LlamaConfig { hidden_size: 96, num_attention_heads: 3, num_key_value_heads: 1, intermediate_size: 1056, ..config() };
+    let wide_k = LlamaConfig { intermediate_size: 1024, ..config_k() };
+    let ms: Vec<usize> = (2..=9).chain([12, 16, 20, 24, 28, 32]).collect();
+    check_small_batches(wide, wide_k, &ms);
+}
+
+/// As [`metal_small_batches_match_token_by_token`] with a 2048-wide hidden size, so the
+/// accumulating output and down projections also run on `mmh` (the down projection with
+/// an odd number of blocks: 3).
+#[test]
+fn metal_mmh_accumulating_projections_match_token_by_token() {
+    let tall = LlamaConfig {
+        hidden_size: 2048,
+        num_attention_heads: 64,
+        num_key_value_heads: 32,
+        intermediate_size: 96,
+        num_hidden_layers: 1,
+        ..config()
+    };
+    let tall_k = LlamaConfig { hidden_size: 2048, num_attention_heads: 16, num_key_value_heads: 8, intermediate_size: 256, num_hidden_layers: 1, ..config() };
+    check_small_batches(tall, tall_k, &[9, 12, 16]);
+}
+
+fn check_small_batches(cfg: LlamaConfig, cfg_k: LlamaConfig, ms: &[usize]) {
     if !MetalLlama::is_available() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let wide = LlamaConfig { hidden_size: 96, num_attention_heads: 3, num_key_value_heads: 1, intermediate_size: 1056, ..config() };
-    let wide_k = LlamaConfig { intermediate_size: 1024, ..config_k() };
-    let model = |dtype| model_with(wide.clone(), wide_k.clone(), dtype);
+    let wide = cfg.clone();
+    let model = |dtype| model_with(cfg.clone(), cfg_k.clone(), dtype);
     let f16_model = || {
         let mut m = LlamaModel::new_seeded(wide.clone(), Arc::new(CpuBackend), 11).unwrap();
         let round = |t: &mut Tensor| {
@@ -325,7 +348,7 @@ fn metal_small_batches_match_token_by_token() {
         let block = 16;
         gpu.init_kv_cache(4, block).unwrap();
         let vocab = cpu.config.vocab_size;
-        for m in (2..=9usize).chain([12, 16, 20, 24, 28, 32]) {
+        for &m in ms {
             let tokens: Vec<u32> = (0..m as u32).map(|i| (i * 17 + m as u32) % 96).collect();
             let rows: Vec<usize> = (0..m).collect();
             let batched = gpu

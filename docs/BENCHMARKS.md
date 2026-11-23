@@ -195,7 +195,7 @@ End to end, Llama-3.2-1B (tok/s, interleaved A/B against PR #24, mean of 2 round
 
 Against llama.cpp (`llama-bench -ngl 99`) at 8 / 16 / 24 / 32 tokens: Q8_0 1.04 / 0.91 / 1.05 / 0.97x, Q4_K_M 0.97 / 0.92 / 1.00 / 0.95x, Q4_0 0.96 / 0.87 / 1.04 / 0.95x (previously 0.83–0.89x at 16 and 32 tokens). SmolLM2-135M F16 is unchanged at 8–24 tokens and 11% faster at 32.
 
-Tests: the batch-vs-token-by-token Metal test now runs 2–9, 12, 16, 20, 24, 28 and 32 tokens on a model with a 2112-row gate/up matrix and a 96-wide hidden size (2048 rows for the K-quant mix), so both `mmh` variants (two blocks per stage, and one for odd block counts) run. A planted bug in either variant fails it, as do skipped fragments or a dropped accumulation in the `mmh` epilogue.
+Tests: the batch-vs-token-by-token Metal test now runs 2–9, 12, 16, 20, 24, 28 and 32 tokens on a model with a 2112-row gate/up matrix and a 96-wide hidden size (2048 rows for the K-quant mix), so both `mmh` variants (two blocks per stage, and one for odd block counts) run. A second test with a 2048-wide hidden size runs the accumulating output and down projections on `mmh` too. A planted bug in either variant fails them, as does a dropped accumulation in either `mmh` epilogue path.
 
 **Metal prefill GEMM and fused SwiGLU (PR #24)**
 
