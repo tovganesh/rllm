@@ -172,7 +172,30 @@ On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0
 **Behind:**
 - Metal prompt processing on Llama-3.2-1B, 0.94–0.96x (128–512 tokens); SmolLM2 F16 is at parity or ahead (0.99–1.07x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
-- Small batches of 16–32 tokens on Metal: 0.86–0.91x, except Q4_0 at 0.75–0.80x. At 24 tokens rllm is ahead for Q8_0 and Q4_K_M. See "Metal 16–32-token batches" below.
+- Small batches on Metal at 16 tokens: 0.87–0.92x (at 8, 24 and 32 tokens rllm is at 0.95–1.05x). See "Metal 9–32-token batches" below.
+
+**Metal 9–32-token batches (PR #25)**
+
+llama.cpp's time on Llama-3.2-1B Q8_0 rises in steps: 16–18 ms for 8–16 tokens, 27 ms for 17–32 and 44 ms for 33–64. The small-batch GEMM (`mms`) grows more steeply. With the faster 64x32 GEMM from PR #24 the crossover moved down. Per layer (`tests/gemm_bench.rs`, now with `GEMM_REPS=200`, because 20 repetitions vary by ±15% at these sizes):
+
+1. **25–32 tokens use the tiled GEMM** (and get the fused SwiGLU): 15–20% faster than `mms` per layer. At 24 tokens `mms` stays 10% faster.
+2. **A 16-token tile (`mmh`) for 9–16 tokens.** It is the 64x32 kernel's scheme with 4 simdgroups of 16 weight rows × 16 tokens, so no products go to an empty half of a 32-token tile: 5–9% faster than `mms` at 12–16 tokens. It is used only on matrices of at least 2048 rows (32 threadgroups). On SmolLM2-135M's 576-row matrices it launched 9 threadgroups and was 12–14% slower.
+3. **The 64x32 kernel stores whole 8x8 fragments directly** when the token count is a multiple of 8, instead of staging a partly filled tile through threadgroup memory.
+4. **The `load8` Q4_0 dequantizer masks nibbles in place** (bit-identical, as in PR #24), for the matrix-vector and `mms` kernels.
+
+End to end, Llama-3.2-1B (tok/s, interleaved A/B against PR #24, mean of 2 rounds):
+
+| tokens | Q8_0 | Q4_K_M | Q4_0 |
+| ---: | ---: | ---: | ---: |
+| 12 | 585 → 602 (+2.9%) | 582 → 610 (+4.7%) | 621 → 667 (+7.5%) |
+| 16 | 768 → 799 (+4.1%) | 779 → 813 (+4.3%) | 826 → 884 (+7.0%) |
+| 20 | 768 → 796 (+3.7%) | 779 → 779 | 814 → 836 (+2.7%) |
+| 28 | 928 → 1,009 (+8.7%) | 902 → 992 (+9.9%) | 935 → 1,050 (+12.3%) |
+| 32 | 1,053 → 1,154 (+9.5%) | 1,028 → 1,136 (+10.5%) | 1,064 → 1,206 (+13.3%) |
+
+Against llama.cpp (`llama-bench -ngl 99`) at 8 / 16 / 24 / 32 tokens: Q8_0 1.04 / 0.91 / 1.05 / 0.97x, Q4_K_M 0.97 / 0.92 / 1.00 / 0.95x, Q4_0 0.96 / 0.87 / 1.04 / 0.95x (previously 0.83–0.89x at 16 and 32 tokens). SmolLM2-135M F16 is unchanged at 8–24 tokens and 11% faster at 32.
+
+Tests: the batch-vs-token-by-token Metal test now runs 2–9, 12, 16, 20, 24, 28 and 32 tokens on a model with a 2112-row gate/up matrix and a 96-wide hidden size (2048 rows for the K-quant mix), so both `mmh` variants (two blocks per stage, and one for odd block counts) run. A second test with a 2048-wide hidden size runs the accumulating output and down projections on `mmh` too. A planted bug in either variant fails them, as does a dropped accumulation in either `mmh` epilogue path.
 
 **Metal prefill GEMM and fused SwiGLU (PR #24)**
 
