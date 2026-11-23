@@ -880,6 +880,134 @@ ATTN_ROW_KERNEL(64, _f16, half)
 ATTN_ROW_KERNEL(96, _f16, half)
 ATTN_ROW_KERNEL(128, _f16, half)
 
+// ── GQA decode attention: one threadgroup per (KV head, row, context chunk) ──
+// Same algorithm as `attn_row_impl`, but the threadgroup serves all G query heads that
+// share a KV head: each key and value is read once and applied to G queries (the
+// per-query-head kernel reads every K/V row G times). Each lane scores one position
+// for all G heads; per-head online softmax state and G x HD/32 accumulators per lane.
+// Partials use the same layout as `attn_row_impl`, so `attn_reduce` combines them.
+template <uint HD, typename KVT, uint G>
+inline void attn_gqa_impl(device const float* q, device const KVT* kc, device const KVT* vc,
+                          device float* out, device const uint* tables, device const uint* table_off,
+                          device const uint* pos, uint nq, uint nkv, uint bs, float scale, uint q_stride,
+                          device const uint* row_list, device float* part, uint chunk, uint nsplit,
+                          threadgroup float* qs, threadgroup float* tm, threadgroup float* ts,
+                          threadgroup float* tacc, uint3 tg, uint sg, uint lane) {
+    constexpr uint NSG = 4;
+    constexpr uint dpl = HD / 32;
+    constexpr uint H4 = HD / 4;
+
+    const uint kvh = tg.x, slot = tg.y, split = tg.z, r = row_list[slot];
+    const uint head0 = kvh * G;
+    const uint ctx = pos[r] + 1;
+    const uint begin = split * chunk, end = min(ctx, begin + chunk);
+    if (begin >= ctx) {
+        if (sg == 0) {
+            for (uint g = 0; g < G; ++g) {
+                device float* pout = part + ((ulong)(slot * nq + head0 + g) * nsplit + split) * (HD + 2);
+                if (lane == 0) { pout[0] = -INFINITY; pout[1] = 0.0f; }
+                for (uint i = 0; i < dpl; ++i) pout[2 + lane + i * 32] = 0.0f;
+            }
+        }
+        return;
+    }
+    const ulong block_stride = (ulong)nkv * bs * HD;
+    const ulong head_off = (ulong)kvh * bs * HD;
+    device const uint* table = tables + table_off[r];
+
+    device const float* qr = q + (ulong)r * q_stride + head0 * HD;
+    for (uint i = sg * 32 + lane; i < G * HD; i += NSG * 32) qs[i] = qr[i] * scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const float4* q4 = (threadgroup const float4*)qs;
+
+    float m[G], s[G], acc[G][dpl];
+    for (uint g = 0; g < G; ++g) {
+        m[g] = -INFINITY; s[g] = 0.0f;
+        for (uint i = 0; i < dpl; ++i) acc[g][i] = 0.0f;
+    }
+
+    for (uint t0 = begin + sg * 32; t0 < end; t0 += NSG * 32) {
+        const uint t = t0 + lane;
+        float score[G];
+        for (uint g = 0; g < G; ++g) score[g] = -INFINITY;
+        if (t < end) {
+            device const vec<KVT, 4>* kr = (device const vec<KVT, 4>*)(kc + table[t / bs] * block_stride + head_off + (t % bs) * HD);
+            float d[G];
+            for (uint g = 0; g < G; ++g) d[g] = 0.0f;
+            for (uint j = 0; j < H4; ++j) {
+                const float4 kv = float4(kr[j]);
+                for (uint g = 0; g < G; ++g) d[g] += dot(q4[g * H4 + j], kv);
+            }
+            for (uint g = 0; g < G; ++g) score[g] = d[g];
+        }
+        float p[G];
+        for (uint g = 0; g < G; ++g) {
+            const float mn = max(m[g], simd_max(score[g]));
+            const float corr = exp(m[g] - mn);
+            p[g] = (t < end) ? exp(score[g] - mn) : 0.0f;
+            s[g] = s[g] * corr + simd_sum(p[g]);
+            for (uint i = 0; i < dpl; ++i) acc[g][i] *= corr;
+            m[g] = mn;
+        }
+        const uint cnt = min(32u, end - t0);
+        for (uint u = 0; u < cnt; ++u) {
+            const uint tu = t0 + u;
+            device const KVT* vr = vc + table[tu / bs] * block_stride + head_off + (tu % bs) * HD;
+            float v[dpl];
+            for (uint i = 0; i < dpl; ++i) v[i] = float(vr[lane + i * 32]);
+            for (uint g = 0; g < G; ++g) {
+                const float pu = simd_shuffle(p[g], u);
+                for (uint i = 0; i < dpl; ++i) acc[g][i] += pu * v[i];
+            }
+        }
+    }
+
+    for (uint g = 0; g < G; ++g) {
+        if (lane == 0) { tm[sg * G + g] = m[g]; ts[sg * G + g] = s[g]; }
+        for (uint i = 0; i < dpl; ++i) tacc[(sg * G + g) * HD + lane + i * 32] = acc[g][i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Simdgroup g' < G finalises head g' (the four simdgroups split the heads).
+    for (uint g = sg; g < G; g += NSG) {
+        const uint head = head0 + g;
+        device float* pout = part + ((ulong)(slot * nq + head) * nsplit + split) * (HD + 2);
+        float M = -INFINITY;
+        for (uint w = 0; w < NSG; ++w) M = max(M, tm[w * G + g]);
+        float S = 0.0f;
+        for (uint w = 0; w < NSG; ++w) S += ts[w * G + g] * exp(tm[w * G + g] - M);
+        for (uint i = 0; i < dpl; ++i) {
+            const uint dim = lane + i * 32;
+            float o = 0.0f;
+            for (uint w = 0; w < NSG; ++w) o += tacc[(w * G + g) * HD + dim] * exp(tm[w * G + g] - M);
+            if (nsplit == 1) out[((ulong)r * nq + head) * HD + dim] = o / S;
+            else pout[2 + dim] = o;
+        }
+        if (nsplit > 1 && lane == 0) { pout[0] = M; pout[1] = S; }
+    }
+}
+
+#define ATTN_GQA_KERNEL(HDV, SFX, KVT, GV) \
+kernel void attention_gqa##GV##_hd##HDV##SFX(ATTN_ARGS(KVT), device const uint* row_list [[buffer(12)]], \
+                              device float* part [[buffer(14)]], constant uint& chunk [[buffer(15)]], \
+                              constant uint& nsplit [[buffer(16)]], \
+                              uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                              uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float qs[GV * HDV]; \
+    threadgroup float tm[4 * GV]; \
+    threadgroup float ts[4 * GV]; \
+    threadgroup float tacc[4 * GV * HDV]; \
+    attn_gqa_impl<HDV, KVT, GV>(q, kc, vc, out, tables, table_off, pos, nq, nkv, bs, scale, q_stride, row_list, part, \
+                                chunk, nsplit, qs, tm, ts, tacc, tg, sg, lane); }
+#define ATTN_GQA_ALL(GV) \
+ATTN_GQA_KERNEL(32, _f32, float, GV) ATTN_GQA_KERNEL(64, _f32, float, GV) \
+ATTN_GQA_KERNEL(96, _f32, float, GV) ATTN_GQA_KERNEL(128, _f32, float, GV) \
+ATTN_GQA_KERNEL(32, _f16, half, GV) ATTN_GQA_KERNEL(64, _f16, half, GV) \
+ATTN_GQA_KERNEL(96, _f16, half, GV) ATTN_GQA_KERNEL(128, _f16, half, GV)
+ATTN_GQA_ALL(2)
+ATTN_GQA_ALL(3)
+ATTN_GQA_ALL(4)
+ATTN_GQA_ALL(8)
+
 // ── combine split-context partials: one threadgroup (hd threads) per (head, row) ──
 kernel void attn_reduce(device const float* part [[buffer(0)]], device float* out [[buffer(1)]],
                         device const uint* row_list [[buffer(2)]], constant uint& nq [[buffer(3)]],

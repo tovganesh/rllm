@@ -127,7 +127,7 @@ impl Backend for CpuBackend {
 
         let dtype = w.dtype();
         let fmt = QFormat::from_dtype(dtype);
-        if fmt.is_none() && dtype != DType::Q4_0x4 {
+        if fmt.is_none() && !matches!(dtype, DType::Q4_0x4 | DType::F16) {
             return Err(RllmError::UnsupportedOp { op: "linear", dtype: dtype.to_string(), device: "cpu".to_string() });
         }
         let block = dtype.block_info().map_or(1, |(values, _)| values);
@@ -151,7 +151,14 @@ impl Backend for CpuBackend {
         let m = x_slice.len() / k;
         let repacked = dtype == DType::Q4_0x4;
         let integer_path = m < BATCHED_F32_MIN_ROWS || ((repacked || fmt == Some(QFormat::Q8_0)) && use_i8mm(m, n, k));
-        if m == 1 {
+        if dtype == DType::F16 && m < BATCHED_F32_MIN_ROWS {
+            // F16 weights (F16 GGUF files) stay F16: half the bytes of F32 per token.
+            if m == 1 {
+                crate::ops::f16w::gemv_f16(w_bytes, x_slice, out_slice, n, k);
+            } else {
+                crate::ops::f16w::linear_f16(w_bytes, x_slice, out_slice, m, n, k);
+            }
+        } else if m == 1 {
             // Decode: activations quantized to Q8, integer dot products.
             match fmt {
                 Some(fmt) => gemv_quantized(fmt, w_bytes, x_slice, out_slice, n, k),
@@ -163,8 +170,8 @@ impl Backend for CpuBackend {
                 None => gemm_q4_0x4(w_bytes, x_slice, out_slice, m, n, k),
             }
         } else {
-            // Large batches (prefill): dequantize the weight and use an F32 GEMM, as
-            // llama.cpp's CPU backend does for batches of 32+ rows.
+            // Large batches (prefill): dequantize the weight (or widen F16) and use an
+            // F32 GEMM, as llama.cpp's CPU backend does for batches of 32+ rows.
             // The weight is processed in row chunks small enough to stay in cache between
             // dequantization and the GEMM that consumes them.
             let row_bytes = dtype.storage_bytes(k);
