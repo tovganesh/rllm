@@ -62,7 +62,27 @@ struct Layer {
     o: Weight,
     ffn_norm: Buffer,
     gate_up: Vec<Weight>,
+    /// `gate_up` is one segment with gate and up rows interleaved in 32-row chunks
+    /// (see [`interleave_gate_up`]); otherwise `[gate | up]` row blocks.
+    gu_interleaved: bool,
     down: Weight,
+}
+
+/// Rows per chunk of an interleaved gate/up weight (one half of a 64-row GEMM tile).
+const GLU_CHUNK: usize = 32;
+
+/// Raw rows of `gate` and `up` (same format and shape) interleaved in [`GLU_CHUNK`]-row
+/// chunks, so each 64-row GEMM tile holds matching gate and up outputs and can apply
+/// SwiGLU in its epilogue.
+fn interleave_gate_up(gate: &[u8], up: &[u8], rows: usize) -> Vec<u8> {
+    let row_bytes = gate.len() / rows;
+    let chunk = GLU_CHUNK * row_bytes;
+    let mut out = Vec::with_capacity(2 * gate.len());
+    for (g, u) in gate.chunks(chunk).zip(up.chunks(chunk)) {
+        out.extend_from_slice(g);
+        out.extend_from_slice(u);
+    }
+    out
 }
 
 /// Scratch buffers reused across forward passes, grown on demand.
@@ -133,9 +153,10 @@ fn mv_max_rows(kind: WKind) -> usize {
 /// 1.4x at 32; the tiled GEMM wins from 64 rows.
 const MMS_MAX_ROWS: usize = 32;
 
-/// The 64x32-tile GEMM (`mml_*`) is used when the 64x64 one would launch fewer
-/// threadgroups than this (M4, Llama-3.2-1B shapes: faster at 128-256 tokens on narrow
-/// matrices, equal on wide ones, up to 5% slower for Q4_0 at 512 tokens).
+/// The 64x32-tile GEMM (`mml_*`) is used for all formats but Q6_K, and for Q6_K when the
+/// 64x64 one would launch fewer threadgroups than this (M4, Llama-3.2-1B shapes: 64x32
+/// is 1-10% faster for the former at 128-512 tokens; for Q6_K the 64x64 tile is 3-6%
+/// faster on large grids).
 const MML_MAX_TILES: usize = 256;
 
 /// Query heads per KV head with a dedicated GQA decode attention kernel
@@ -175,8 +196,8 @@ impl MetalLlama {
         let mut pipelines = HashMap::new();
         let names = [
             "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
-            "mm_q4_k", "mm_q6_k", "mml_q8_0", "mml_q4_0", "mml_f16", "mml_q4_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
-            "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "attn_reduce",
+            "mm_q4_k", "mm_q6_k", "mml_q8_0", "mml_q4_0", "mml_f16", "mml_q4_k", "mml_q6_k", "mml1_q8_0", "mml1_q4_0", "mml1_f16", "mml1_q4_k", "mml1_q6_k", "mmlg_q8_0", "mmlg_q4_0", "mmlg_f16", "mmlg_q4_k", "mmlg_q6_k", "mmlg1_q8_0", "mmlg1_q4_0", "mmlg1_f16", "mmlg1_q4_k", "mmlg1_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
+            "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "swiglu_i", "swiglu_ih", "attn_reduce",
         ];
         let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
             .iter()
@@ -281,6 +302,21 @@ impl MetalLlama {
             }
             Ok(segments)
         };
+        // Gate/up: interleaved into one segment when both parts share a format.
+        let upload_gate_up = |gate: &Tensor, up: &Tensor| -> Result<(Vec<Weight>, bool)> {
+            let (gc, uc) = (to_metal_format(gate)?, to_metal_format(up)?);
+            let (g, u) = (gc.as_ref().unwrap_or(gate), uc.as_ref().unwrap_or(up));
+            let rows = g.dims()[0];
+            if g.dtype() != u.dtype() || g.dims() != u.dims() || g.dims().len() != 2 || !rows.is_multiple_of(GLU_CHUNK) {
+                return Ok((upload_concat(&[gate, up])?, false));
+            }
+            let len = g.dtype().storage_bytes(g.numel());
+            let gb = &g.storage().as_cpu()?.as_bytes()[g.offset()..g.offset() + len];
+            let ub = &u.storage().as_cpu()?.as_bytes()[u.offset()..u.offset() + len];
+            let shape = rllm_core::shape::Shape::new(vec![2 * rows, g.dims()[1]]);
+            let storage = rllm_core::storage::Storage::Cpu(rllm_core::storage::CpuStorage::from_bytes(interleave_gate_up(gb, ub, rows)));
+            Ok((vec![upload(&Tensor::new(shape, g.dtype(), rllm_core::device::Device::Cpu, storage))?], true))
+        };
 
         let embed = upload(&model.embed_tokens)?;
         let tied = model.lm_head.storage().as_cpu()?.as_bytes().as_ptr()
@@ -292,12 +328,14 @@ impl MetalLlama {
         };
         let mut layers = Vec::with_capacity(model.layers.len());
         for l in &model.layers {
+            let (gate_up, gu_interleaved) = upload_gate_up(&l.mlp.gate_proj, &l.mlp.up_proj)?;
             layers.push(Layer {
                 attn_norm: vec_buf(&l.input_layernorm)?,
                 qkv: upload_concat(&[&l.self_attn.q_proj, &l.self_attn.k_proj, &l.self_attn.v_proj])?,
                 o: upload(&l.self_attn.o_proj)?,
                 ffn_norm: vec_buf(&l.post_attention_layernorm)?,
-                gate_up: upload_concat(&[&l.mlp.gate_proj, &l.mlp.up_proj])?,
+                gate_up,
+                gu_interleaved,
                 down: upload(&l.mlp.down_proj)?,
             });
         }
@@ -530,10 +568,11 @@ impl MetalLlama {
             } else {
                 let mut args = args;
                 args[1] = Arg::B(xh);
-                // 64x32 tiles when 64x64 tiles would underfill the GPU, and for F16.
                 let tiles = w.rows.div_ceil(64) * m.div_ceil(64);
-                if w.kind != WKind::Q6K && (tiles < MML_MAX_TILES || w.kind == WKind::F16) {
-                    let p = self.pipeline(&format!("mml_{}", w.kind.suffix()));
+                if w.kind != WKind::Q6K || tiles < MML_MAX_TILES {
+                    // Two blocks per stage, or one for rows with an odd number of blocks.
+                    let stage = if (w.cols / 32).is_multiple_of(2) { "mml" } else { "mml1" };
+                    let p = self.pipeline(&format!("{stage}_{}", w.kind.suffix()));
                     e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(32), 1), 128);
                 } else {
                     let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
@@ -542,6 +581,36 @@ impl MetalLlama {
             }
             col += w.rows as u64;
         }
+    }
+
+    /// Whether the gate/up GEMM for `m` rows runs as the 64x32 tile kernel with SwiGLU
+    /// in its epilogue: the tiled-GEMM range, except Q6_K on large grids (where the 64x64
+    /// tile is faster).
+    fn glu_fused(w: &Weight, m: usize) -> bool {
+        let tiles = w.rows.div_ceil(64) * m.div_ceil(64);
+        w.kind != WKind::F32 && m > MMS_MAX_ROWS && (w.kind != WKind::Q6K || tiles < MML_MAX_TILES)
+    }
+
+    /// Interleaved gate/up projection of `m` rows with SwiGLU fused: writes
+    /// `silu(gate) * up` as half precision to `out` (`[m, rows / 2]`). With `half_ready`,
+    /// `xh` already holds the input in half precision.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_up_glu(&self, e: &Enc<'_>, w: &Weight, x: &Buffer, xh: &Buffer, out: &Buffer, m: usize, half_ready: bool) {
+        if !half_ready {
+            e.threads(self.pipeline("to_half"), &[Arg::B(x), Arg::B(xh)], ((m * w.cols / 4) as u64, 1, 1));
+        }
+        let stage = if (w.cols / 32).is_multiple_of(2) { "mmlg" } else { "mmlg1" };
+        let args = [
+            Arg::B(&w.buf),
+            Arg::B(xh),
+            Arg::B(out),
+            Arg::U(w.rows as u32),
+            Arg::U(w.cols as u32),
+            Arg::U(m as u32),
+            Arg::U(0),
+            Arg::U((w.rows / 2) as u32),
+        ];
+        e.groups(self.pipeline(&format!("{stage}_{}", w.kind.suffix())), &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(32), 1), 128);
     }
 
     /// Whether every segment of a linear layer reads only the half-precision input (`xh`)
@@ -846,15 +915,28 @@ impl LanguageModel for MetalLlama {
                 // MLP block: norm -> fused gate/up -> SwiGLU -> down projection accumulated
                 // into the residual stream.
                 let ready = self.rms_for(&e, b("hidden"), &layer.ffn_norm, b("normed"), b("xh"), n, &layer.gate_up);
-                self.linear_segments(&e, &layer.gate_up, b("normed"), b("xh"), b("gu"), n, false, ready);
                 let down = std::slice::from_ref(&layer.down);
-                let ready = Self::reads_only_half(down, n);
-                e.threads(
-                    self.pipeline(if ready { "swiglu_h" } else { "swiglu" }),
-                    &[Arg::B(b("gu")), Arg::B(if ready { b("xh") } else { b("act") }), Arg::U(inter as u32)],
-                    ((n * inter) as u64, 1, 1),
-                );
-                self.linear_segments(&e, down, b("act"), b("xh"), b("hidden"), n, true, ready);
+                let down_half = Self::reads_only_half(down, n);
+                if layer.gu_interleaved && down_half && Self::glu_fused(&layer.gate_up[0], n) {
+                    // Gate/up GEMM with SwiGLU in its epilogue, writing the down
+                    // projection's half-precision input to `act`.
+                    self.gate_up_glu(&e, &layer.gate_up[0], b("normed"), b("xh"), b("act"), n, ready);
+                    self.linear_segments(&e, down, b("act"), b("act"), b("hidden"), n, true, true);
+                } else {
+                    self.linear_segments(&e, &layer.gate_up, b("normed"), b("xh"), b("gu"), n, false, ready);
+                    let name = match (layer.gu_interleaved, down_half) {
+                        (false, false) => "swiglu",
+                        (false, true) => "swiglu_h",
+                        (true, false) => "swiglu_i",
+                        (true, true) => "swiglu_ih",
+                    };
+                    e.threads(
+                        self.pipeline(name),
+                        &[Arg::B(b("gu")), Arg::B(if down_half { b("xh") } else { b("act") }), Arg::U(inter as u32)],
+                        ((n * inter) as u64, 1, 1),
+                    );
+                    self.linear_segments(&e, down, b("act"), b("xh"), b("hidden"), n, true, down_half);
+                }
             }
 
             // Final norm on the requested rows only, then the LM head.

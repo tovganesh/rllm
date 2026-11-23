@@ -170,11 +170,32 @@ On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0
 **Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x).
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
-- Metal prompt processing on Llama-3.2-1B, 0.89–0.94x (128–512 tokens); SmolLM2 F16 is at parity. The GEMMs run at 3.0–3.3 TFLOPS (~80% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and are ~90% of the time; K-quant dequantization costs the most (Q4_K_M is the slowest format). See "Metal prompt processing" below.
+- Metal prompt processing on Llama-3.2-1B, 0.94–0.96x (128–512 tokens); SmolLM2 F16 is at parity or ahead (0.99–1.07x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 - Small batches of 16–32 tokens on Metal: 0.86–0.91x, except Q4_0 at 0.75–0.80x. At 24 tokens rllm is ahead for Q8_0 and Q4_K_M. See "Metal 16–32-token batches" below.
 
-**Metal prompt processing (this round)**
+**Metal prefill GEMM and fused SwiGLU (PR #24)**
+
+Skipping one kernel type at a time on Llama-3.2-1B Q8_0 at 512 tokens (327 ms) put the GEMMs at ~308 ms, prefill attention at 8 ms, SwiGLU at 5–6 ms, RMSNorm at 1.5 ms and RoPE at 1 ms. llama.cpp's whole pass takes 310 ms, and its GEMM kernel, ported into `tests/gemm_bench.rs`, was no faster than ours. Changes:
+
+1. **One 64x32 GEMM for nearly everything.** Each thread now dequantizes 16 values of a weight row per 32-value block (`load16`: Q4_K reads its 16 bytes in one load and decodes the sub-block scale once), and two blocks are staged per pair of threadgroup barriers. Per Llama-3.2-1B layer this is 4–5% faster for Q4_K and 1–2% for Q8_0 than before, and faster than the 64x64 tile at every prompt length for all formats except Q6_K, which keeps the 64x64 tile on large grids. Rows with an odd number of blocks use a one-block-per-stage instantiation: a one-block tail step inside the two-block kernel made Q8_0 5% slower even when it never ran.
+2. **Q4_0 nibbles are masked in place** and multiplied by d, d/16, d/256 or d/4096 instead of shifted (llama.cpp's trick; the results are bit-identical). The GEMM is 3–6% faster.
+3. **SwiGLU runs in the gate/up GEMM's epilogue.** Gate and up rows are interleaved in 32-row chunks at load, so each 64-row tile holds matching gate and up outputs. The tile writes `silu(gate)·up` in half precision straight into the down projection's input, which removes the 32 MB F32 gate/up buffer per layer at 512 tokens and one dispatch. Decode and small batches read the interleaved buffer with `swiglu_i`.
+
+Interleaved A/B against the previous release (tok/s, mean of 2 rounds):
+
+| model | 128 tokens | 512 tokens |
+| --- | ---: | ---: |
+| 1B Q8_0 | 1,500 → 1,526 (+1.7%) | 1,566 → 1,606 (+2.6%) |
+| 1B Q4_K_M | 1,376 → 1,470 (+6.8%) | 1,471 → 1,542 (+4.8%) |
+| 1B Q4_0 | 1,485 → 1,537 (+3.5%) | 1,554 → 1,596 (+2.7%) |
+| SmolLM2-135M F16 | 10,083 → 10,595 (+5.1%) | 11,456 → 12,269 (+7.1%) |
+
+Against llama.cpp (`scripts/bench_vs_llamacpp.py --device metal`): 1B Q8_0 0.96x at 128 and 512 tokens, Q4_K_M 0.95–0.96x, Q4_0 0.94–0.95x, SmolLM2 F16 0.99x and **1.07x**. Decode is unchanged.
+
+Rejected: a concurrent compute encoder with buffer barriers (llama.cpp's mode) left prompts unchanged and made decode 1–3% slower; double-buffered GEMM tiles (5–9% slower, lower occupancy); four blocks per stage (slower); token-tile-first grid order (no difference: the GEMM is compute-bound); the mask-and-prescale dequant for Q4_K (within noise). Tests: the Metal-vs-CPU model now has a 160-wide FFN, so the down projection exercises odd block counts; planted bugs (no odd-block tail, gate/up swapped in the fused epilogue or in `swiglu_i`, swapped Q4_0 nibble masks) each fail 1–7 of its tests. The real-model Metal tests (perplexity and greedy output against llama.cpp) pass.
+
+**Metal prompt processing (PR #23)**
 
 Timing the forward pass with groups of kernels left out showed that on Llama-3.2-1B Q8_0 at 512 tokens, the GEMMs take 307 of 340 ms. The other 32 ms are mostly SwiGLU (8 ms), prefill attention (8 ms) and the half-precision conversions of linear-layer inputs (6 ms). llama.cpp takes 311 ms in total, so both parts needed work. On the M4, llama.cpp uses its classic simdgroup GEMM: its Metal 4 tensor-op path is enabled only from the M5, as `llama-bench -v` reports. Its 64x32 tile with 8x8-block staging, rebuilt here with our dequantizers, measured the same as our 64x64 tile at 512 tokens. Changes:
 

@@ -4,7 +4,8 @@
 //!
 //! `GEMM_KERNELS="mm_q4_0:64:64:128,variant:64:32:128"` (name:rows-per-tile:tokens-per-tile:threads),
 //! `GEMM_EXTRA=path.metal` appends experimental kernels to the library,
-//! `GEMM_FMT=q4_0|q8_0|q4_k|q6_k|f16`, `GEMM_M` = activation rows (default 512). Prints
+//! `GEMM_FMT=q4_0|q8_0|q4_k|q6_k|f16`, `GEMM_M` = activation rows (default 512), `GEMM_ACC=1`
+//! accumulates into the output (`y += …`). Prints
 //! time and TFLOPS per shape and the max relative difference against the first kernel.
 #![cfg(target_os = "macos")]
 
@@ -83,7 +84,8 @@ fn gemm_bench() {
                 let float_x = name == "mm_f32" || std::env::var("GEMM_FLOAT_X").unwrap_or_default().split(',').any(|k| k == name);
                 e.set_buffer(1, Some(if float_x { &xb } else { &xhb }), 0);
                 e.set_buffer(2, Some(&yb), 0);
-                let args = [n as u32, k as u32, m as u32, 0u32, n as u32];
+                let acc = std::env::var("GEMM_ACC").is_ok() as u32;
+                let args = [n as u32, k as u32, m as u32, acc, n as u32];
                 for (i, v) in args.iter().enumerate() {
                     e.set_bytes(3 + i as u64, 4, v as *const u32 as *const _);
                 }
