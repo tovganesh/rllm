@@ -13,7 +13,7 @@ use std::sync::Arc;
 fn config() -> LlamaConfig {
     LlamaConfig {
         hidden_size: 64,
-        intermediate_size: 128,
+        intermediate_size: 160, // 5 blocks: odd block counts in the down projection
         num_attention_heads: 2,
         num_key_value_heads: 1,
         num_hidden_layers: 2,
