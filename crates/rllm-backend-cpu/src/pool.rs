@@ -59,10 +59,16 @@ thread_local! {
 /// Placeholder job before the first real one.
 static NOOP: fn(usize) = |_| {};
 
+static POOL: OnceLock<&'static Pool> = OnceLock::new();
+
+/// Whether the pool's workers have been started (its size is then fixed).
+pub fn started() -> bool {
+    POOL.get().is_some()
+}
+
 fn pool() -> &'static Pool {
-    static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let workers = rayon::current_num_threads().saturating_sub(1);
+        let workers = crate::threads::decode_threads().saturating_sub(1);
         let spin_us = std::env::var("RLLM_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
         let p: &'static Pool = Box::leak(Box::new(Pool {
             workers,

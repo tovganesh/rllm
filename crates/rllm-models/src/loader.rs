@@ -331,6 +331,7 @@ impl<B: Backend> GgufBundle<B> {
         let gguf = MappedGguf::open(path)?;
         let tokenizer = BpeTokenizer::from_gguf(&gguf.header)?;
         let model = LlamaModel::from_mapped(&gguf, backend, opts)?;
+        rllm_backend_cpu::threads::hint_model_width(model.config.hidden_size);
         if tokenizer.vocab_size() != model.config.vocab_size {
             return Err(RllmError::ModelError(format!(
                 "Tokenizer has {} tokens but the model expects {}",

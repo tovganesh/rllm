@@ -86,7 +86,7 @@ The P0 correctness issues found in the initial review (stride-ignoring matmul on
 Remaining limitations:
 
 1. **Only LLaMA-architecture GGUF models with a byte-level BPE tokenizer load.** Qwen2 (attention biases, NeoX RoPE), Gemma, Phi, and SentencePiece tokenizers are not supported yet.
-2. **Performance gaps (Apple M4).** CPU: decode is at parity or ahead (0.99–1.08x; F16 files 1.87x) and prompt processing is ahead except 128-token prompts on 1B Q8_0/Q4_0 (0.87–0.94x). Metal: decode at parity or ahead (0.96–1.30x across formats), prompt processing 0.85–0.95x. No CUDA backend; Metal runs only on macOS. See [BENCHMARKS](docs/BENCHMARKS.md).
+2. **Performance gaps (Apple M4).** CPU: decode is ahead of llama.cpp's default settings (1B: 1.2–1.3x; F16 files 1.87x) and at parity with its best thread count and prompt processing is ahead except 128-token prompts on 1B Q8_0/Q4_0 (0.87–0.94x). Metal: decode at parity or ahead (0.96–1.30x across formats), prompt processing 0.85–0.95x. No CUDA backend; Metal runs only on macOS. See [BENCHMARKS](docs/BENCHMARKS.md).
 3. **Q5_K weights are converted to Q8_0** (no native kernel yet), and BF16 files use 2× their size (F32).
 4. **Small models rarely write `[n]` citations.** SmolLM2-135M answers correctly from the sources but usually without citation markers; the response then carries a warning. Dense thresholds are calibrated only for bge-small-en-v1.5 and all-MiniLM-L6-v2. The reranker is lexical, not a neural cross-encoder.
 5. **No authentication, per-client rate limiting or TLS** — put rllm behind a reverse proxy for anything exposed. A single engine thread serves one model per process.
