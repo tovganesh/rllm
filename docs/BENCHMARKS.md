@@ -172,8 +172,33 @@ On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0
 **Behind:**
 - Metal prompt processing on Llama-3.2-1B, 0.94–0.96x (128–512 tokens); SmolLM2 F16 is at parity or ahead (0.99–1.07x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
-- Small batches on Metal at 16 tokens: 0.87–0.92x (at 8, 24 and 32 tokens rllm is at 0.95–1.05x). See "Metal 9–32-token batches" below.
 - Metal decode at 4k context: SmolLM2 F16 0.95x, 1B Q4_K_M 0.93x (Q8_0 and Q4_0 at parity). Decode attention reaches ~80 GB/s of the ~100 GB/s a plain streaming read gets; see "Metal decode attention" below.
+
+**Metal split-K for small GEMM grids (PR #27)**
+
+At 16 tokens the 16-token GEMM (`mmh`) ran Llama-3.2-1B's 2048-row output and down projections on only 32 threadgroups, at 1.6 TFLOPS against 2.1–2.4 for the 16384-row gate/up matrix. Those two shapes took 419 of 1,031 µs per layer. The 64x32 GEMM (`mml`) had the same problem at 25–64 tokens. Now both kernels split the inner dimension when the grid is small: a GEMM with `t` threadgroups runs in `128 / t` parts (at most 4, each with at least 8 K steps), each writing a partial output, and `split_k_reduce` sums them in a fixed order (results do not depend on scheduling). Per 1B layer (Q8_0, `tests/gemm_bench.rs` with `GEMM_SPLIT`):
+
+| tokens | output projection 2048x2048 | down projection 2048x8192 |
+| ---: | ---: | ---: |
+| 16 | 82 → 63 µs | 340 → 253 µs |
+| 32 | 126 → 96 µs | 503 → 381 µs |
+| 64 (2 parts) | 204 → 181 µs | 813 → 712 µs |
+
+Six and eight parts were no faster than four. At 20–24 tokens `mml` with split-K only ties `mms`, so `mms` stays. Splitting SmolLM2's 576-wide matrices (9 K steps) cost 6% at 16 tokens, hence the minimum of 8 steps per part.
+
+Interleaved A/B, prompt tok/s (mean of 2–3 rounds):
+
+| tokens | 1B Q8_0 | 1B Q4_K_M | 1B Q4_0 | SmolLM2 F16 |
+| ---: | ---: | ---: | ---: | ---: |
+| 12 | 609 → 650 (+6.7%) | 621 → 680 (+9.6%) | 683 → 746 (+9.3%) | unchanged |
+| 16 | 782 → 844 (+8.0%) | 833 → 911 (+9.3%) | 904 → 988 (+9.3%) | unchanged |
+| 32 | 1,165 → 1,269 (+8.9%) | 1,150 → 1,278 (+11.1%) | 1,226 → 1,343 (+9.6%) | 5,360 → 5,984 (+11.6%) |
+| 64 | 1,385 → 1,436 (+3.7%) | 1,342 → 1,401 (+4.4%) | 1,413 → 1,467 (+3.8%) | 8,527 → 8,908 (+4.5%) |
+| 128 | unchanged | unchanged | unchanged | unchanged |
+
+Against llama.cpp (`llama-bench -ngl 99 -p N -n 0`, alternating, 2 rounds) at 16 / 32 / 64 tokens: Q8_0 1.04 / 1.08 / 0.97x, Q4_K_M 1.01 / 1.05 / 0.99x, Q4_0 0.98 / 1.03 / 0.97x, SmolLM2 F16 1.08 / 1.08 / 1.07x (at 16 tokens previously 0.87–0.92x on the 1B).
+
+Tests: the existing batch tests exercise split-K in both kernels, with accumulation and without (the wide test model's 2112-row gate/up matrix and 96-row projections, and the 2048-wide model's output and down projections). Each of these planted bugs fails 2–7 of the tests: a reduce that drops part 0 or ignores accumulation, a skipped K step in either kernel's split range, and a wrong partial offset.
 
 **Metal decode attention (PR #26)**
 

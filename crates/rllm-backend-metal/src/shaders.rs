@@ -812,8 +812,8 @@ inline void mml_stage(device const uchar* w, device const half* xr, bool tok_ok,
 // halves. `n` is then a multiple of 64.
 template <typename T, uint NB, bool GLU>
 inline void mml_impl(device const uchar* w, device const half* x, device float* y,
-                     uint n, uint k, uint m, uint acc_in, uint ldy, uint2 tg, uint tid, uint sg,
-                     threadgroup half* sa, threadgroup half* sb, threadgroup float* stage) {
+                     uint n, uint k, uint m, uint acc_in, uint ldy, uint2 tg, uint split, uint splits,
+                     uint tid, uint sg, threadgroup half* sa, threadgroup half* sb, threadgroup float* stage) {
     const uint r0 = tg.x * 64, r1 = tg.y * 32;
     // weight staging: thread -> row tid/2, values 16*(tid%2) .. +16 of each 32-block
     const uint lr0 = min(r0 + tid / 2, n - 1);
@@ -823,8 +823,13 @@ inline void mml_impl(device const uchar* w, device const half* x, device float* 
     device const half* xr = x + (ulong)min(r1 + tok, m - 1) * k + 8 * (tid % 4);
     simdgroup_float8x8 mc[8];
     for (uint i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    // Split-K (grid z): each split sums its share of the blocks and writes a partial
+    // [m, n] output to y + split * m * ldy (`split_k_reduce` adds them up).
     const uint nb = k / 32;
-    for (uint b = 0; b < nb; b += NB) mml_stage<T, NB>(w, xr, tok_ok, lr0, k, b, tid, sg, sa, sb, mc);
+    const uint per = (nb / NB + splits - 1) / splits * NB;
+    const uint b1 = min(nb, (split + 1) * per);
+    y += (ulong)split * m * ldy;
+    for (uint b = split * per; b < b1; b += NB) mml_stage<T, NB>(w, xr, tok_ok, lr0, k, b, tid, sg, sa, sb, mc);
     const uint rr = r0 + 32 * (sg & 1), tt = r1 + 16 * (sg >> 1);
     if (GLU) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -870,12 +875,12 @@ inline void mml_impl(device const uchar* w, device const half* x, device float* 
     }
 }
 #define MML_KERNEL(NAME, TAG, NB, GLU) \
-kernel void NAME(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]], \
+kernel void NAME(LINEAR_ARGS, uint3 tg [[threadgroup_position_in_grid]], uint3 ntg [[threadgroups_per_grid]], \
                  uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup float stage[3 * 64 * 32 / 2];   /* 12 KB: 2 x (64x32 + 32x32) halves */ \
     threadgroup half* sa = (threadgroup half*)stage; \
     threadgroup half* sb = sa + 2 * 64 * 32; \
-    mml_impl<TAG, NB, GLU>(w, (device const half*)x, y, n, k, m, accumulate, ldy, tg, tid, sg, sa, sb, stage); }
+    mml_impl<TAG, NB, GLU>(w, (device const half*)x, y, n, k, m, accumulate, ldy, tg.xy, tg.z, ntg.z, tid, sg, sa, sb, stage); }
 #define MML_ALL(TAG, SUF) MML_KERNEL(mml_##SUF, TAG, 2, false) MML_KERNEL(mml1_##SUF, TAG, 1, false) \
     MML_KERNEL(mmlg_##SUF, TAG, 2, true) MML_KERNEL(mmlg1_##SUF, TAG, 1, true)
 MML_ALL(WQ8, q8_0)
@@ -924,12 +929,20 @@ inline void mmh_stage(device const uchar* w, device const half* xr, bool tok_ok,
 }
 
 template <typename T, uint NB>
-kernel void mmh(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]],
+kernel void mmh(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]], uint2 ntg [[threadgroups_per_grid]],
                 uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup half sa[2 * 64 * 32];   // 8 KB (NB <= 2), reused for output staging
     threadgroup half sb[2 * 16 * 32];
     device const half* xh = (device const half*)x;
-    const uint r0 = tg.x * 64, r1 = tg.y * 16;
+    // tg.y = split * token tiles + token tile. Split-K: with several splits, each sums
+    // its share of the blocks and writes a partial [m, n] output to y + split * m * ldy
+    // (`split_k_reduce` adds them up).
+    const uint tiles = (m + 15) / 16, split = tg.y / tiles, splits = ntg.y / tiles;
+    const uint r0 = tg.x * 64, r1 = (tg.y % tiles) * 16;
+    const uint nb = k / 32;
+    const uint per = (nb / NB + splits - 1) / splits * NB;
+    const uint b0 = split * per, b1 = min(nb, b0 + per);
+    y += (ulong)split * m * ldy;
     // weight staging: thread -> row tid/2, values 16*(tid%2) .. +16 of each 32-block;
     // activations: thread -> token tid/8, k offset 4*(tid%8)
     const uint lr0 = min(r0 + tid / 2, n - 1);
@@ -938,8 +951,7 @@ kernel void mmh(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]],
     device const half* xr = xh + (ulong)min(r1 + tok, m - 1) * k + 4 * (tid % 8);
     simdgroup_float8x8 mc[4];
     for (uint i = 0; i < 4; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    const uint nb = k / 32;
-    for (uint b = 0; b < nb; b += NB) mmh_stage<T, NB>(w, xr, tok_ok, lr0, k, b, tid, sg, sa, sb, mc);
+    for (uint b = b0; b < b1; b += NB) mmh_stage<T, NB>(w, xr, tok_ok, lr0, k, b, tid, sg, sa, sb, mc);
     // mc[2j + i]: tokens r1 + 8j.., rows r0 + 16 sg + 8i..
     if (r0 + 64 <= n && m % 8 == 0) {
         const simdgroup_float8x8 ident = simdgroup_float8x8(1.0f);
@@ -970,6 +982,19 @@ kernel void mmh(LINEAR_ARGS, uint2 tg [[threadgroup_position_in_grid]],
         }
     }
 }
+// Sum of split-K partials (`mmh`, `mml`): y[t, r] (+)= sum over s of part[s][t][r], in order.
+kernel void split_k_reduce(device const float* part [[buffer(0)]], device float* y [[buffer(1)]],
+                       constant uint& n [[buffer(2)]], constant uint& m [[buffer(3)]],
+                       constant uint& accumulate [[buffer(4)]], constant uint& ldy [[buffer(5)]],
+                       constant uint& splits [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
+    const uint r = gid.x, t = gid.y;
+    if (r >= n || t >= m) return;
+    float v = 0.0f;
+    for (uint s = 0; s < splits; ++s) v += part[((ulong)s * m + t) * n + r];
+    device float* o = y + (ulong)t * ldy + r;
+    *o = accumulate ? *o + v : v;
+}
+
 // Two blocks per stage, or one for rows with an odd number of blocks (`mmh1_*`).
 typedef decltype(mmh<WQ8, 2>) mmh_t;
 #define MMH_ALL(TAG, SUF) \
