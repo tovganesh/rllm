@@ -225,13 +225,28 @@ fn metal_matches_cpu_q8_0_f16_kv() {
 /// Decode at long context, where Metal splits each row's keys over several threadgroups
 /// (chunks of 256) and combines the partials, batched with a short sequence whose
 /// later chunks are empty. Compared with fresh CPU prefills of the full sequences.
+/// Covers the grouped-query kernel at head dims 32, 64 and 128 (1, 2 and 4 values per
+/// lane) and the per-query-head kernel (multi-head attention).
 #[test]
 fn metal_split_context_decode_matches_cpu() {
     if !MetalLlama::is_available() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let cfg = LlamaConfig { max_position_embeddings: 1024, ..config() };
+    // (hidden, query heads, KV heads)
+    for (hidden, heads, kv_heads) in [(64, 2, 1), (192, 3, 1), (256, 4, 2), (256, 2, 2)] {
+        let cfg = LlamaConfig {
+            hidden_size: hidden,
+            num_attention_heads: heads,
+            num_key_value_heads: kv_heads,
+            max_position_embeddings: 1024,
+            ..config()
+        };
+        check_split_context_decode(cfg);
+    }
+}
+
+fn check_split_context_decode(cfg: LlamaConfig) {
     let make = || {
         let mut m = LlamaModel::new_seeded(cfg.clone(), Arc::new(CpuBackend), 11).unwrap();
         m.kv_dtype = DType::F16;
@@ -271,7 +286,8 @@ fn metal_split_context_decode_matches_cpu() {
             .forward_cached(&ForwardBatch { tokens: &all, positions: &p, block_tables: &vec![t; all.len()], logits_rows: &[all.len() - 1] })
             .unwrap();
         let d = max_rel_diff(&g[row * vocab..(row + 1) * vocab], &c);
-        assert!(d < 2e-3, "row {row} (context {}): relative diff {d}", all.len());
+        let (h, nq, nkv) = (cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads);
+        assert!(d < 2e-3, "hidden {h}, {nq}/{nkv} heads, row {row} (context {}): relative diff {d}", all.len());
     }
 }
 

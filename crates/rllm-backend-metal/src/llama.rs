@@ -129,12 +129,12 @@ const ATTN_KB: usize = 32;
 /// 128 and 512 were up to 7% slower, no splitting 14–28% slower.
 const DECODE_CHUNK: usize = 256;
 
-/// With fewer decode-attention threadgroups than this at [`DECODE_CHUNK`], chunks of
-/// [`DECODE_CHUNK_SMALL`] keys are used instead, so a model with few KV heads still
-/// spreads a short context over the GPU (SmolLM2-135M, 3 KV heads, 1k context: +10%;
-/// at 4k, 256-key chunks are 4% faster).
+/// While there are fewer decode-attention threadgroups than this, the chunk is halved
+/// (down to [`DECODE_CHUNK_MIN`] keys), so a model with few KV heads still spreads a
+/// short context over the GPU (SmolLM2-135M, 3 KV heads: +10% at 1k context, +2.5% at
+/// 16–144 tokens from 64-key chunks; at 4k, 256-key chunks are 3–4% faster than 128).
 const DECODE_MIN_GROUPS: usize = 32;
-const DECODE_CHUNK_SMALL: usize = 128;
+const DECODE_CHUNK_MIN: usize = 64;
 
 /// Rows at or below which a linear layer uses matrix-vector kernels; larger batches use
 /// the small-batch GEMM (`mms`, F16/quantized weights) or the tiled GEMM. Measured
@@ -803,11 +803,10 @@ impl LanguageModel for MetalLlama {
         // (one threadgroup each); partials need a buffer sized by the longest context.
         let max_single_ctx = singles.iter().map(|&r| batch.positions[r as usize] + 1).max().unwrap_or(0);
         let attn_heads = if GQA_GROUPS.contains(&(nq / nkv)) && std::env::var_os("RLLM_NO_GQA_ATTN").is_none() { nkv } else { nq };
-        let decode_chunk = if attn_heads * singles.len() * max_single_ctx.div_ceil(DECODE_CHUNK) < DECODE_MIN_GROUPS {
-            DECODE_CHUNK_SMALL
-        } else {
-            DECODE_CHUNK
-        };
+        let mut decode_chunk = DECODE_CHUNK;
+        while decode_chunk > DECODE_CHUNK_MIN && attn_heads * singles.len() * max_single_ctx.div_ceil(decode_chunk) < DECODE_MIN_GROUPS {
+            decode_chunk /= 2;
+        }
         let nsplit = max_single_ctx.div_ceil(decode_chunk).max(1);
         let part_len = (singles.len() * nq * nsplit * (hd + 2)).max(1) * 4;
         if sc.bufs.get("attn_part").is_none_or(|buf| (buf.length() as usize) < part_len) {

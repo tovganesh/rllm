@@ -173,6 +173,29 @@ On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0
 - Metal prompt processing on Llama-3.2-1B, 0.94–0.96x (128–512 tokens); SmolLM2 F16 is at parity or ahead (0.99–1.07x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 - Small batches on Metal at 16 tokens: 0.87–0.92x (at 8, 24 and 32 tokens rllm is at 0.95–1.05x). See "Metal 9–32-token batches" below.
+- Metal decode at 4k context: SmolLM2 F16 0.95x, 1B Q4_K_M 0.93x (Q8_0 and Q4_0 at parity). Decode attention reaches ~80 GB/s of the ~100 GB/s a plain streaming read gets; see "Metal decode attention" below.
+
+**Metal decode attention (PR #26)**
+
+Skipping the decode attention dispatch on SmolLM2-135M F16 raised decode from 185 to 269 tok/s at 4k context: attention took 1.7 ms of each 5.4 ms step, at about half of memory bandwidth. A new micro-benchmark, `tests/attn_bench.rs`, times the kernel and its split reduce per layer, cycling through one KV cache per layer so that reads come from DRAM. Changes:
+
+1. **Values load as vectors.** Each lane now owns `hd/32` consecutive dimensions and reads them in one load per key (previously one 2-byte load per dimension). Full 32-key steps run an unrolled loop. Per layer at 4k context: SmolLM2 53 → 45 µs, Llama-3.2-1B 117 → 104 µs (72 → 80 GB/s; a plain streaming read on this M4 reaches 100 GB/s).
+2. **Short contexts use smaller chunks.** The chunk is halved from 256 keys down to 64 until there are 32 threadgroups (previously one step to 128). SmolLM2 at 16–144 tokens of context: +2.5%.
+
+Tried and dropped: loading a full step's values together with its keys (13–25% slower, register pressure), 16-byte key loads (no change), 8 simdgroups per threadgroup (within noise) and coalesced key reads (about 5% in a diagnostic variant). From 2k to 8k context, decode now slows by 0.372 ms per 1k tokens on 1B Q4_K_M, against llama.cpp's 0.345 ms.
+
+Interleaved A/B, decode tok/s (mean of 3 rounds):
+
+| model | short context | 4k context |
+| --- | ---: | ---: |
+| SmolLM2-135M F16 | 247.2 → 256.1 (+3.6%) | 191.7 → 200.0 (+4.3%) |
+| 1B Q8_0 | 67.4 → 68.1 (+1.0%) | 61.3 → 62.4 (+1.8%) |
+| 1B Q4_K_M | 105.9 → 106.8 (+0.8%) | 87.8 → 88.7 (+1.0%) |
+| 1B Q4_0 | 111.7 → 114.4 (+2.4%) | 93.7 → 94.7 (+1.1%) |
+
+Against llama.cpp (decode only, alternating the two engines over 3 rounds; the machine varied by up to ±10% between rounds): SmolLM2 F16 0.98x at short context and 0.95x at 4k, 1B Q4_K_M 0.99x and 0.93x, 1B Q8_0 at parity at both.
+
+Tests: the long-context decode test now runs head dims 32, 64 and 128 (1, 2 and 4 values per lane) with grouped-query attention, and multi-head attention (the per-query-head kernel). Planted bugs in the value offsets, the merge layout, the unrolled step or the tail of either kernel fail it.
 
 **Metal 9–32-token batches (PR #25)**
 
