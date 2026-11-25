@@ -140,15 +140,39 @@ const DECODE_MIN_GROUPS: usize = 32;
 const DECODE_CHUNK_MIN: usize = 64;
 
 /// Rows at or below which a linear layer uses matrix-vector kernels; larger batches use
-/// the small-batch GEMM (`mms`, F16/quantized weights) or the tiled GEMM. Measured
-/// end to end on Llama-3.2-1B (M4) at 3-4 rows: `mms` is ~25% faster for K-quants,
-/// `mv4` ~10% faster for Q8_0, and they tie for Q4_0. F32 weights have no `mms`.
+/// the few-row MMA GEMM (`mvm`, Q8_0/Q4_0, up to [`MVM_ROWS`]), the small-batch GEMM
+/// (`mms`) or the tiled GEMM. Measured end to end on Llama-3.2-1B (M4) at 3-4 rows: `mms`
+/// is ~25% faster for K-quants. F32 weights have no `mms`.
 fn mv_max_rows(kind: WKind) -> usize {
     match kind {
         WKind::F32 => 8,
+        WKind::Q8 | WKind::Q4 => 1,
         WKind::Q4K | WKind::Q6K => 2,
-        WKind::F16 | WKind::Q8 | WKind::Q4 => 4,
+        WKind::F16 => 4,
     }
+}
+
+/// Rows handled by the few-row MMA GEMM (`mvm`) for Q8_0 and Q4_0 weights, which reads
+/// F32 activations. One row keeps `mv` (as fast or faster). Measured on Llama-3.2-1B (M4)
+/// with 16 sequences decoding together: a 16-row `mvm` was ~10% slower than `mmh` with
+/// split-K, and equal at 12.
+const MVM_ROWS: std::ops::RangeInclusive<usize> = 2..=8;
+
+fn uses_mvm(kind: WKind, m: usize) -> bool {
+    matches!(kind, WKind::Q8 | WKind::Q4) && MVM_ROWS.contains(&m)
+}
+
+/// (8-row weight tiles, simdgroups) per `mvm` threadgroup; matches the shader
+/// instantiations.
+fn mvm_shape(kind: WKind) -> (u64, u64) {
+    if kind == WKind::Q4 { (2, 8) } else { (1, 16) }
+}
+
+/// Whether a linear segment of this format reads its input as half precision (`xh`) for
+/// `m` rows: the small-batch and tiled GEMMs do; the matrix-vector kernels, `mvm` and
+/// the F32 kernels read F32.
+fn reads_half(kind: WKind, m: usize) -> bool {
+    kind != WKind::F32 && m > mv_max_rows(kind) && !uses_mvm(kind, m)
 }
 
 /// Rows at or below which the small-batch kernels are used instead of the tiled GEMM:
@@ -230,6 +254,7 @@ impl MetalLlama {
             "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
             "mm_q4_k", "mm_q6_k", "mml_q8_0", "mml_q4_0", "mml_f16", "mml_q4_k", "mml_q6_k", "mml1_q8_0", "mml1_q4_0", "mml1_f16", "mml1_q4_k", "mml1_q6_k", "mmlg_q8_0", "mmlg_q4_0", "mmlg_f16", "mmlg_q4_k", "mmlg_q6_k", "mmlg1_q8_0", "mmlg1_q4_0", "mmlg1_f16", "mmlg1_q4_k", "mmlg1_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
             "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "swiglu_i", "swiglu_ih", "attn_reduce", "split_k_reduce",
+            "mvm_q8_0", "mvm_q4_0",
         ];
         let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
             .iter()
@@ -558,7 +583,7 @@ impl MetalLlama {
     #[allow(clippy::too_many_arguments)]
     fn linear_segments(&self, e: &Enc<'_>, segs: &[Weight], x: &Buffer, xh: &Buffer, y: &Buffer, m: usize, accumulate: bool, half_ready: bool) {
         let ldy = segs.iter().map(|w| w.rows).sum::<usize>() as u32;
-        if !half_ready && segs.iter().any(|w| w.kind != WKind::F32 && m > mv_max_rows(w.kind)) {
+        if !half_ready && segs.iter().any(|w| reads_half(w.kind, m)) {
             let quads = (m * segs[0].cols / 4) as u64;
             e.threads(self.pipeline("to_half"), &[Arg::B(x), Arg::B(xh)], (quads, 1, 1));
         }
@@ -575,7 +600,12 @@ impl MetalLlama {
                 Arg::U(accumulate as u32),
                 Arg::U(ldy),
             ];
-            if m <= mv_max_rows(w.kind) {
+            if uses_mvm(w.kind, m) {
+                // Up to 8 rows: one 8-row activation tile.
+                let (nt, nsg) = mvm_shape(w.kind);
+                let p = self.pipeline(&format!("mvm_{}", w.kind.suffix()));
+                e.groups(p, &args, ((w.rows as u64).div_ceil(8 * nt), 1, 1), 32 * nsg);
+            } else if m <= mv_max_rows(w.kind) {
                 // One activation row: the tuned decode kernels; 2..8 rows: kernels that
                 // decode each weight chunk once for all rows.
                 let name = match m {
@@ -699,7 +729,7 @@ impl MetalLlama {
     /// Whether every segment of a linear layer reads only the half-precision input (`xh`)
     /// for `m` rows, so the producer may write half precision directly.
     fn reads_only_half(segs: &[Weight], m: usize) -> bool {
-        segs.iter().all(|w| w.kind != WKind::F32 && m > mv_max_rows(w.kind))
+        segs.iter().all(|w| reads_half(w.kind, m))
     }
 
     /// RMSNorm into `y` (F32), or into `xh` as half precision when the next linear
