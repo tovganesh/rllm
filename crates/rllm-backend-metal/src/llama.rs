@@ -115,6 +115,9 @@ pub struct MetalLlama {
     sin: Buffer,
     /// KV cache element type, `"f16"` or `"f32"` (kernel-name suffix).
     kv_type: &'static str,
+    /// Split-K partial outputs (parts x tokens x rows floats; at most
+    /// `SPLIT_K_GROUPS` x 64 x 32 by the [`split_k`] rule).
+    split_part: Buffer,
     state: Mutex<State>,
 }
 
@@ -158,6 +161,26 @@ const MMS_MAX_ROWS: usize = 24;
 /// it was 12-14% slower than `mms`.
 const MMH_ROWS: std::ops::RangeInclusive<usize> = 9..=16;
 const MMH_MIN_GROUPS: usize = 32;
+
+/// Split-K for the tiled GEMMs (`mmh`, `mml`) on small grids: a GEMM with `t`
+/// threadgroups is split over the inner dimension into `SPLIT_K_GROUPS / t` parts (at
+/// most `SPLIT_K_MAX`), each writing a partial output that `split_k_reduce` sums in a fixed
+/// order. Per Llama-3.2-1B layer (M4, Q8_0), 2048x2048 output and 2048x8192 down
+/// projections: 16 tokens 82 -> 63 and 340 -> 253 us, 32 tokens 126 -> 96 and
+/// 503 -> 381 us, 64 tokens (two parts) 204 -> 181 and 813 -> 712 us. Six and eight
+/// parts were no faster than four.
+const SPLIT_K_GROUPS: usize = 128;
+const SPLIT_K_MAX: usize = 4;
+
+/// Fewest K steps (stages of 64 or 32 values) per split-K part: SmolLM2-135M's
+/// 576-wide matrices (9 two-block stages) split in two were 6% slower end to end at 16
+/// tokens, and at 128 tokens split-K cost 2% there.
+const SPLIT_K_MIN_STAGES: usize = 8;
+
+/// Number of split-K parts for a GEMM of `groups` threadgroups over `stages` K steps.
+fn split_k(groups: usize, stages: usize) -> usize {
+    (SPLIT_K_GROUPS / groups.max(1)).clamp(1, SPLIT_K_MAX).min((stages / SPLIT_K_MIN_STAGES).max(1))
+}
 /// Rows of `x` the small-batch kernels may read (whole 8-row fragments; rows past the
 /// batch only feed discarded outputs).
 const SMALL_BATCH_READ_ROWS: usize = 24;
@@ -206,7 +229,7 @@ impl MetalLlama {
         let names = [
             "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
             "mm_q4_k", "mm_q6_k", "mml_q8_0", "mml_q4_0", "mml_f16", "mml_q4_k", "mml_q6_k", "mml1_q8_0", "mml1_q4_0", "mml1_f16", "mml1_q4_k", "mml1_q6_k", "mmlg_q8_0", "mmlg_q4_0", "mmlg_f16", "mmlg_q4_k", "mmlg_q6_k", "mmlg1_q8_0", "mmlg1_q4_0", "mmlg1_f16", "mmlg1_q4_k", "mmlg1_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
-            "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "swiglu_i", "swiglu_ih", "attn_reduce",
+            "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "swiglu_i", "swiglu_ih", "attn_reduce", "split_k_reduce",
         ];
         let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
             .iter()
@@ -353,6 +376,7 @@ impl MetalLlama {
         let sin = vec_buf(&model.sin_table)?;
         info!("Metal executor ready on {} ({} layers)", device.name(), layers.len());
 
+        let split_part = device.new_buffer((SPLIT_K_GROUPS * 64 * 32 * 4) as u64, MTLResourceOptions::StorageModePrivate);
         Ok(Self {
             config: c,
             queue: device.new_command_queue(),
@@ -365,6 +389,7 @@ impl MetalLlama {
             cos,
             sin,
             kv_type,
+            split_part,
             state: Mutex::new(State { kv: Vec::new(), block_size: 0, num_blocks: 0, scratch: Scratch::default() }),
         })
     }
@@ -562,10 +587,17 @@ impl MetalLlama {
                 let p = self.pipeline(&name);
                 e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
             } else if w.kind != WKind::F32 && MMH_ROWS.contains(&m) && w.rows.div_ceil(64) >= MMH_MIN_GROUPS {
-                let stage = if (w.cols / 32).is_multiple_of(2) { "mmh" } else { "mmh1" };
+                let two = (w.cols / 32).is_multiple_of(2);
+                let stage = if two { "mmh" } else { "mmh1" };
+                let groups = w.rows.div_ceil(64);
+                let splits = split_k(groups, w.cols / 32 / if two { 2 } else { 1 });
                 let mut args = args;
                 args[1] = Arg::B(xh);
-                e.groups(self.pipeline(&format!("{stage}_{}", w.kind.suffix())), &args, ((w.rows as u64).div_ceil(64), 1, 1), 128);
+                if splits > 1 {
+                    self.split_args(&mut args, n);
+                }
+                e.groups(self.pipeline(&format!("{stage}_{}", w.kind.suffix())), &args, (groups as u64, splits as u64, 1), 128);
+                self.split_reduce(e, splits, y, col, n, m, accumulate, ldy);
             } else if w.kind != WKind::F32 && m <= MMS_MAX_ROWS {
                 // `mms`: m/8 token fragments; two row groups per simdgroup from 16 tokens,
                 // except for F16 weights at 16.
@@ -585,9 +617,16 @@ impl MetalLlama {
                 let tiles = w.rows.div_ceil(64) * m.div_ceil(64);
                 if w.kind != WKind::Q6K || tiles < MML_MAX_TILES {
                     // Two blocks per stage, or one for rows with an odd number of blocks.
-                    let stage = if (w.cols / 32).is_multiple_of(2) { "mml" } else { "mml1" };
+                    let two = (w.cols / 32).is_multiple_of(2);
+                    let stage = if two { "mml" } else { "mml1" };
+                    let (gx, gy) = (w.rows.div_ceil(64), m.div_ceil(32));
+                    let splits = split_k(gx * gy, w.cols / 32 / if two { 2 } else { 1 });
+                    if splits > 1 {
+                        self.split_args(&mut args, n);
+                    }
                     let p = self.pipeline(&format!("{stage}_{}", w.kind.suffix()));
-                    e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(32), 1), 128);
+                    e.groups(p, &args, (gx as u64, gy as u64, splits as u64), 128);
+                    self.split_reduce(e, splits, y, col, n, m, accumulate, ldy);
                 } else {
                     let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
                     e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1), 128);
@@ -595,6 +634,36 @@ impl MetalLlama {
             }
             col += w.rows as u64;
         }
+    }
+
+    /// Points a split-K GEMM's output at the partials buffer (`[parts][m][n]`, written,
+    /// not accumulated).
+    fn split_args<'a>(&'a self, args: &mut [Arg<'a>; 8], n: u32) {
+        args[2] = Arg::B(&self.split_part);
+        args[6] = Arg::U(0);
+        args[7] = Arg::U(n);
+    }
+
+    /// Sums `splits` split-K partials into columns `col..col + n` of `y` (row stride
+    /// `ldy`), adding to it when `accumulate`. No-op for a single part.
+    #[allow(clippy::too_many_arguments)]
+    fn split_reduce(&self, e: &Enc<'_>, splits: usize, y: &Buffer, col: u64, n: u32, m: usize, accumulate: bool, ldy: u32) {
+        if splits <= 1 {
+            return;
+        }
+        e.threads(
+            self.pipeline("split_k_reduce"),
+            &[
+                Arg::B(&self.split_part),
+                Arg::BO(y, col * 4),
+                Arg::U(n),
+                Arg::U(m as u32),
+                Arg::U(accumulate as u32),
+                Arg::U(ldy),
+                Arg::U(splits as u32),
+            ],
+            (n as u64, m as u64, 1),
+        );
     }
 
     /// Whether the gate/up GEMM for `m` rows runs as the 64x32 tile kernel with SwiGLU

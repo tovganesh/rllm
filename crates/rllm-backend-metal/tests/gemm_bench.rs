@@ -6,6 +6,8 @@
 //! `GEMM_EXTRA=path.metal` appends experimental kernels to the library,
 //! `GEMM_FMT=q4_0|q8_0|q4_k|q6_k|f16`, `GEMM_M` = activation rows (default 512), `GEMM_ACC=1`
 //! accumulates into the output (`y += …`),
+//! `GEMM_SPLIT=s` runs `mmh`/`mml` split over K in `s` parts (times the partial GEMMs
+//! only, without the reduce; the diff column is then meaningless),
 //! `GEMM_REPS` = timed dispatches per kernel and shape (default 20; use more for small `GEMM_M`). Prints
 //! time and TFLOPS per shape and the max relative difference against the first kernel.
 #![cfg(target_os = "macos")]
@@ -74,7 +76,10 @@ fn gemm_bench() {
         for (ki, (name, tn, tm, threads)) in kernels.iter().enumerate() {
             let f = lib.get_function(name, None).unwrap();
             let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
-            let yb = device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+            // GEMM_SPLIT=s: split-K over grid y (`mmh`) or z (`mml`); outputs are partials.
+            let split: u64 = std::env::var("GEMM_SPLIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            let (sy, sz) = if name.starts_with("mmh") { (split, 1) } else { (1, split) };
+            let yb = device.new_buffer((split as usize * m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
             let run = |reps: usize| {
                 let cb = q.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
@@ -92,7 +97,7 @@ fn gemm_bench() {
                 }
                 for _ in 0..reps {
                     e.dispatch_thread_groups(
-                        MTLSize::new((n as u64).div_ceil(*tn), (m as u64).div_ceil(*tm), 1),
+                        MTLSize::new((n as u64).div_ceil(*tn), (m as u64).div_ceil(*tm) * sy, sz),
                         MTLSize::new(*threads, 1, 1),
                     );
                 }
