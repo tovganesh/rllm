@@ -1082,6 +1082,20 @@ KV_WRITE_KERNEL(kv_write_f16, half)
     constant uint& bs [[buffer(10)]], constant float& scale [[buffer(11)]], \
     constant uint& q_stride [[buffer(13)]]
 
+// Loads N consecutive cache values as floats (one vector load for N = 2 or 4).
+template <typename T, uint N> struct vload {
+    static inline void f(device const T* p, thread float* v) { for (uint i = 0; i < N; ++i) v[i] = float(p[i]); }
+};
+template <typename T> struct vload<T, 2> {
+    static inline void f(device const T* p, thread float* v) { const vec<T, 2> x = *(device const vec<T, 2>*)p; v[0] = x[0]; v[1] = x[1]; }
+};
+template <typename T> struct vload<T, 4> {
+    static inline void f(device const T* p, thread float* v) {
+        const vec<T, 4> x = *(device const vec<T, 4>*)p;
+        v[0] = x[0]; v[1] = x[1]; v[2] = x[2]; v[3] = x[3];
+    }
+};
+
 // ── causal paged attention for decode rows, split over the context ("flash decoding") ──
 // One threadgroup (4 simdgroups) per (query head, row, context chunk of `chunk`
 // positions). Positions are processed in tiles of 32: each lane scores one position
@@ -1142,17 +1156,25 @@ inline void attn_row_impl(device const float* q, device const KVT* kc, device co
         s = s * corr + simd_sum(p);
         for (uint i = 0; i < dpl; ++i) acc[i] *= corr;
         const uint cnt = min(32u, end - t0);
-        for (uint u = 0; u < cnt; ++u) {
-            const float pu = simd_shuffle(p, u);
-            const uint tu = t0 + u;
-            device const KVT* vr = vc + table[tu / bs] * block_stride + head_off + (tu % bs) * HD;
-            for (uint i = 0; i < dpl; ++i) acc[i] += pu * float(vr[lane + i * 32]);
+        // Each lane owns dims lane*dpl .. lane*dpl+dpl-1 (one vector load per key).
+        #define ROW_V_STEP(u) { \
+            const float pu = simd_shuffle(p, u); \
+            const uint tu = t0 + (u); \
+            float v[dpl]; \
+            vload<KVT, dpl>::f(vc + table[tu / bs] * block_stride + head_off + (tu % bs) * HD + lane * dpl, v); \
+            for (uint i = 0; i < dpl; ++i) acc[i] += pu * v[i]; }
+        if (cnt == 32) {
+            #pragma unroll(8)
+            for (uint u = 0; u < 32; ++u) ROW_V_STEP(u)
+        } else {
+            for (uint u = 0; u < cnt; ++u) ROW_V_STEP(u)
         }
+        #undef ROW_V_STEP
         m = mn;
     }
 
     if (lane == 0) { tm[sg] = m; ts[sg] = s; }
-    for (uint i = 0; i < dpl; ++i) tacc[sg * HD + lane + i * 32] = acc[i];
+    for (uint i = 0; i < dpl; ++i) tacc[sg * HD + lane * dpl + i] = acc[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
         float M = -INFINITY;
@@ -1261,21 +1283,25 @@ inline void attn_gqa_impl(device const float* q, device const KVT* kc, device co
             m[g] = mn;
         }
         const uint cnt = min(32u, end - t0);
-        for (uint u = 0; u < cnt; ++u) {
-            const uint tu = t0 + u;
-            device const KVT* vr = vc + table[tu / bs] * block_stride + head_off + (tu % bs) * HD;
-            float v[dpl];
-            for (uint i = 0; i < dpl; ++i) v[i] = float(vr[lane + i * 32]);
-            for (uint g = 0; g < G; ++g) {
-                const float pu = simd_shuffle(p[g], u);
-                for (uint i = 0; i < dpl; ++i) acc[g][i] += pu * v[i];
-            }
+        #define GQA_V_STEP(u) { \
+            const uint tu = t0 + (u); \
+            float v[dpl]; \
+            vload<KVT, dpl>::f(vc + table[tu / bs] * block_stride + head_off + (tu % bs) * HD + lane * dpl, v); \
+            for (uint g = 0; g < G; ++g) { \
+                const float pu = simd_shuffle(p[g], u); \
+                for (uint i = 0; i < dpl; ++i) acc[g][i] += pu * v[i]; } }
+        if (cnt == 32) {
+            #pragma unroll(8)
+            for (uint u = 0; u < 32; ++u) GQA_V_STEP(u)
+        } else {
+            for (uint u = 0; u < cnt; ++u) GQA_V_STEP(u)
         }
+        #undef GQA_V_STEP
     }
 
     for (uint g = 0; g < G; ++g) {
         if (lane == 0) { tm[sg * G + g] = m[g]; ts[sg * G + g] = s[g]; }
-        for (uint i = 0; i < dpl; ++i) tacc[(sg * G + g) * HD + lane + i * 32] = acc[g][i];
+        for (uint i = 0; i < dpl; ++i) tacc[(sg * G + g) * HD + lane * dpl + i] = acc[g][i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Simdgroup g' < G finalises head g' (the four simdgroups split the heads).
