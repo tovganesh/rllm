@@ -333,3 +333,146 @@ pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
     s
 }
+
+/// One `Q4_0` weight row against `R` activation rows (blocks from `offs[r]`); each
+/// weight block is unpacked once for all rows.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot_q4_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [usize; R], nb: usize) -> [f32; R] {
+    assert!(w.len() >= nb * Q4_0_BYTES);
+    for &o in &offs {
+        assert!(a.qs.len() >= (o + nb) * QK && a.d.len() >= o + nb);
+    }
+    let wp = w.as_ptr();
+    let mut acc = [_mm256_setzero_ps(); R];
+    for b in 0..nb {
+        let blk = wp.add(b * Q4_0_BYTES);
+        let x = q4_0_values(blk.add(2));
+        let ax = _mm256_sign_epi8(x, x);
+        let dw = f16_at(blk);
+        for r in 0..R {
+            let y = _mm256_loadu_si256(a.qs.as_ptr().add((offs[r] + b) * QK) as *const __m256i);
+            let s = _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(y, x)), _mm256_set1_epi16(1));
+            let d = _mm256_set1_ps(dw * *a.d.get_unchecked(offs[r] + b));
+            acc[r] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(s), acc[r]);
+        }
+    }
+    let mut out = [0f32; R];
+    for r in 0..R {
+        out[r] = hsum_ps(acc[r]);
+    }
+    out
+}
+
+/// One `Q4_K` weight row against `R` `Q8_K` activation rows (super-blocks from
+/// `offs[r]`); each weight super-block is unpacked once for all rows.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot_q4_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize; R], nb: usize) -> [f32; R] {
+    assert!(w.len() >= nb * Q4_K_BYTES);
+    for &o in &offs {
+        assert!(a.qs.len() >= (o + nb) * QK_K && a.bsums.len() >= (o + nb) * 16 && a.d.len() >= o + nb);
+    }
+    let m4 = _mm256_set1_epi8(0x0F);
+    let mut out = [0f32; R];
+    for i in 0..nb {
+        let blk = w.as_ptr().add(i * Q4_K_BYTES);
+        let (dw, dmw) = (f16_at(blk), f16_at(blk.add(2)));
+        let (scales, mins) = super::kdot::q4_k_scales_mins(std::slice::from_raw_parts(blk.add(4), 12));
+        let mut sm = [0u8; 16];
+        sm[..8].copy_from_slice(&scales);
+        sm[8..].copy_from_slice(&mins);
+        let mins_and_scales = _mm256_cvtepu8_epi16(_mm_loadu_si128(sm.as_ptr() as *const __m128i));
+        let mins16 = _mm256_extracti128_si256::<1>(mins_and_scales);
+        let sc128 = _mm256_castsi256_si128(mins_and_scales);
+        let scales = _mm256_set_m128i(sc128, sc128);
+        let mut sumi = [_mm256_setzero_si256(); R];
+        for j in 0..4 {
+            let (sl, sh) = (4 * j as i16, 4 * j as i16 + 2);
+            let scale_l = _mm256_shuffle_epi8(scales, _mm256_set1_epi16(((sl + 1) << 8) | sl));
+            let scale_h = _mm256_shuffle_epi8(scales, _mm256_set1_epi16(((sh + 1) << 8) | sh));
+            let bits = _mm256_loadu_si256(blk.add(16 + 32 * j) as *const __m256i);
+            let q4l = _mm256_and_si256(bits, m4);
+            let q4h = _mm256_and_si256(_mm256_srli_epi16::<4>(bits), m4);
+            for r in 0..R {
+                let q8 = a.qs.as_ptr().add((offs[r] + i) * QK_K + 64 * j);
+                let q8l = _mm256_loadu_si256(q8 as *const __m256i);
+                let q8h = _mm256_loadu_si256(q8.add(32) as *const __m256i);
+                let p16l = _mm256_madd_epi16(scale_l, _mm256_maddubs_epi16(q4l, q8l));
+                let p16h = _mm256_madd_epi16(scale_h, _mm256_maddubs_epi16(q4h, q8h));
+                sumi[r] = _mm256_add_epi32(sumi[r], _mm256_add_epi32(p16l, p16h));
+            }
+        }
+        for r in 0..R {
+            let da = *a.d.get_unchecked(offs[r] + i);
+            let q8sums = _mm256_loadu_si256(a.bsums.as_ptr().add((offs[r] + i) * 16) as *const __m256i);
+            let q8s = _mm_hadd_epi16(_mm256_castsi256_si128(q8sums), _mm256_extracti128_si256::<1>(q8sums));
+            let msum = hsum_i32_128(_mm_madd_epi16(mins16, q8s));
+            out[r] += da * dw * hsum_i32(sumi[r]) as f32 - da * dmw * msum as f32;
+        }
+    }
+    out
+}
+
+/// One `Q6_K` weight row against `R` `Q8_K` activation rows (super-blocks from
+/// `offs[r]`); each weight super-block is unpacked once for all rows.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot_q6_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize; R], nb: usize) -> [f32; R] {
+    assert!(w.len() >= nb * Q6_K_BYTES);
+    for &o in &offs {
+        assert!(a.qs.len() >= (o + nb) * QK_K && a.d.len() >= o + nb);
+    }
+    let m4 = _mm256_set1_epi8(0x0F);
+    let m2 = _mm256_set1_epi8(3);
+    let m32s = _mm256_set1_epi8(32);
+    let mut out = [0f32; R];
+    for i in 0..nb {
+        let blk = w.as_ptr().add(i * Q6_K_BYTES);
+        let dw = f16_at(blk.add(208));
+        let scales = _mm_loadu_si128(blk.add(192) as *const __m128i);
+        let mut sumi = [_mm256_setzero_si256(); R];
+        for j in 0..2 {
+            let bits1 = _mm256_loadu_si256(blk.add(64 * j) as *const __m256i);
+            let bits2 = _mm256_loadu_si256(blk.add(64 * j + 32) as *const __m256i);
+            let bits_h = _mm256_loadu_si256(blk.add(128 + 32 * j) as *const __m256i);
+            let h0 = _mm256_slli_epi16::<4>(_mm256_and_si256(bits_h, m2));
+            let h1 = _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<2>(bits_h), m2));
+            let h2 = _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<4>(bits_h), m2));
+            let h3 = _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<6>(bits_h), m2));
+            let q = [
+                _mm256_or_si256(_mm256_and_si256(bits1, m4), h0),
+                _mm256_or_si256(_mm256_and_si256(bits2, m4), h1),
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(bits1), m4), h2),
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(bits2), m4), h3),
+            ];
+            for (k, &qk) in q.iter().enumerate() {
+                let s = (4 * j + k) as i8;
+                let sel = _mm_unpacklo_epi64(_mm_set1_epi8(2 * s), _mm_set1_epi8(2 * s + 1));
+                let sc = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, sel));
+                for r in 0..R {
+                    let y = _mm256_loadu_si256(
+                        a.qs.as_ptr().add((offs[r] + i) * QK_K + 128 * j + 32 * k) as *const __m256i
+                    );
+                    let p16 = _mm256_sub_epi16(_mm256_maddubs_epi16(qk, y), _mm256_maddubs_epi16(m32s, y));
+                    sumi[r] = _mm256_add_epi32(sumi[r], _mm256_madd_epi16(sc, p16));
+                }
+            }
+        }
+        for r in 0..R {
+            out[r] += *a.d.get_unchecked(offs[r] + i) * dw * hsum_i32(sumi[r]) as f32;
+        }
+    }
+    out
+}
+
+#[inline(always)]
+unsafe fn hsum_i32_128(v: __m128i) -> i32 {
+    let s = _mm_add_epi32(v, _mm_shuffle_epi32::<0b01_00_11_10>(v));
+    _mm_cvtsi128_si32(_mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s)))
+}
+
+#[inline(always)]
+unsafe fn hsum_i32(v: __m256i) -> i32 {
+    hsum_i32_128(_mm_add_epi32(
+        _mm256_castsi256_si128(v),
+        _mm256_extracti128_si256::<1>(v),
+    ))
+}

@@ -138,6 +138,11 @@ pub fn dot_q4_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize;
         // SAFETY: dotprod detected at runtime; slice lengths are asserted inside.
         return unsafe { neon::dot_q4_k_rows(w, a, offs, nb) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q4_k_rows(w, a, offs, nb) };
+    }
     std::array::from_fn(|r| vec_dot_q4_k_q8_k(w, a, offs[r], nb))
 }
 
@@ -148,6 +153,11 @@ pub fn dot_q6_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize;
     if has_dotprod() {
         // SAFETY: as above.
         return unsafe { neon::dot_q6_k_rows(w, a, offs, nb) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q6_k_rows(w, a, offs, nb) };
     }
     std::array::from_fn(|r| vec_dot_q6_k_q8_k(w, a, offs[r], nb))
 }

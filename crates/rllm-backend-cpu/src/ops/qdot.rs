@@ -172,6 +172,18 @@ pub fn dot_q8_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [usize; 
     std::array::from_fn(|r| scalar_dot_q8_0_q8(w, a, offs[r], nb))
 }
 
+/// Dot products of one `Q4_0` weight row with `R` activation rows (see
+/// [`dot_q8_0_rows`]); a multi-row kernel exists on x86_64 (AVX2).
+#[inline]
+pub fn dot_q4_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [usize; R], nb: usize) -> [f32; R] {
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q4_0_rows(w, a, offs, nb) };
+    }
+    std::array::from_fn(|r| vec_dot_q4_0_q8(w, a, offs[r], nb))
+}
+
 /// Portable reference implementation of [`vec_dot_q8_0_q8`].
 pub fn scalar_dot_q8_0_q8(w: &[u8], a: &Q8Activations, off: usize, nb: usize) -> f32 {
     let mut sum = 0f32;
@@ -471,6 +483,7 @@ impl Acts {
         let offs: [usize; R] = std::array::from_fn(|r| (i0 + r) * nb);
         match (self, fmt) {
             (Acts::Q8(a), QFormat::Q8_0) => dot_q8_0_rows(w, a, offs, nb),
+            (Acts::Q8(a), QFormat::Q4_0) => dot_q4_0_rows(w, a, offs, nb),
             (Acts::K(a), QFormat::Q4K) => kdot::dot_q4_k_rows(w, a, offs, nb),
             (Acts::K(a), QFormat::Q6K) => kdot::dot_q6_k_rows(w, a, offs, nb),
             _ => offs.map(|o| self.dot(fmt, w, o, nb)),
@@ -695,11 +708,14 @@ mod tests {
     /// weight row count) against per-row matrix-vector products.
     #[test]
     fn multi_row_kernels_match_per_row_gemv() {
-        use crate::ops::quant::{quantize_f32_to_q4_k, quantize_f32_to_q6_k};
+        use crate::ops::quant::{quantize_f32_to_q4_0, quantize_f32_to_q4_k, quantize_f32_to_q6_k};
         let (n, k) = (38, 512);
         let wf = data(n * k, 5);
+        let mut q4_0 = vec![0u8; n * k / QK * Q4_0_BYTES];
+        quantize_f32_to_q4_0(&wf, &mut q4_0);
         for (fmt, w) in [
             (QFormat::Q8_0, q8_0_weights(&wf)),
+            (QFormat::Q4_0, q4_0),
             (QFormat::Q4K, quantize_f32_to_q4_k(&wf)),
             (QFormat::Q6K, quantize_f32_to_q6_k(&wf)),
         ] {
