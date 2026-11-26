@@ -140,9 +140,8 @@ const DECODE_MIN_GROUPS: usize = 32;
 const DECODE_CHUNK_MIN: usize = 64;
 
 /// Rows at or below which a linear layer uses matrix-vector kernels; larger batches use
-/// the few-row MMA GEMM (`mvm`, Q8_0/Q4_0, up to [`MVM_ROWS`]), the small-batch GEMM
-/// (`mms`) or the tiled GEMM. Measured end to end on Llama-3.2-1B (M4) at 3-4 rows: `mms`
-/// is ~25% faster for K-quants. F32 weights have no `mms`.
+/// the few-row MMA GEMM (`mvm`, quantized weights, [`MVM_ROWS`]), the small-batch GEMM
+/// (`mms`) or the tiled GEMM. F32 weights have no `mms`.
 fn mv_max_rows(kind: WKind) -> usize {
     match kind {
         WKind::F32 => 8,
@@ -152,20 +151,21 @@ fn mv_max_rows(kind: WKind) -> usize {
     }
 }
 
-/// Rows handled by the few-row MMA GEMM (`mvm`) for Q8_0 and Q4_0 weights, which reads
-/// F32 activations. One row keeps `mv` (as fast or faster). Measured on Llama-3.2-1B (M4)
+/// Rows handled by the few-row MMA GEMM (`mvm`) for quantized weights, which reads F32
+/// activations. One row keeps `mv` (as fast or faster). Measured on Llama-3.2-1B (M4)
 /// with 16 sequences decoding together: a 16-row `mvm` was ~10% slower than `mmh` with
-/// split-K, and equal at 12.
+/// split-K, and equal at 12. For Q4_K and Q6_K it replaces `mv2` and `mms` (17-28% less
+/// time per layer at 2-8 rows).
 const MVM_ROWS: std::ops::RangeInclusive<usize> = 2..=8;
 
 fn uses_mvm(kind: WKind, m: usize) -> bool {
-    matches!(kind, WKind::Q8 | WKind::Q4) && MVM_ROWS.contains(&m)
+    !matches!(kind, WKind::F32 | WKind::F16) && MVM_ROWS.contains(&m)
 }
 
 /// (8-row weight tiles, simdgroups) per `mvm` threadgroup; matches the shader
 /// instantiations.
 fn mvm_shape(kind: WKind) -> (u64, u64) {
-    if kind == WKind::Q4 { (2, 8) } else { (1, 16) }
+    if kind == WKind::Q8 { (1, 16) } else { (2, 8) }
 }
 
 /// Whether a linear segment of this format reads its input as half precision (`xh`) for
@@ -254,7 +254,7 @@ impl MetalLlama {
             "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
             "mm_q4_k", "mm_q6_k", "mml_q8_0", "mml_q4_0", "mml_f16", "mml_q4_k", "mml_q6_k", "mml1_q8_0", "mml1_q4_0", "mml1_f16", "mml1_q4_k", "mml1_q6_k", "mmlg_q8_0", "mmlg_q4_0", "mmlg_f16", "mmlg_q4_k", "mmlg_q6_k", "mmlg1_q8_0", "mmlg1_q4_0", "mmlg1_f16", "mmlg1_q4_k", "mmlg1_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
             "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "swiglu_i", "swiglu_ih", "attn_reduce", "split_k_reduce",
-            "mvm_q8_0", "mvm_q4_0",
+            "mvm_q8_0", "mvm_q4_0", "mvm_q4_k", "mvm_q6_k",
         ];
         let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
             .iter()
