@@ -56,27 +56,27 @@ Exact token parity across engines is only expected where both use the same arith
 
 | model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
 | --- | --- | --- | ---: | ---: | ---: |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 | 1,599 | 1,390 | 0.87x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 | 1,647 | 1,508 | 0.92x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 | 67 | 64 | 0.96x |
-| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp128 | 1,546 | 1,327 | 0.86x |
-| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp512 | 1,592 | 1,436 | 0.90x |
-| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | tg128 | 112 | 114 | 1.02x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 | 1,629 | 1,386 | 0.85x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 | 1,672 | 1,489 | 0.89x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 | 108 | 112 | 1.04x |
-| SmolLM2-135M-Instruct-Q8_0 | metal | pp128 | 9,468 | 8,359 | 0.88x |
-| SmolLM2-135M-Instruct-Q8_0 | metal | pp512 | 10,958 | 9,910 | 0.90x |
-| SmolLM2-135M-Instruct-Q8_0 | metal | tg128 | 270 | 331 | 1.23x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp128 | 9,538 | 8,273 | 0.87x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp512 | 10,273 | 9,732 | 0.95x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | tg128 | 378 | 389 | 1.03x |
-| SmolLM2-135M-Instruct-Q4_0.requant | metal | pp128 | 10,249 | 7,294 | 0.71x |
-| SmolLM2-135M-Instruct-Q4_0.requant | metal | pp512 | 10,924 | 9,813 | 0.90x |
-| SmolLM2-135M-Instruct-Q4_0.requant | metal | tg128 | 349 | 411 | 1.18x |
-| SmolLM2-135M-Instruct-F16.requant | metal | pp128 | 8,822 | 8,669 | 0.98x |
-| SmolLM2-135M-Instruct-F16.requant | metal | pp512 | 11,272 | 10,475 | 0.93x |
-| SmolLM2-135M-Instruct-F16.requant | metal | tg128 | 214 | 236 | 1.10x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 | 1,611 | 1,542 | 0.96x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 | 1,667 | 1,609 | 0.97x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 | 74 | 79 | 1.07x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp128 | 1,560 | 1,478 | 0.95x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp512 | 1,608 | 1,543 | 0.96x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | tg128 | 115 | 117 | 1.02x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 | 1,647 | 1,546 | 0.94x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 | 1,687 | 1,601 | 0.95x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 | 120 | 121 | 1.01x |
+| SmolLM2-135M-Instruct-Q8_0 | metal | pp128 | 10,585 | 10,817 | 1.02x |
+| SmolLM2-135M-Instruct-Q8_0 | metal | pp512 | 11,188 | 11,858 | 1.06x |
+| SmolLM2-135M-Instruct-Q8_0 | metal | tg128 | 379 | 384 | 1.02x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp128 | 9,966 | 10,618 | 1.07x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp512 | 10,600 | 11,638 | 1.10x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | tg128 | 383 | 398 | 1.04x |
+| SmolLM2-135M-Instruct-Q4_0.requant | metal | pp128 | 10,776 | 10,887 | 1.01x |
+| SmolLM2-135M-Instruct-Q4_0.requant | metal | pp512 | 11,298 | 11,814 | 1.05x |
+| SmolLM2-135M-Instruct-Q4_0.requant | metal | tg128 | 456 | 461 | 1.01x |
+| SmolLM2-135M-Instruct-F16.requant | metal | pp128 | 10,709 | 11,127 | 1.04x |
+| SmolLM2-135M-Instruct-F16.requant | metal | pp512 | 11,594 | 12,414 | 1.07x |
+| SmolLM2-135M-Instruct-F16.requant | metal | tg128 | 271 | 266 | 0.98x |
 
 SmolLM2-135M pp128 on Metal is noisy in this script (single runs of the same build vary by up to ~20%).
 
@@ -86,18 +86,24 @@ SmolLM2-135M pp128 on Metal is noisy in this script (single runs of the same bui
 
 | model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
 | --- | --- | --- | ---: | ---: | ---: |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 @ d2048 | 1,351 | 1,180 | 0.87x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 @ d2048 | 1,397 | 1,274 | 0.91x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 @ d2048 | 104 | 95 | 0.92x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 @ d2048 | 1,328 | 1,187 | 0.89x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 @ d2048 | 1,378 | 1,291 | 0.94x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 @ d2048 | 68 | 62 | 0.91x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 @ d8192 | 900 | 823 | 0.91x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 @ d8192 | 928 | 884 | 0.95x |
-| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 @ d8192 | 86 | 66 | 0.77x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 @ d8192 | 843 | 816 | 0.97x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 @ d8192 | 867 | 855 | 0.99x |
-| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 @ d8192 | 59 | 48 | 0.81x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 @ d2048 | 1,355 | 1,296 | 0.96x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 @ d2048 | 1,395 | 1,347 | 0.97x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 @ d2048 | 108 | 106 | 0.99x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 @ d2048 | 1,332 | 1,294 | 0.97x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 @ d2048 | 1,378 | 1,358 | 0.99x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 @ d2048 | 69 | 70 | 1.02x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp128 @ d2048 | 1,299 | 1,234 | 0.95x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp512 @ d2048 | 1,323 | 1,257 | 0.95x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | tg128 @ d2048 | 102 | 104 | 1.02x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 @ d8192 | 842 | 818 | 0.97x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 @ d8192 | 866 | 858 | 0.99x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 @ d8192 | 90 | 87 | 0.96x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp128 @ d8192 | 834 | 821 | 0.98x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | pp512 @ d8192 | 863 | 864 | 1.00x |
+| Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 @ d8192 | 63 | 62 | 0.99x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp128 @ d8192 | 816 | 798 | 0.98x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp512 @ d8192 | 843 | 841 | 1.00x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | tg128 @ d8192 | 87 | 85 | 0.97x |
 | Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp128 @ d2048 | 134 | 190 | 1.42x |
 | Llama-3.2-1B-Instruct-Q4_0.requant | cpu | pp512 @ d2048 | 128 | 213 | 1.67x |
 | Llama-3.2-1B-Instruct-Q4_0.requant | cpu | tg128 @ d2048 | 46 | 66 | 1.43x |
@@ -195,12 +201,32 @@ Since PR #28 (few-row Metal GEMM, below), Metal one-pass batches of 2 / 4 / 8 to
 
 Before PR #28, 1B Q4_0 was at 0.79x with 4 sequences (247 tok/s): a 4-row step cost more than an 8-row one. Before PR #29, 1B Q4_K_M was at 0.84–0.93x with 2–8 sequences.
 
-**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.03–1.23x) and Llama-3.2-1B Q4_0 (1.04x); Metal batches of 2–8 tokens on 1B Q4_0 (1.10–1.15x) and 2–8 sequences decoding together (Q4_0/Q8_0 0.99–1.16x, Q4_K_M 0.97–1.06x).
-**At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
+**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on Llama-3.2-1B Q8_0 (1.07x); Metal prompt processing on SmolLM2-135M in every format (1.01–1.10x); Metal batches of 2–8 tokens on 1B Q4_0 (1.10–1.15x) and 2–8 sequences decoding together (Q4_0/Q8_0 0.99–1.16x, Q4_K_M 0.97–1.06x).
+**At parity (within ~5%):** decode on Llama-3.2-1B in every format on CPU (0.95–1.04x) and the other formats on Metal (1.01–1.02x); Metal decode on SmolLM2-135M (0.98–1.04x); Metal at 2k and 8k context on Llama-3.2-1B (prompts 0.95–1.00x, decode 0.96–1.02x).
 **Behind:**
-- Metal prompt processing on Llama-3.2-1B, 0.94–0.96x (128–512 tokens); SmolLM2 F16 is at parity or ahead (0.99–1.07x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
+- Metal prompt processing on Llama-3.2-1B, 0.94–0.97x (128–512 tokens); SmolLM2 is ahead in every format (1.01–1.10x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
-- Metal decode at 4k context: SmolLM2 F16 0.95x (1B Q4_K_M 0.99x since PR #30; Q8_0 and Q4_0 at parity). Decode attention reaches ~80 GB/s of the ~100 GB/s a plain streaming read gets; see "Metal decode attention" below.
+
+**Metal Q8_0 decode with split K (PR #31)**
+
+Re-measuring the tables showed Metal long-context decode at 0.96–1.02x, not the 0.77–0.92x listed before (those rows predated the decode-attention work in PR #26). 1B Q8_0 decode was the largest remaining gap (0.96x, 0.94x at 8k context). Our `mv_q8_0` gives each simdgroup 4 weight rows, and each lane covers the whole row. llama.cpp's `kernel_mul_mv_q8_0_f32` instead splits a row's K over 4 simdgroups and adds their sums through threadgroup memory. A port (`mvs_q8_0`, MIT) with one row and 8 simdgroups per threadgroup is fastest. Per 1B layer at one row (`tests/gemm_bench.rs`, µs, 3 runs):
+
+| kernel | rows / simdgroups per threadgroup | Q8_0 |
+| --- | --- | ---: |
+| `mv_q8_0` | 8 / 2 | 637–642 |
+| split K | 2 / 4 (llama.cpp's choice) | 611–617 |
+| split K (used) | 1 / 8 | 580–586 |
+| split K | 2 / 8, 4 / 8, 2 / 16, 4 / 16 | 588–604 |
+
+That is ~111 GB/s of weight reads. On SmolLM2-135M, whose 576-value rows have 18 blocks, most of the 8 simdgroups would idle and decode was 20% slower. So `mvs_q8_0` only runs on rows of at least 2,048 values, and SmolLM2 keeps `mv_q8_0`. Decode tok/s, interleaved A/B (4 rounds; 2 at 4k context), with llama-bench on the same machine:
+
+| model | before | after | llama.cpp | rllm / llama.cpp |
+| --- | ---: | ---: | ---: | ---: |
+| 1B Q8_0, tg128 | 69.6 | 76.0 (+9%) | 72.6 | 1.05x |
+| 1B Q8_0, tg128 at 4k context | 62.9 | 68.3 (+9%) | 67.7 | 1.01x |
+| SmolLM2 Q8_0, tg128 | 376 | 375 | 376 | 1.00x |
+
+The Metal tables above were re-run after this change. Tests: the token-by-token Metal test with a 2048-wide model runs `mvs_q8_0`. A skipped simdgroup in the reduction, a wrong activation offset or an ignored `accumulate` each fail it.
 
 **Metal K-quant decode kernels (PR #30)**
 

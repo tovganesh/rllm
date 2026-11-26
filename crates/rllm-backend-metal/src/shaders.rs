@@ -198,8 +198,43 @@ kernel void NAME(LINEAR_ARGS, uint tg [[threadgroup_position_in_grid]], \
     mv_impl<TAG>(w, x, y, n, k, m, accumulate, ldy, tg, sg, lane); }
 
 MV_KERNEL(mv_f32, WF32)
-MV_KERNEL(mv_q8_0, WQ8)
 MV_KERNEL(mv_f16, WF16)
+
+MV_KERNEL(mv_q8_0, WQ8)
+
+// ── Q8_0 matrix-vector with split K (after llama.cpp's kernel_mul_mv_q8_0_f32, MIT) ──
+// One activation row (m = 1), one weight row per threadgroup; its 8 simdgroups split K
+// (4 lanes per block, 8 values each, 64 blocks per step) and add their sums through
+// threadgroup memory. Used for rows of at least 64 blocks (`MV_SPLIT_MIN_COLS` in
+// llama.rs): per Llama-3.2-1B layer on an M4 9% faster than `mv_q8_0` (2 simdgroups x 4
+// rows, every lane over all K); 2 or 4 rows per threadgroup and 2, 4 or 16 simdgroups
+// were 1-15% slower. On SmolLM2-135M (576-value rows) most simdgroups would idle and
+// decode was 20% slower.
+constant constexpr uint MV8_SG = 8;
+kernel void mvs_q8_0(LINEAR_ARGS, uint row [[threadgroup_position_in_grid]],
+                     ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[MV8_SG];
+    const uint nb = k / 32;
+    device const block_q8_0* ax = (device const block_q8_0*)w + (ulong)row * nb;
+    const short il = lane % 4;
+    const uint ib0 = sg * 8 + lane / 4;
+    float sum = 0.0f;
+    device const float* yb = x + ib0 * 32 + il * 8;
+    for (uint ib = ib0; ib < nb; ib += MV8_SG * 8, yb += MV8_SG * 8 * 32) {
+        const float4 y0 = ((device const float4*)yb)[0], y1 = ((device const float4*)yb)[1];
+        device const char* qs = ax[ib].qs + il * 8;
+        const float sq = dot(float4(qs[0], qs[1], qs[2], qs[3]), y0) + dot(float4(qs[4], qs[5], qs[6], qs[7]), y1);
+        sum += sq * float(ax[ib].d);
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) red[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && lane == 0) {
+        float s = 0.0f;
+        for (uint g = 0; g < MV8_SG; ++g) s += red[g];
+        y[row] = accumulate ? y[row] + s : s;
+    }
+}
 
 // ── Q4_0 matrix-vector: two lanes per block, 16 blocks per simdgroup step ──
 // Lane half `il` reads qs[il..il+8] (two-byte loads): low nibbles pair with
