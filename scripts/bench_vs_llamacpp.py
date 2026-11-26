@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Side-by-side throughput of rllm vs llama.cpp on the same model and device.
 
-Usage: python3 scripts/bench_vs_llamacpp.py [--device cpu|metal] [--reps N] [--depth D] <model.gguf> ...
+Usage: python3 scripts/bench_vs_llamacpp.py [--device cpu|metal] [--reps N] [--depth D] [--threads T] <model.gguf> ...
 Runs `llama-bench` (-ngl 0 for cpu, 99 for metal) and `rllm bench --model` with
 pp128, pp512 and tg128, and prints tokens/s and the rllm / llama.cpp ratio. With
---depth D every test runs after D tokens of context (llama-bench -d, rllm --depth).
+--depth D every test runs after D tokens of context (llama-bench -d, rllm --depth). With
+--threads T both use T CPU threads (llama-bench -t, rllm --threads); otherwise each uses
+its default. LLAMA_BENCH overrides the llama-bench executable.
 Requires a release build of rllm (`cargo build --release -p rllm-cli`).
 """
 import csv, io, os, re, subprocess, sys
@@ -18,22 +20,26 @@ if "--reps" in args:
 depth = 0
 if "--depth" in args:
     i = args.index("--depth"); depth = int(args[i + 1]); del args[i:i + 2]
+threads = None
+if "--threads" in args:
+    i = args.index("--threads"); threads = args[i + 1]; del args[i:i + 2]
 at = f" @ d{depth}" if depth else ""
+llama_bench = os.environ.get("LLAMA_BENCH", "llama-bench")
 ngl = "0" if device == "cpu" else "99"
 rllm = os.path.join(os.path.dirname(__file__), "..", "target", "release", "rllm")
 
 print(f"| model | device | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |")
 print(f"| --- | --- | --- | ---: | ---: | ---: |")
 for model in args:
-    out = subprocess.run(["llama-bench", "-m", model, "-ngl", ngl, "-p", "128,512", "-n", "128", "-r", str(reps), "-d", str(depth), "-o", "csv"],
-                         capture_output=True, text=True).stdout
+    cmd = [llama_bench, "-m", model, "-ngl", ngl, "-p", "128,512", "-n", "128", "-r", str(reps), "-d", str(depth), "-o", "csv"]
+    out = subprocess.run(cmd + (["-t", threads] if threads else []), capture_output=True, text=True).stdout
     ref = {}
     for row in csv.DictReader(io.StringIO(out)):
         key = f"pp{row['n_prompt']}" if int(row["n_gen"]) == 0 else f"tg{row['n_gen']}"
         ref[key] = float(row["avg_ts"])
     ours = {}
     for pp in (128, 512):
-        o = subprocess.run([rllm, "--device", device, "bench", "--model", model, "--prompt-tokens", str(pp),
+        o = subprocess.run([rllm, "--device", device] + (["--threads", threads] if threads else []) + ["bench", "--model", model, "--prompt-tokens", str(pp),
                             "--generate-tokens", "128", "--repetitions", str(reps), "--depth", str(depth)],
                            capture_output=True, text=True).stdout
         for test, ts in re.findall(r"\| (pp\d+|tg\d+)(?: @ d\d+)? \| ([0-9.]+) \|", o):
