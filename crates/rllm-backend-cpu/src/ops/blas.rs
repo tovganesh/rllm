@@ -73,8 +73,20 @@ mod accelerate {
         // SAFETY: a is m*k, w is n*k, c holds (m-1)*ldc + n elements (checked by caller).
         unsafe {
             cblas_sgemm(
-                ROW_MAJOR, NO_TRANS, TRANS, m as i32, n as i32, k as i32, 1.0, a.as_ptr(), k as i32,
-                w.as_ptr(), k as i32, 0.0, c.as_mut_ptr(), ldc as i32,
+                ROW_MAJOR,
+                NO_TRANS,
+                TRANS,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                a.as_ptr(),
+                k as i32,
+                w.as_ptr(),
+                k as i32,
+                0.0,
+                c.as_mut_ptr(),
+                ldc as i32,
             );
         }
     }
@@ -85,8 +97,20 @@ mod accelerate {
         // dimensions describe contiguous row-major storage.
         unsafe {
             cblas_sgemm(
-                ROW_MAJOR, NO_TRANS, TRANS, m as i32, n as i32, k as i32, 1.0, a.as_ptr(), k as i32,
-                w.as_ptr(), k as i32, 0.0, c.as_mut_ptr(), n as i32,
+                ROW_MAJOR,
+                NO_TRANS,
+                TRANS,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                a.as_ptr(),
+                k as i32,
+                w.as_ptr(),
+                k as i32,
+                0.0,
+                c.as_mut_ptr(),
+                n as i32,
             );
         }
     }

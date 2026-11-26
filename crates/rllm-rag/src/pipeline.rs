@@ -17,7 +17,10 @@ use crate::grounding::{extract_content_keywords, extract_grounded_quote};
 use crate::hybrid::HybridIndex;
 use crate::reranker::CrossEncoderReranker;
 use parking_lot::Mutex;
-use rllm_core::{backend::Backend, error::{Result, RllmError}};
+use rllm_core::{
+    backend::Backend,
+    error::{Result, RllmError},
+};
 use rllm_models::{BpeTokenizer, ChatMessage, ChatTemplate, TextEmbedder};
 use rllm_scheduler::{EngineHandle, SamplingParams, SequenceEvent};
 use serde::{Deserialize, Serialize};
@@ -201,7 +204,11 @@ impl<B: Backend> RagEngine<B> {
                 .search(query, &q_emb, top_k.max(1) * 2)
                 .into_iter()
                 .map(|m| {
-                    let d = if use_dense { index.dense_similarity(m.chunk_idx, &q_emb) } else { None };
+                    let d = if use_dense {
+                        index.dense_similarity(m.chunk_idx, &q_emb)
+                    } else {
+                        None
+                    };
                     (m.chunk, d)
                 })
                 .unzip()
@@ -265,7 +272,12 @@ impl<B: Backend> RagEngine<B> {
     ) -> Result<RagResponse> {
         let retrieval = self.retrieve(query, top_k, min_lexical)?;
         if !retrieval.is_relevant {
-            return Ok(unrelated_response(query, &retrieval, min_lexical.unwrap_or(self.min_relevance_threshold), self.min_dense_similarity));
+            return Ok(unrelated_response(
+                query,
+                &retrieval,
+                min_lexical.unwrap_or(self.min_relevance_threshold),
+                self.min_dense_similarity,
+            ));
         }
         let mut citations = retrieval.citations;
 
@@ -274,7 +286,9 @@ impl<B: Backend> RagEngine<B> {
                 let max_pos = generator.engine.scheduler().model.config().max_position_embeddings;
                 // Drop the weakest sources until the prompt leaves room for the answer.
                 let prompt_tokens = loop {
-                    let prompt = generator.chat_template.render(&grounded_messages(query, &citations), true)?;
+                    let prompt = generator
+                        .chat_template
+                        .render(&grounded_messages(query, &citations), true)?;
                     let tokens = generator.tokenizer.encode(&prompt, true, true);
                     if tokens.len() + sampling.max_tokens < max_pos || citations.len() <= 1 {
                         break tokens;
@@ -299,7 +313,11 @@ impl<B: Backend> RagEngine<B> {
                 if out.last().is_some_and(|t| stops.contains(t)) {
                     out.pop();
                 }
-                (generator.tokenizer.decode(&out, true).trim().to_string(), "llm", generated)
+                (
+                    generator.tokenizer.decode(&out, true).trim().to_string(),
+                    "llm",
+                    generated,
+                )
             }
             None => (extractive_answer(&citations), "extractive", 0),
         };
@@ -326,7 +344,10 @@ pub fn grounded_messages(query: &str, citations: &[Citation]) -> Vec<ChatMessage
     for (i, c) in citations.iter().enumerate() {
         system.push_str(&format!("[{}] {}\n", i + 1, c.passage.trim()));
     }
-    vec![ChatMessage::new("system", system.trim_end()), ChatMessage::new("user", query)]
+    vec![
+        ChatMessage::new("system", system.trim_end()),
+        ChatMessage::new("user", query),
+    ]
 }
 
 /// Answer listing the grounded quote of each source, used without an LLM.
@@ -360,7 +381,10 @@ pub fn verify_citations(answer: &str, citations: &mut [Citation]) -> Option<Stri
         i += 1;
     }
     if !invalid.is_empty() {
-        Some(format!("The answer cites sources that do not exist: {}", invalid.join(", ")))
+        Some(format!(
+            "The answer cites sources that do not exist: {}",
+            invalid.join(", ")
+        ))
     } else if !citations.iter().any(|c| c.cited_in_answer) {
         Some("The answer does not cite any of the retrieved sources.".to_string())
     } else {
@@ -414,12 +438,17 @@ mod tests {
     fn verify_marks_cited_sources_and_flags_invalid_ones() {
         let mut c = vec![cit("a"), cit("b"), cit("c")];
         assert_eq!(verify_citations("Water boils at 100 °C [1][3].", &mut c), None);
-        assert_eq!(c.iter().map(|c| c.cited_in_answer).collect::<Vec<_>>(), vec![true, false, true]);
+        assert_eq!(
+            c.iter().map(|c| c.cited_in_answer).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
 
         let mut c = vec![cit("a")];
         assert!(verify_citations("See [2] and [x].", &mut c).unwrap().contains("[2]"));
         let mut c = vec![cit("a")];
-        assert!(verify_citations("No citations here.", &mut c).unwrap().contains("does not cite"));
+        assert!(verify_citations("No citations here.", &mut c)
+            .unwrap()
+            .contains("does not cite"));
     }
 
     #[test]

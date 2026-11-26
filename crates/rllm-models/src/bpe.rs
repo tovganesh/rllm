@@ -19,8 +19,7 @@ mod token_type {
     pub const USER_DEFINED: i64 = 4;
 }
 
-const GPT2_PATTERN: &str =
-    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)";
+const GPT2_PATTERN: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)";
 const LLAMA3_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const QWEN2_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
@@ -93,9 +92,8 @@ impl BpeTokenizer {
             .get("tokenizer.ggml.pre")
             .and_then(GgufValue::as_str)
             .unwrap_or("default");
-        let (patterns, ignore_merges) = pre_tokenizer(pre).ok_or_else(|| {
-            RllmError::ModelError(format!("Unsupported BPE pre-tokenizer '{pre}'"))
-        })?;
+        let (patterns, ignore_merges) = pre_tokenizer(pre)
+            .ok_or_else(|| RllmError::ModelError(format!("Unsupported BPE pre-tokenizer '{pre}'")))?;
 
         let tokens: Vec<String> = string_array(g, "tokenizer.ggml.tokens")?;
         let types: Vec<i64> = match g.get("tokenizer.ggml.token_type").and_then(GgufValue::as_array) {
@@ -115,11 +113,23 @@ impl BpeTokenizer {
         tok.add_bos = flag("tokenizer.ggml.add_bos_token").unwrap_or(llama3_family);
         tok.add_eos = flag("tokenizer.ggml.add_eos_token").unwrap_or(false);
 
-        let mut stops: Vec<u32> = ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"]
-            .iter()
-            .filter_map(|k| id(k))
-            .collect();
-        for marker in ["<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>", "<|end_of_text|>", "<|eom_id|>"] {
+        let mut stops: Vec<u32> = [
+            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.eot_token_id",
+            "tokenizer.ggml.eom_token_id",
+        ]
+        .iter()
+        .filter_map(|k| id(k))
+        .collect();
+        for marker in [
+            "<|eot_id|>",
+            "<|im_end|>",
+            "<|end|>",
+            "<end_of_turn>",
+            "<|endoftext|>",
+            "<|end_of_text|>",
+            "<|eom_id|>",
+        ] {
             if let Some(&i) = tok.token_to_id.get(marker) {
                 if tok.is_special[i as usize] {
                     stops.push(i);
@@ -139,11 +149,15 @@ impl BpeTokenizer {
         patterns: &[&str],
         ignore_merges: bool,
     ) -> Result<Self> {
-        let token_to_id: HashMap<String, u32> =
-            tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        let token_to_id: HashMap<String, u32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
 
         let is_special: Vec<bool> = (0..tokens.len())
-            .map(|i| matches!(types.get(i), Some(&token_type::CONTROL) | Some(&token_type::USER_DEFINED)))
+            .map(|i| {
+                matches!(
+                    types.get(i),
+                    Some(&token_type::CONTROL) | Some(&token_type::USER_DEFINED)
+                )
+            })
             .collect();
         let mut specials_by_len: Vec<(String, u32)> = tokens
             .iter()
@@ -159,7 +173,9 @@ impl BpeTokenizer {
             // first character (which may be multi-byte, e.g. 'Ġ').
             let Some(first) = m.chars().next() else { continue };
             let skip = first.len_utf8();
-            let Some(split) = m[skip..].find(' ').map(|p| p + skip) else { continue };
+            let Some(split) = m[skip..].find(' ').map(|p| p + skip) else {
+                continue;
+            };
             let (l, r) = (&m[..split], &m[split + 1..]);
             let merged = format!("{l}{r}");
             if let (Some(&li), Some(&ri), Some(&mi)) =
@@ -328,7 +344,9 @@ impl BpeTokenizer {
 
     /// Raw bytes of one token (special tokens yield their literal text).
     pub fn token_bytes(&self, id: u32) -> Vec<u8> {
-        let Some(tok) = self.tokens.get(id as usize) else { return Vec::new() };
+        let Some(tok) = self.tokens.get(id as usize) else {
+            return Vec::new();
+        };
         if self.is_special[id as usize] {
             return tok.as_bytes().to_vec();
         }
@@ -426,10 +444,17 @@ mod tests {
         }
         let mut types = vec![1i64; tokens.len()];
         types[0] = token_type::CONTROL;
-        let merges: Vec<String> = [("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o"), (" ", "w"), (" w", "o")]
-            .iter()
-            .map(|(a, b)| format!("{} {}", g(a), g(b)))
-            .collect();
+        let merges: Vec<String> = [
+            ("h", "e"),
+            ("l", "l"),
+            ("he", "ll"),
+            ("hell", "o"),
+            (" ", "w"),
+            (" w", "o"),
+        ]
+        .iter()
+        .map(|(a, b)| format!("{} {}", g(a), g(b)))
+        .collect();
         BpeTokenizer::build(tokens, &types, &merges, &[GPT2_PATTERN], false).unwrap()
     }
 

@@ -69,11 +69,17 @@ pub fn started() -> bool {
 fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         let workers = crate::threads::decode_threads().saturating_sub(1);
-        let spin_us = std::env::var("RLLM_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
+        let spin_us = std::env::var("RLLM_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200u64);
         let p: &'static Pool = Box::leak(Box::new(Pool {
             workers,
             epoch: AtomicU64::new(0),
-            job: UnsafeCell::new(Job { f: &NOOP as &Task<'static> as *const Task<'static>, n: 0 }),
+            job: UnsafeCell::new(Job {
+                f: &NOOP as &Task<'static> as *const Task<'static>,
+                n: 0,
+            }),
             next: AtomicUsize::new(0),
             done: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
@@ -164,7 +170,10 @@ pub fn for_each_index(n: usize, f: impl Fn(usize) + Sync) {
     // before the previous caller released `busy`). The closure's lifetime is erased;
     // it is only used until every worker reports done below.
     unsafe {
-        *p.job.get() = Job { f: std::mem::transmute::<&Task<'_>, &Task<'static>>(f_dyn) as *const Task<'static>, n };
+        *p.job.get() = Job {
+            f: std::mem::transmute::<&Task<'_>, &Task<'static>>(f_dyn) as *const Task<'static>,
+            n,
+        };
     }
     p.next.store(0, Ordering::Relaxed);
     p.done.store(0, Ordering::Relaxed);

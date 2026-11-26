@@ -55,16 +55,14 @@ pub fn gemv_f32(mat: &[f32], vec: &[f32], out: &mut [f32], n: usize, k: usize) {
 
     let rows = super::gemv_rows_per_task(k * 4);
     if n > rows {
-        out.par_chunks_mut(rows)
-            .enumerate()
-            .for_each(|(chunk_idx, out_chunk)| {
-                let row_start = chunk_idx * rows;
-                for (i, val) in out_chunk.iter_mut().enumerate() {
-                    let row = row_start + i;
-                    let mat_row = &mat[row * k..(row + 1) * k];
-                    *val = dot_f32(mat_row, vec);
-                }
-            });
+        out.par_chunks_mut(rows).enumerate().for_each(|(chunk_idx, out_chunk)| {
+            let row_start = chunk_idx * rows;
+            for (i, val) in out_chunk.iter_mut().enumerate() {
+                let row = row_start + i;
+                let mat_row = &mat[row * k..(row + 1) * k];
+                *val = dot_f32(mat_row, vec);
+            }
+        });
     } else {
         for row in 0..n {
             let mat_row = &mat[row * k..(row + 1) * k];
@@ -77,14 +75,7 @@ pub fn gemv_f32(mat: &[f32], vec: &[f32], out: &mut [f32], n: usize, k: usize) {
 ///
 /// Parallelised over rows of `C`. The inner loop is an AXPY over a contiguous row of
 /// `B`, so memory is streamed sequentially (no column-strided access).
-pub fn gemm_f32(
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-    m: usize,
-    k: usize,
-    n: usize,
-) {
+pub fn gemm_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), k * n);
     debug_assert_eq!(c.len(), m * n);
@@ -116,14 +107,7 @@ pub fn gemm_f32(
 /// `[out_features, in_features]`: every output element is a dot product of two
 /// contiguous rows. Parallelised over output columns for small `M` (decode) and over
 /// rows of `C` otherwise.
-pub fn gemm_nt_f32(
-    a: &[f32],
-    w: &[f32],
-    c: &mut [f32],
-    m: usize,
-    k: usize,
-    n: usize,
-) {
+pub fn gemm_nt_f32(a: &[f32], w: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(w.len(), n * k);
     debug_assert_eq!(c.len(), m * n);

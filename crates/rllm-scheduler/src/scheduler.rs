@@ -129,8 +129,7 @@ impl ContinuousBatchScheduler {
     pub fn new(config: SchedulerConfig, model: Arc<dyn LanguageModel>) -> Result<Self> {
         if config.block_size == 0 || config.total_blocks == 0 || config.max_batch_size == 0 {
             return Err(RllmError::BackendError(
-                "SchedulerConfig: block_size, total_blocks and max_batch_size must be > 0"
-                    .to_string(),
+                "SchedulerConfig: block_size, total_blocks and max_batch_size must be > 0".to_string(),
             ));
         }
         let block_size = config.block_size;
@@ -191,7 +190,8 @@ impl ContinuousBatchScheduler {
         {
             return Err(RllmError::BackendError(format!(
                 "Token ID {} exceeds vocabulary size {}",
-                bad, self.model.config().vocab_size
+                bad,
+                self.model.config().vocab_size
             )));
         }
         if seq.sampling_params.max_tokens == 0 {
@@ -280,7 +280,10 @@ impl ContinuousBatchScheduler {
             }
             // Preempt the newest sequence (possibly this one) and retry.
             let mut victim = running.pop().expect("running is non-empty");
-            warn!("KV cache exhausted: preempting sequence {} for recomputation", victim.id);
+            warn!(
+                "KV cache exhausted: preempting sequence {} for recomputation",
+                victim.id
+            );
             *num_preemptions += 1;
             allocator.free_table(&mut victim.block_table);
             victim.num_computed_tokens = 0;
@@ -297,8 +300,7 @@ impl ContinuousBatchScheduler {
 
             // Reuse cached KV blocks, always leaving at least one token to compute so the
             // forward pass produces logits for the last position.
-            let (cached_tokens, cached_blocks) =
-                prefix_cache.match_prefix(&seq.all_tokens()[..total - 1]);
+            let (cached_tokens, cached_blocks) = prefix_cache.match_prefix(&seq.all_tokens()[..total - 1]);
             for &bid in &cached_blocks {
                 allocator.inc_ref(bid);
             }
@@ -306,11 +308,8 @@ impl ContinuousBatchScheduler {
             seq.num_computed_tokens = cached_tokens;
 
             let to_compute = total - cached_tokens;
-            let over_budget =
-                prefill_tokens > 0 && prefill_tokens + to_compute > self.config.max_prefill_tokens;
-            if over_budget
-                || ensure_capacity(allocator, prefix_cache, &mut seq.block_table, total).is_err()
-            {
+            let over_budget = prefill_tokens > 0 && prefill_tokens + to_compute > self.config.max_prefill_tokens;
+            if over_budget || ensure_capacity(allocator, prefix_cache, &mut seq.block_table, total).is_err() {
                 allocator.free_table(&mut seq.block_table);
                 seq.num_computed_tokens = 0;
                 waiting.push_front(seq);
@@ -325,7 +324,9 @@ impl ContinuousBatchScheduler {
                 );
             }
             prefill_tokens += to_compute;
-            self.metrics.cached_prompt_tokens.fetch_add(cached_tokens as u64, Ordering::Relaxed);
+            self.metrics
+                .cached_prompt_tokens
+                .fetch_add(cached_tokens as u64, Ordering::Relaxed);
             seq.status = SequenceStatus::Running;
             running.push(seq);
         }
@@ -358,11 +359,16 @@ impl ContinuousBatchScheduler {
             num_drafts += seq.draft_tokens.len();
         }
 
-        let decode_rows = running.iter().filter(|s| s.total_tokens() - s.num_computed_tokens == 1 && !s.output_tokens.is_empty()).count();
+        let decode_rows = running
+            .iter()
+            .filter(|s| s.total_tokens() - s.num_computed_tokens == 1 && !s.output_tokens.is_empty())
+            .count();
         self.metrics
             .prefill_tokens
             .fetch_add((tokens.len() - decode_rows - num_drafts) as u64, Ordering::Relaxed);
-        self.metrics.draft_tokens.fetch_add(num_drafts as u64, Ordering::Relaxed);
+        self.metrics
+            .draft_tokens
+            .fetch_add(num_drafts as u64, Ordering::Relaxed);
         let started = Instant::now();
         let logits_slice = self.model.forward_cached(&ForwardBatch {
             tokens: &tokens,
@@ -372,7 +378,9 @@ impl ContinuousBatchScheduler {
         })?;
         self.metrics.forward_passes.fetch_add(1, Ordering::Relaxed);
         let elapsed = started.elapsed();
-        self.metrics.forward_time_us.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.metrics
+            .forward_time_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
         if self.config.speculation.enabled() && tokens.len() == decode_rows + num_drafts {
             pass_costs.record(tokens.len(), elapsed.as_secs_f64() * 1e6);
         }
@@ -407,7 +415,8 @@ impl ContinuousBatchScheduler {
                 seq.num_computed_tokens += 1;
                 accepted += 1;
             }
-            seq.draft_stats.record(drafts.len(), (accepted - accepted_before) as usize);
+            seq.draft_stats
+                .record(drafts.len(), (accepted - accepted_before) as usize);
             // Share newly completed blocks right away (not only when the sequence
             // finishes), so concurrent requests with the same prefix — a system prompt,
             // a chat history — reuse them. Full blocks are never written again: later
@@ -419,8 +428,12 @@ impl ContinuousBatchScheduler {
                 }
             }
         }
-        self.metrics.accepted_draft_tokens.fetch_add(accepted, Ordering::Relaxed);
-        self.metrics.generated_tokens.fetch_add(generated.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .accepted_draft_tokens
+            .fetch_add(accepted, Ordering::Relaxed);
+        self.metrics
+            .generated_tokens
+            .fetch_add(generated.len() as u64, Ordering::Relaxed);
 
         // 5. Retire finished sequences.
         self.retire_finished(running, allocator, prefix_cache);
@@ -477,9 +490,16 @@ impl ContinuousBatchScheduler {
     /// Retires finished sequences: hands their computed full blocks to the prefix cache
     /// (which takes its own reference), releases the sequences' references and sends
     /// the terminal `Finished` event.
-    fn retire_finished(&self, running: &mut Vec<Sequence>, allocator: &mut BlockAllocator, prefix_cache: &mut PrefixCache) {
+    fn retire_finished(
+        &self,
+        running: &mut Vec<Sequence>,
+        allocator: &mut BlockAllocator,
+        prefix_cache: &mut PrefixCache,
+    ) {
         running.retain_mut(|seq| {
-            let SequenceStatus::Finished(reason) = seq.status else { return true };
+            let SequenceStatus::Finished(reason) = seq.status else {
+                return true;
+            };
             let computed = &seq.all_tokens()[..seq.num_computed_tokens];
             for bid in prefix_cache.insert_prefix(computed, &seq.block_table.block_ids) {
                 allocator.inc_ref(bid);

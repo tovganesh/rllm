@@ -21,9 +21,8 @@ use crate::config::LlamaConfig;
 use crate::gguf::{GgmlType, GgufFile, GgufValue, MappedGguf};
 use crate::llama::{LlamaAttention, LlamaDecoderLayer, LlamaMlp, LlamaModel};
 use rllm_backend_cpu::ops::quant::{
-    convert_bf16, convert_f16, dequantize_q4_0, dequantize_q4_1, dequantize_q4_k,
-    dequantize_q5_0, dequantize_q5_1, dequantize_q5_k, dequantize_q6_k, dequantize_q8_0,
-    quantize_f32_to_q8_0,
+    convert_bf16, convert_f16, dequantize_q4_0, dequantize_q4_1, dequantize_q4_k, dequantize_q5_0, dequantize_q5_1,
+    dequantize_q5_k, dequantize_q6_k, dequantize_q8_0, quantize_f32_to_q8_0,
 };
 use rllm_backend_cpu::ops::rope::precompute_rope_freqs_scaled;
 use rllm_core::{
@@ -103,9 +102,7 @@ impl LlamaConfig {
             None => g.get_u64(&key("vocab_size"))? as usize,
         };
         let context_length = g.get_u64(&key("context_length"))? as usize;
-        let max_position_embeddings = opts
-            .max_context
-            .map_or(context_length, |cap| cap.min(context_length));
+        let max_position_embeddings = opts.max_context.map_or(context_length, |cap| cap.min(context_length));
 
         Ok(LlamaConfig {
             hidden_size,
@@ -239,7 +236,12 @@ pub(crate) fn load_weight(g: &MappedGguf, name: &str, shape: &[usize], requantiz
         // values in registers.
         let bytes = g.tensor_bytes(info)?;
         let storage = Storage::Cpu(CpuStorage::from_bytes(bytes.to_vec()));
-        return Ok(Tensor::new(Shape::new(shape.to_vec()), DType::F16, Device::Cpu, storage));
+        return Ok(Tensor::new(
+            Shape::new(shape.to_vec()),
+            DType::F16,
+            Device::Cpu,
+            storage,
+        ));
     }
     let lossy_format = native_dtype(ty).is_none() && !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
     let in_features = *shape.last().unwrap_or(&0);
@@ -249,7 +251,12 @@ pub(crate) fn load_weight(g: &MappedGguf, name: &str, shape: &[usize], requantiz
     let dense = load_tensor(g, name, shape, false)?.to_vec::<f32>()?;
     let mut bytes = vec![0u8; dense.len() / 32 * 34];
     quantize_f32_to_q8_0(&dense, &mut bytes);
-    Ok(Tensor::new(Shape::new(shape.to_vec()), DType::Q8_0, Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(bytes))))
+    Ok(Tensor::new(
+        Shape::new(shape.to_vec()),
+        DType::Q8_0,
+        Device::Cpu,
+        Storage::Cpu(CpuStorage::from_bytes(bytes)),
+    ))
 }
 
 /// The stored type of a GGUF tensor kept as-is because the backends have kernels for it.

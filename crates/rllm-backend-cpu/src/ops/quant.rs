@@ -85,53 +85,37 @@ pub fn dot_q8_0_f32(q8_bytes: &[u8], f32_vec: &[f32]) -> f32 {
 
 /// Multiplies a matrix `[N, K]` stored in `Q4_0` by vector `[K]` into `out [N]` in F32.
 /// Eliminates intermediate full-matrix dequantization memory allocations.
-pub fn gemv_q4_0_f32(
-    weight_bytes: &[u8],
-    act: &[f32],
-    out: &mut [f32],
-    n: usize,
-    k: usize,
-) {
+pub fn gemv_q4_0_f32(weight_bytes: &[u8], act: &[f32], out: &mut [f32], n: usize, k: usize) {
     let bytes_per_row = (k / QK4_0) * 18;
     debug_assert_eq!(weight_bytes.len(), n * bytes_per_row);
     debug_assert_eq!(act.len(), k);
     debug_assert_eq!(out.len(), n);
 
-    out.par_chunks_mut(16)
-        .enumerate()
-        .for_each(|(chunk_idx, out_chunk)| {
-            let row_start = chunk_idx * 16;
-            for (i, val) in out_chunk.iter_mut().enumerate() {
-                let row = row_start + i;
-                let row_bytes = &weight_bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
-                *val = dot_q4_0_f32(row_bytes, act);
-            }
-        });
+    out.par_chunks_mut(16).enumerate().for_each(|(chunk_idx, out_chunk)| {
+        let row_start = chunk_idx * 16;
+        for (i, val) in out_chunk.iter_mut().enumerate() {
+            let row = row_start + i;
+            let row_bytes = &weight_bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+            *val = dot_q4_0_f32(row_bytes, act);
+        }
+    });
 }
 
 /// Multiplies a matrix `[N, K]` stored in `Q8_0` by vector `[K]` into `out [N]` in F32.
-pub fn gemv_q8_0_f32(
-    weight_bytes: &[u8],
-    act: &[f32],
-    out: &mut [f32],
-    n: usize,
-    k: usize,
-) {
+pub fn gemv_q8_0_f32(weight_bytes: &[u8], act: &[f32], out: &mut [f32], n: usize, k: usize) {
     let bytes_per_row = (k / QK8_0) * 34;
     debug_assert_eq!(weight_bytes.len(), n * bytes_per_row);
     debug_assert_eq!(act.len(), k);
     debug_assert_eq!(out.len(), n);
 
-    out.par_chunks_mut(16)
-        .enumerate()
-        .for_each(|(chunk_idx, out_chunk)| {
-            let row_start = chunk_idx * 16;
-            for (i, val) in out_chunk.iter_mut().enumerate() {
-                let row = row_start + i;
-                let row_bytes = &weight_bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
-                *val = dot_q8_0_f32(row_bytes, act);
-            }
-        });
+    out.par_chunks_mut(16).enumerate().for_each(|(chunk_idx, out_chunk)| {
+        let row_start = chunk_idx * 16;
+        for (i, val) in out_chunk.iter_mut().enumerate() {
+            let row = row_start + i;
+            let row_bytes = &weight_bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+            *val = dot_q8_0_f32(row_bytes, act);
+        }
+    });
 }
 
 /// Quantizes an F32 slice (length a multiple of 32) into `Q8_0` blocks, like ggml's
@@ -322,7 +306,13 @@ pub fn quantize_f32_to_q4_k(src: &[f32]) -> Vec<u8> {
         let d = f16::from_f32(max_sc / 63.0);
         let dmin = f16::from_f32(max_m / 63.0);
         let (df, dminf) = (d.to_f32(), dmin.to_f32());
-        let q6 = |v: f32, base: f32| if base > 0.0 { (v / base).round().clamp(0.0, 63.0) as u8 } else { 0 };
+        let q6 = |v: f32, base: f32| {
+            if base > 0.0 {
+                (v / base).round().clamp(0.0, 63.0) as u8
+            } else {
+                0
+            }
+        };
         let ls: Vec<u8> = scales.iter().map(|&v| q6(v, df)).collect();
         let lm: Vec<u8> = mins.iter().map(|&v| q6(v, dminf)).collect();
         let mut packed = [0u8; 12];
@@ -341,7 +331,11 @@ pub fn quantize_f32_to_q4_k(src: &[f32]) -> Vec<u8> {
             let (sc, m) = scale_min_k4(j, &packed);
             let (step, off) = (df * sc, dminf * m);
             for l in 0..32 {
-                let q = if step > 0.0 { ((x[j * 32 + l] + off) / step).round().clamp(0.0, 15.0) as u8 } else { 0 };
+                let q = if step > 0.0 {
+                    ((x[j * 32 + l] + off) / step).round().clamp(0.0, 15.0) as u8
+                } else {
+                    0
+                };
                 let byte = &mut qs[(j / 2) * 32 + l];
                 *byte |= if j % 2 == 0 { q } else { q << 4 };
             }
@@ -359,16 +353,32 @@ pub fn quantize_f32_to_q4_k(src: &[f32]) -> Vec<u8> {
 pub fn quantize_f32_to_q6_k(src: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len() / QK_K * 210);
     for x in src.chunks_exact(QK_K) {
-        let group_scale: Vec<f32> = x.chunks_exact(16).map(|g| g.iter().fold(0f32, |m, v| m.max(v.abs())) / 31.0).collect();
+        let group_scale: Vec<f32> = x
+            .chunks_exact(16)
+            .map(|g| g.iter().fold(0f32, |m, v| m.max(v.abs())) / 31.0)
+            .collect();
         let max_sc = group_scale.iter().cloned().fold(0f32, f32::max);
         let d = f16::from_f32(max_sc / 127.0);
         let df = d.to_f32();
-        let sc: Vec<i8> = group_scale.iter().map(|&v| if df > 0.0 { (v / df).round().clamp(-128.0, 127.0) as i8 } else { 0 }).collect();
+        let sc: Vec<i8> = group_scale
+            .iter()
+            .map(|&v| {
+                if df > 0.0 {
+                    (v / df).round().clamp(-128.0, 127.0) as i8
+                } else {
+                    0
+                }
+            })
+            .collect();
         let mut ql = [0u8; 128];
         let mut qh = [0u8; 64];
         for (p, &v) in x.iter().enumerate() {
             let step = df * sc[p / 16] as f32;
-            let q = if step != 0.0 { (v / step).round().clamp(-32.0, 31.0) as i32 + 32 } else { 32 } as u8;
+            let q = if step != 0.0 {
+                (v / step).round().clamp(-32.0, 31.0) as i32 + 32
+            } else {
+                32
+            } as u8;
             let (half, lo) = (p / 128, p % 128);
             let (g, l) = (lo / 32, lo % 32);
             let qli = half * 64 + (g & 1) * 32 + l;
@@ -478,7 +488,7 @@ pub fn convert_f16(src: &[u8], out: &mut [f32]) {
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
-    for (b, y) in src.chunks_exact(2).zip(out.iter_mut()) {
+    for (b, y) in src[..2 * n].chunks_exact(2).zip(out[..n].iter_mut()) {
         *y = f16::from_le_bytes([b[0], b[1]]).to_f32();
     }
 }

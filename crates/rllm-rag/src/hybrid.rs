@@ -75,12 +75,7 @@ impl HybridIndex {
     }
 
     /// Performs hybrid search over dense vector embeddings and lexical text, fusing ranks via RRF.
-    pub fn search(
-        &self,
-        query_text: &str,
-        query_vector: &[f32],
-        top_k: usize,
-    ) -> Vec<HybridMatch> {
+    pub fn search(&self, query_text: &str, query_vector: &[f32], top_k: usize) -> Vec<HybridMatch> {
         let dense_results = self.hnsw.search(query_vector, top_k * 2);
         let bm25_results = self.bm25.search(query_text, top_k * 2);
 

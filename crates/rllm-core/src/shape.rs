@@ -17,9 +17,7 @@ impl Shape {
 
     /// Creates a Shape from a slice of dimension sizes.
     pub fn from_slice(dims: &[usize]) -> Self {
-        Self {
-            dims: dims.to_vec(),
-        }
+        Self { dims: dims.to_vec() }
     }
 
     /// Returns a slice over the dimensions.

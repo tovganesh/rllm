@@ -1,7 +1,7 @@
 pub mod activations;
 pub mod blas;
-pub mod gemm;
 pub mod f16w;
+pub mod gemm;
 pub mod kdot;
 pub mod norm;
 pub mod paged_attn;
@@ -11,7 +11,6 @@ pub mod repack;
 pub mod rope;
 pub mod softmax;
 
-
 /// Minimum number of elements per parallel task for cheap element-wise work. Below
 /// this, Rayon runs the loop inline on the calling thread (no fork/join overhead).
 pub const ELEMENTWISE_GRAIN: usize = 16 * 1024;
@@ -20,7 +19,10 @@ pub const ELEMENTWISE_GRAIN: usize = 16 * 1024;
 pub fn gemv_task_bytes() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("RLLM_TASK_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(128 * 1024)
+        std::env::var("RLLM_TASK_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128 * 1024)
     })
 }
 

@@ -18,11 +18,14 @@
 
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use super::qdot::{quantize_activations, quantize_activations_impl, Q8Activations, QK};
+#[cfg(target_arch = "aarch64")]
+use super::qdot::quantize_activations_impl;
+use super::qdot::{quantize_activations, Q8Activations, QK};
 use half::f16;
 use rayon::prelude::*;
 
 const Q4_0_BYTES: usize = 18;
+#[cfg(target_arch = "aarch64")]
 const Q8_0_BYTES: usize = 34;
 /// Bytes of one interleaved 4-row block.
 pub const GROUP_BLOCK_BYTES: usize = 4 * Q4_0_BYTES;
@@ -135,16 +138,10 @@ pub fn scalar_dot_q4_0x4(grp: &[u8], a: &Q8Activations, off: usize, nb: usize) -
     out
 }
 
+#[cfg(target_arch = "aarch64")]
 fn has_dotprod() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *V.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
 }
 
 /// Whether the int8 matrix-multiply (`SMMLA`) path is available.
@@ -176,6 +173,7 @@ pub fn vec_dot_q4_0x4(grp: &[u8], a: &Q8Activations, off: usize, nb: usize) -> [
 }
 
 /// Batches below this many rows run on the low-latency decode pool.
+#[cfg(target_arch = "aarch64")]
 const SMALL_BATCH_ROWS: usize = 32;
 
 /// Raw pointer that tasks writing disjoint output elements may share.
@@ -204,7 +202,12 @@ pub fn gemv_q4_0x4(weight: &[u8], x: &[f32], out: &mut [f32], n: usize, k: usize
     crate::pool::for_each_chunk_mut(out, 4 * groups_per_task, |t, chunk| {
         for (g, o) in chunk.chunks_exact_mut(4).enumerate() {
             let gi = t * groups_per_task + g;
-            o.copy_from_slice(&vec_dot_q4_0x4(&weight[gi * group_bytes..(gi + 1) * group_bytes], &a, 0, nb));
+            o.copy_from_slice(&vec_dot_q4_0x4(
+                &weight[gi * group_bytes..(gi + 1) * group_bytes],
+                &a,
+                0,
+                nb,
+            ));
         }
     });
 }
@@ -305,11 +308,13 @@ pub fn gemm_q8_0_i8mm(weight: &[u8], x: &[f32], out: &mut [f32], m: usize, n: us
 /// Activations of rows `2p, 2p+1` interleaved in 8-byte chunks per block (the `SMMLA`
 /// left operand), with per-lane scales `[d0, d0, d1, d1] / 16`. An odd last row is
 /// paired with zeros.
+#[cfg(target_arch = "aarch64")]
 struct PackedPairs {
     qs: Vec<i8>,
     scales: Vec<f32>,
 }
 
+#[cfg(target_arch = "aarch64")]
 fn pack_pairs(a: &Q8Activations, m: usize, nb: usize) -> PackedPairs {
     let pairs = m.div_ceil(2);
     let mut qs = vec![0i8; pairs * nb * 64];
@@ -414,14 +419,26 @@ mod neon {
             let (p0, p1) = (wp.add(b * GROUP_BLOCK_BYTES), wp.add((b + 1) * GROUP_BLOCK_BYTES));
             let i0 = group_block(p0, ap.add(b * QK));
             let i1 = group_block(p1, ap.add((b + 1) * QK));
-            acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(i0), vmulq_n_f32(f16x4(p0), a.d[off + b] * (1.0 / 16.0)));
-            acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(i1), vmulq_n_f32(f16x4(p1), a.d[off + b + 1] * (1.0 / 16.0)));
+            acc0 = vfmaq_f32(
+                acc0,
+                vcvtq_f32_s32(i0),
+                vmulq_n_f32(f16x4(p0), a.d[off + b] * (1.0 / 16.0)),
+            );
+            acc1 = vfmaq_f32(
+                acc1,
+                vcvtq_f32_s32(i1),
+                vmulq_n_f32(f16x4(p1), a.d[off + b + 1] * (1.0 / 16.0)),
+            );
             b += 2;
         }
         if b < nb {
             let p0 = wp.add(b * GROUP_BLOCK_BYTES);
             let i0 = group_block(p0, ap.add(b * QK));
-            acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(i0), vmulq_n_f32(f16x4(p0), a.d[off + b] * (1.0 / 16.0)));
+            acc0 = vfmaq_f32(
+                acc0,
+                vcvtq_f32_s32(i0),
+                vmulq_n_f32(f16x4(p0), a.d[off + b] * (1.0 / 16.0)),
+            );
         }
         let mut out = [0f32; 4];
         vst1q_f32(out.as_mut_ptr(), vaddq_f32(acc0, acc1));
@@ -493,7 +510,12 @@ mod neon {
             for t in 0..TP {
                 let pb = (p0 + t) * nb + b;
                 let ap = packed.qs.as_ptr().add(pb * 64);
-                let (x0, x1, x2, x3) = (vld1q_s8(ap), vld1q_s8(ap.add(16)), vld1q_s8(ap.add(32)), vld1q_s8(ap.add(48)));
+                let (x0, x1, x2, x3) = (
+                    vld1q_s8(ap),
+                    vld1q_s8(ap.add(16)),
+                    vld1q_s8(ap.add(32)),
+                    vld1q_s8(ap.add(48)),
+                );
                 let mut i01 = smmla(vdupq_n_s32(0), x0, l0_01);
                 let mut i23 = smmla(vdupq_n_s32(0), x0, l0_23);
                 i01 = smmla(i01, x1, l1_01);
@@ -510,9 +532,15 @@ mod neon {
         for t in 0..TP {
             // acc01 = [x0·r0, x0·r1, x1·r0, x1·r1], acc23 likewise for rows r2, r3.
             let row0 = 2 * (p0 + t);
-            vst1q_f32(out.add(row0 * n + 4 * g), vcombine_f32(vget_low_f32(acc01[t]), vget_low_f32(acc23[t])));
+            vst1q_f32(
+                out.add(row0 * n + 4 * g),
+                vcombine_f32(vget_low_f32(acc01[t]), vget_low_f32(acc23[t])),
+            );
             if row0 + 1 < m {
-                vst1q_f32(out.add((row0 + 1) * n + 4 * g), vcombine_f32(vget_high_f32(acc01[t]), vget_high_f32(acc23[t])));
+                vst1q_f32(
+                    out.add((row0 + 1) * n + 4 * g),
+                    vcombine_f32(vget_high_f32(acc01[t]), vget_high_f32(acc23[t])),
+                );
             }
         }
     }
@@ -572,7 +600,12 @@ mod neon {
         for b in 0..nb {
             let o = b * Q8_0_BYTES;
             let ld = |r: usize, i: usize| vreinterpretq_s64_s8(vld1q_s8(rows[r].add(o + 2 + 16 * i) as *const i8));
-            let zip = |lo: int64x2_t, hi: int64x2_t| (vreinterpretq_s8_s64(vzip1q_s64(lo, hi)), vreinterpretq_s8_s64(vzip2q_s64(lo, hi)));
+            let zip = |lo: int64x2_t, hi: int64x2_t| {
+                (
+                    vreinterpretq_s8_s64(vzip1q_s64(lo, hi)),
+                    vreinterpretq_s8_s64(vzip2q_s64(lo, hi)),
+                )
+            };
             // c{chunk}_{rows}: 8 values of each of two rows, the SMMLA right operand.
             let (c0_01, c1_01) = zip(ld(0, 0), ld(1, 0));
             let (c2_01, c3_01) = zip(ld(0, 1), ld(1, 1));
@@ -590,7 +623,12 @@ mod neon {
             for t in 0..TP {
                 let pb = (p0 + t) * nb + b;
                 let ap = packed.qs.as_ptr().add(pb * 64);
-                let (x0, x1, x2, x3) = (vld1q_s8(ap), vld1q_s8(ap.add(16)), vld1q_s8(ap.add(32)), vld1q_s8(ap.add(48)));
+                let (x0, x1, x2, x3) = (
+                    vld1q_s8(ap),
+                    vld1q_s8(ap.add(16)),
+                    vld1q_s8(ap.add(32)),
+                    vld1q_s8(ap.add(48)),
+                );
                 let mut i01 = smmla(vdupq_n_s32(0), x0, c0_01);
                 let mut i23 = smmla(vdupq_n_s32(0), x0, c0_23);
                 i01 = smmla(i01, x1, c1_01);
@@ -606,9 +644,15 @@ mod neon {
         }
         for t in 0..TP {
             let row0 = 2 * (p0 + t);
-            vst1q_f32(out.add(row0 * n + 4 * g), vcombine_f32(vget_low_f32(acc01[t]), vget_low_f32(acc23[t])));
+            vst1q_f32(
+                out.add(row0 * n + 4 * g),
+                vcombine_f32(vget_low_f32(acc01[t]), vget_low_f32(acc23[t])),
+            );
             if row0 + 1 < m {
-                vst1q_f32(out.add((row0 + 1) * n + 4 * g), vcombine_f32(vget_high_f32(acc01[t]), vget_high_f32(acc23[t])));
+                vst1q_f32(
+                    out.add((row0 + 1) * n + 4 * g),
+                    vcombine_f32(vget_high_f32(acc01[t]), vget_high_f32(acc23[t])),
+                );
             }
         }
     }
@@ -648,7 +692,9 @@ mod tests {
     use crate::ops::quant::{dequantize_q4_0, quantize_f32_to_q4_0};
 
     fn data(n: usize, seed: usize) -> Vec<f32> {
-        (0..n).map(|i| (((i * 7919 + seed * 104729) % 2001) as f32 - 1000.0) / 400.0).collect()
+        (0..n)
+            .map(|i| (((i * 7919 + seed * 104729) % 2001) as f32 - 1000.0) / 400.0)
+            .collect()
     }
 
     fn q4(n: usize, k: usize, seed: usize) -> Vec<u8> {
@@ -689,7 +735,11 @@ mod tests {
             let reference = scalar_dot_q4_0x4(&r, &a, 0, nb);
             for i in 0..4 {
                 let want = scalar_dot_q4_0_q8(&w[i * row_bytes..(i + 1) * row_bytes], &a, 0, nb);
-                assert!((got[i] - want).abs() <= 1e-4 * want.abs().max(1.0), "nb={nb} r={i}: {} vs {want}", got[i]);
+                assert!(
+                    (got[i] - want).abs() <= 1e-4 * want.abs().max(1.0),
+                    "nb={nb} r={i}: {} vs {want}",
+                    got[i]
+                );
                 assert!((reference[i] - want).abs() <= 1e-4 * want.abs().max(1.0));
             }
         }
@@ -714,7 +764,10 @@ mod tests {
                 for j in 0..n {
                     let want = scalar_dot_q4_0_q8(&w[j * nb * 18..(j + 1) * nb * 18], &a, i * nb, nb);
                     let got = out[i * n + j];
-                    assert!((got - want).abs() <= 1e-4 * want.abs().max(1.0), "m={m} ({i},{j}): {got} vs {want}");
+                    assert!(
+                        (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                        "m={m} ({i},{j}): {got} vs {want}"
+                    );
                 }
             }
         }

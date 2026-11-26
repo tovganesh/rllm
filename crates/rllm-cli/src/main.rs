@@ -11,17 +11,16 @@ use benchmark::{run_comprehensive_benchmark, BenchmarkOptions};
 use clap::{Parser, Subcommand};
 use rllm_backend_cpu::CpuBackend;
 use rllm_models::{
-    BertConfig, ChatMessage, GgufBundle, LanguageModel, LlamaConfig, LlamaModel, LoadOptions,
-    StreamDecoder, TextEmbedder,
+    BertConfig, ChatMessage, GgufBundle, LanguageModel, LlamaConfig, LlamaModel, LoadOptions, StreamDecoder,
+    TextEmbedder,
 };
 use rllm_rag::{LlmGenerator, RagEngine};
 use rllm_scheduler::{
-    ContinuousBatchScheduler, EngineConfig, EngineHandle, SamplingParams, SchedulerConfig, Sequence,
-    SpeculationConfig,
+    ContinuousBatchScheduler, EngineConfig, EngineHandle, SamplingParams, SchedulerConfig, Sequence, SpeculationConfig,
 };
-use std::io::Write;
 use rllm_server::{run_server, AppState, ServerLimits, ServerMetrics};
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -292,11 +291,7 @@ async fn main() -> anyhow::Result<()> {
             let mut model_name = model.clone();
             let scheduler = if mode == ServiceMode::All || mode == ServiceMode::Inference {
                 let llama_model = if model.ends_with(".gguf") {
-                    let bundle = GgufBundle::load(
-                        &model,
-                        backend.clone(),
-                        &load_opts(max_context),
-                    )?;
+                    let bundle = GgufBundle::load(&model, backend.clone(), &load_opts(max_context))?;
                     model_name = std::path::Path::new(&model)
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
@@ -399,8 +394,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let prompt = match (prompt, prompt_file) {
                 (Some(p), _) => p,
-                (None, Some(f)) => std::fs::read_to_string(&f)
-                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", f.display()))?,
+                (None, Some(f)) => {
+                    std::fs::read_to_string(&f).map_err(|e| anyhow::anyhow!("reading {}: {e}", f.display()))?
+                }
                 (None, None) => anyhow::bail!("--prompt or --prompt-file is required"),
             };
             run_generate(GenerateArgs {
@@ -438,8 +434,17 @@ async fn main() -> anyhow::Result<()> {
             if let Some(path) = model {
                 match (shared_prefix, parallel) {
                     (Some(shared), _) => run_prefix_bench(&path, prompt_tokens, shared, repetitions.max(1), device)?,
-                    (None, Some(n)) => run_parallel_bench(&path, prompt_tokens, generate_tokens, n.max(1), repetitions.max(1), device)?,
-                    (None, None) => run_model_bench(&path, prompt_tokens, generate_tokens, depth, repetitions.max(1), device)?,
+                    (None, Some(n)) => run_parallel_bench(
+                        &path,
+                        prompt_tokens,
+                        generate_tokens,
+                        n.max(1),
+                        repetitions.max(1),
+                        device,
+                    )?,
+                    (None, None) => {
+                        run_model_bench(&path, prompt_tokens, generate_tokens, depth, repetitions.max(1), device)?
+                    }
                 }
                 return Ok(());
             }
@@ -491,7 +496,15 @@ async fn main() -> anyhow::Result<()> {
                 ("rust", "The Rust programming language guarantees memory safety without a garbage collector through its ownership and borrowing system, checked at compile time."),
                 ("reef", "The Great Barrier Reef, off the coast of Queensland, Australia, is the world's largest coral reef system, stretching for over 2,300 kilometres."),
             ];
-            println!("Embedder: {}{}", embedder.name, if embedder.is_synthetic() { " (synthetic: dense retrieval disabled)" } else { "" });
+            println!(
+                "Embedder: {}{}",
+                embedder.name,
+                if embedder.is_synthetic() {
+                    " (synthetic: dense retrieval disabled)"
+                } else {
+                    ""
+                }
+            );
             println!("Indexing {} documents...", docs.len());
             for (id, text) in docs {
                 rag_engine.ingest_document(id, text, HashMap::new())?;
@@ -512,9 +525,13 @@ async fn main() -> anyhow::Result<()> {
                 "Relevant: {} | lexical confidence {:.2} | max dense similarity {}",
                 resp.is_relevant,
                 resp.confidence_score,
-                resp.max_dense_similarity.map_or("n/a".to_string(), |d| format!("{d:.2}"))
+                resp.max_dense_similarity
+                    .map_or("n/a".to_string(), |d| format!("{d:.2}"))
             );
-            println!("\nAnswer ({}, {} tokens generated):\n{}", resp.answer_source, resp.generated_tokens, resp.answer);
+            println!(
+                "\nAnswer ({}, {} tokens generated):\n{}",
+                resp.answer_source, resp.generated_tokens, resp.answer
+            );
             if let Some(w) = &resp.warning {
                 println!("\nWarning: {w}");
             }
@@ -563,11 +580,7 @@ fn speculation(max_draft_tokens: usize, max_ngram: usize) -> SpeculationConfig {
 /// `rllm generate`: load a GGUF model and stream a completion to stdout.
 fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     let load_start = Instant::now();
-    let bundle = GgufBundle::load(
-        &args.model,
-        Arc::new(CpuBackend),
-        &load_opts(args.max_context),
-    )?;
+    let bundle = GgufBundle::load(&args.model, Arc::new(CpuBackend), &load_opts(args.max_context))?;
     let load_time = load_start.elapsed();
     let tokenizer = &bundle.tokenizer;
 
@@ -636,7 +649,10 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
         let m = &scheduler.metrics;
         let drafted = m.draft_tokens.load(std::sync::atomic::Ordering::Relaxed);
         let accepted = m.accepted_draft_tokens.load(std::sync::atomic::Ordering::Relaxed);
-        let passes = m.forward_passes.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1);
+        let passes = m
+            .forward_passes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
         eprintln!(
             "[rllm] prompt lookup: {accepted}/{drafted} draft tokens accepted ({:.0}%), {:.2} tokens per decode pass",
             100.0 * accepted as f64 / drafted.max(1) as f64,
@@ -655,11 +671,20 @@ fn load_embedder(path: Option<&std::path::Path>, backend: Arc<CpuBackend>) -> an
 }
 
 /// `rllm perplexity`: mirrors `llama-perplexity` so results can be compared directly.
-fn run_perplexity(model: &std::path::Path, file: &std::path::Path, ctx: usize, device: LlmDevice) -> anyhow::Result<()> {
+fn run_perplexity(
+    model: &std::path::Path,
+    file: &std::path::Path,
+    ctx: usize,
+    device: LlmDevice,
+) -> anyhow::Result<()> {
     let bundle = GgufBundle::load(model, Arc::new(CpuBackend), &load_opts(ctx))?;
     let text = std::fs::read_to_string(file)?;
     let tokens = bundle.tokenizer.encode(&text, true, false);
-    let bos = if bundle.tokenizer.add_bos { bundle.tokenizer.bos_token_id } else { None };
+    let bos = if bundle.tokenizer.add_bos {
+        bundle.tokenizer.bos_token_id
+    } else {
+        None
+    };
     let start = Instant::now();
     let lm = device.executor(bundle.model)?;
     let p = rllm_models::perplexity(lm.as_ref(), &tokens, ctx, bos)?;
@@ -715,7 +740,14 @@ impl LlmDevice {
 
 /// `rllm bench --model`: llama-bench-style prompt-processing and generation throughput,
 /// optionally after `depth` tokens of context (llama-bench `-d`).
-fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, depth: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
+fn run_model_bench(
+    path: &std::path::Path,
+    pp: usize,
+    tg: usize,
+    depth: usize,
+    reps: usize,
+    device: LlmDevice,
+) -> anyhow::Result<()> {
     use rllm_core::backend::BlockTable;
     use rllm_models::ForwardBatch;
 
@@ -726,14 +758,22 @@ fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, depth: usize, r
     let block = 16;
     let blocks = ctx.div_ceil(block);
     lm.init_kv_cache(blocks, block)?;
-    let table = BlockTable { block_size: block, block_ids: (0..blocks).collect() };
+    let table = BlockTable {
+        block_size: block,
+        block_ids: (0..blocks).collect(),
+    };
     // Deterministic pseudo-random tokens, as llama-bench uses random tokens.
     let token = |i: usize| ((i as u32).wrapping_mul(2654435761) >> 8) % vocab;
     let prefill = |start: usize, n: usize| -> anyhow::Result<()> {
         let tokens: Vec<u32> = (start..start + n).map(token).collect();
         let positions: Vec<usize> = (start..start + n).collect();
         let tables = vec![table.clone(); n];
-        lm.forward_cached(&ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &tables, logits_rows: &[n - 1] })?;
+        lm.forward_cached(&ForwardBatch {
+            tokens: &tokens,
+            positions: &positions,
+            block_tables: &tables,
+            logits_rows: &[n - 1],
+        })?;
         Ok(())
     };
     let median = |mut v: Vec<f64>| {
@@ -771,19 +811,39 @@ fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, depth: usize, r
         for i in 0..tg {
             let tok = [(i as u32 * 7919) % vocab];
             let pos = depth + i;
-            lm.forward_cached(&ForwardBatch { tokens: &tok, positions: &[pos], block_tables: std::slice::from_ref(&table), logits_rows: &[0] })?;
+            lm.forward_cached(&ForwardBatch {
+                tokens: &tok,
+                positions: &[pos],
+                block_tables: std::slice::from_ref(&table),
+                logits_rows: &[0],
+            })?;
         }
         tg_rates.push(tg as f64 / t.elapsed().as_secs_f64());
     }
     println!("| model | device | test | t/s |");
     println!("| --- | --- | --- | ---: |");
-    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let at = if depth > 0 { format!(" @ d{depth}") } else { String::new() };
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let at = if depth > 0 {
+        format!(" @ d{depth}")
+    } else {
+        String::new()
+    };
     if !pp_rates.is_empty() {
-        println!("| {name} | {} | pp{pp}{at} | {:.1} |", lm.device_name(), median(pp_rates));
+        println!(
+            "| {name} | {} | pp{pp}{at} | {:.1} |",
+            lm.device_name(),
+            median(pp_rates)
+        );
     }
     if !tg_rates.is_empty() {
-        println!("| {name} | {} | tg{tg}{at} | {:.1} |", lm.device_name(), median(tg_rates));
+        println!(
+            "| {name} | {} | tg{tg}{at} | {:.1} |",
+            lm.device_name(),
+            median(tg_rates)
+        );
     }
     Ok(())
 }
@@ -792,7 +852,14 @@ fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, depth: usize, r
 /// batched together (llama-batched-bench's S_PP and S_TG): one forward pass over all
 /// `n` prompts of `pp` tokens, then `tg` steps of one token per sequence (positions
 /// `pp..pp + tg`, so the context grows as in a real decode).
-fn run_parallel_bench(path: &std::path::Path, pp: usize, tg: usize, n: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
+fn run_parallel_bench(
+    path: &std::path::Path,
+    pp: usize,
+    tg: usize,
+    n: usize,
+    reps: usize,
+    device: LlmDevice,
+) -> anyhow::Result<()> {
     use rllm_core::backend::BlockTable;
     use rllm_models::ForwardBatch;
 
@@ -804,8 +871,12 @@ fn run_parallel_bench(path: &std::path::Path, pp: usize, tg: usize, n: usize, re
     let block = 16;
     let per_seq = ctx.div_ceil(block);
     lm.init_kv_cache(n * per_seq, block)?;
-    let tables: Vec<BlockTable> =
-        (0..n).map(|s| BlockTable { block_size: block, block_ids: (s * per_seq..(s + 1) * per_seq).collect() }).collect();
+    let tables: Vec<BlockTable> = (0..n)
+        .map(|s| BlockTable {
+            block_size: block,
+            block_ids: (s * per_seq..(s + 1) * per_seq).collect(),
+        })
+        .collect();
     // Deterministic pseudo-random tokens, different for each sequence.
     let token = |s: usize, i: usize| (((s * 100_003 + i) as u32).wrapping_mul(2654435761) >> 8) % vocab;
     let median = |mut v: Vec<f64>| {
@@ -819,13 +890,23 @@ fn run_parallel_bench(path: &std::path::Path, pp: usize, tg: usize, n: usize, re
         row_tables.extend(std::iter::repeat_n(t.clone(), pp));
         last.push((s + 1) * pp - 1);
     }
-    let prompts = ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &row_tables, logits_rows: &last };
+    let prompts = ForwardBatch {
+        tokens: &tokens,
+        positions: &positions,
+        block_tables: &row_tables,
+        logits_rows: &last,
+    };
     let rows: Vec<usize> = (0..n).collect();
     let decode = || -> anyhow::Result<()> {
         for i in 0..tg {
             let toks: Vec<u32> = (0..n).map(|s| token(s, pp + i)).collect();
             let pos = vec![pp + i; n];
-            lm.forward_cached(&ForwardBatch { tokens: &toks, positions: &pos, block_tables: &tables, logits_rows: &rows })?;
+            lm.forward_cached(&ForwardBatch {
+                tokens: &toks,
+                positions: &pos,
+                block_tables: &tables,
+                logits_rows: &rows,
+            })?;
         }
         Ok(())
     };
@@ -846,10 +927,21 @@ fn run_parallel_bench(path: &std::path::Path, pp: usize, tg: usize, n: usize, re
     }
     println!("| model | device | test | t/s |");
     println!("| --- | --- | --- | ---: |");
-    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    println!("| {name} | {} | pp{pp} x{n} | {:.1} |", lm.device_name(), median(pp_rates));
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    println!(
+        "| {name} | {} | pp{pp} x{n} | {:.1} |",
+        lm.device_name(),
+        median(pp_rates)
+    );
     if !tg_rates.is_empty() {
-        println!("| {name} | {} | tg{tg} x{n} | {:.1} |", lm.device_name(), median(tg_rates));
+        println!(
+            "| {name} | {} | tg{tg} x{n} | {:.1} |",
+            lm.device_name(),
+            median(tg_rates)
+        );
     }
     Ok(())
 }
@@ -857,16 +949,29 @@ fn run_parallel_bench(path: &std::path::Path, pp: usize, tg: usize, n: usize, re
 /// `rllm bench --model --shared-prefix N`: time to first token through the scheduler
 /// for a `prompt`-token request whose first `shared` tokens a previous request already
 /// computed (warm prefix cache), versus a request with nothing cached (cold).
-fn run_prefix_bench(path: &std::path::Path, prompt: usize, shared: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
+fn run_prefix_bench(
+    path: &std::path::Path,
+    prompt: usize,
+    shared: usize,
+    reps: usize,
+    device: LlmDevice,
+) -> anyhow::Result<()> {
     anyhow::ensure!(shared < prompt, "--shared-prefix must be smaller than --prompt-tokens");
     let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &load_opts(prompt + 16))?;
     let vocab = bundle.model.config.vocab_size as u32;
     let lm = device.executor(bundle.model)?;
     let block_size = 16;
     let tokens = |seed: u32, n: usize| -> Vec<u32> {
-        (0..n as u32).map(|i| (i.wrapping_add(seed.wrapping_mul(7919)).wrapping_mul(2654435761) >> 8) % vocab).collect()
+        (0..n as u32)
+            .map(|i| (i.wrapping_add(seed.wrapping_mul(7919)).wrapping_mul(2654435761) >> 8) % vocab)
+            .collect()
     };
-    let one_token = SamplingParams { temperature: 0.0, max_tokens: 1, stop_tokens: Vec::new(), ..SamplingParams::default() };
+    let one_token = SamplingParams {
+        temperature: 0.0,
+        max_tokens: 1,
+        stop_tokens: Vec::new(),
+        ..SamplingParams::default()
+    };
     let median = |mut v: Vec<f64>| {
         v.sort_by(|a, b| a.total_cmp(b));
         v[v.len() / 2]
@@ -888,7 +993,13 @@ fn run_prefix_bench(path: &std::path::Path, prompt: usize, shared: usize, reps: 
         let ttft = |suffix_seed: u32| -> anyhow::Result<f64> {
             let mut p = prefix.clone();
             p.extend(tokens(suffix_seed, prompt - shared));
-            scheduler.submit_sequence(Sequence::new(scheduler.next_sequence_id(), p, one_token.clone(), block_size, None))?;
+            scheduler.submit_sequence(Sequence::new(
+                scheduler.next_sequence_id(),
+                p,
+                one_token.clone(),
+                block_size,
+                None,
+            ))?;
             let t = Instant::now();
             scheduler.step()?;
             let dt = t.elapsed().as_secs_f64();
@@ -898,20 +1009,34 @@ fn run_prefix_bench(path: &std::path::Path, prompt: usize, shared: usize, reps: 
             Ok(dt)
         };
         let c = ttft(1)?;
-        let before = scheduler.metrics.cached_prompt_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        let before = scheduler
+            .metrics
+            .cached_prompt_tokens
+            .load(std::sync::atomic::Ordering::Relaxed);
         let w = ttft(2)?;
-        cached = scheduler.metrics.cached_prompt_tokens.load(std::sync::atomic::Ordering::Relaxed) - before;
+        cached = scheduler
+            .metrics
+            .cached_prompt_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - before;
         if r > 0 {
             // The first round only warms up pipelines and page tables.
             cold.push(c);
             warm.push(w);
         }
     }
-    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let (c, w) = (median(cold) * 1e3, median(warm) * 1e3);
     println!("| model | device | prompt | shared prefix | cached tokens | TTFT cold ms | TTFT warm ms | speed-up |");
     println!("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
-    println!("| {name} | {} | {prompt} | {shared} | {cached} | {c:.1} | {w:.1} | {:.2}x |", lm.device_name(), c / w);
+    println!(
+        "| {name} | {} | {prompt} | {shared} | {cached} | {c:.1} | {w:.1} | {:.2}x |",
+        lm.device_name(),
+        c / w
+    );
     Ok(())
 }
 

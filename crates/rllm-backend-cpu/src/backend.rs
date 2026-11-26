@@ -1,9 +1,9 @@
 use crate::ops::{
     activations::swiglu_f32,
+    blas::{sgemm_nt, sgemm_nt_cols},
     gemm::{gemm_f32, gemm_nt_f32},
     norm::rms_norm_f32,
     paged_attn::{paged_attention_kv_group, KvData},
-    blas::{sgemm_nt, sgemm_nt_cols},
     qdot::{gemv_quantized, linear_quantized, QFormat},
     quant::{dequantize_into, gemv_q4_0_f32, gemv_q8_0_f32, q5_0_to_q8_0},
     repack::{dequantize_q4_0x4_group, dequantize_q4_0x4_row, gemm_q4_0x4, gemv_q4_0x4, has_i8mm, repack_q4_0},
@@ -128,7 +128,11 @@ impl Backend for CpuBackend {
         let dtype = w.dtype();
         let fmt = QFormat::from_dtype(dtype);
         if fmt.is_none() && !matches!(dtype, DType::Q4_0x4 | DType::F16) {
-            return Err(RllmError::UnsupportedOp { op: "linear", dtype: dtype.to_string(), device: "cpu".to_string() });
+            return Err(RllmError::UnsupportedOp {
+                op: "linear",
+                dtype: dtype.to_string(),
+                device: "cpu".to_string(),
+            });
         }
         let block = dtype.block_info().map_or(1, |(values, _)| values);
         if k % block != 0 {
@@ -138,9 +142,9 @@ impl Backend for CpuBackend {
         }
         let w_bytes = dtype.storage_bytes(n * k);
         let all = w.storage().as_cpu()?.as_bytes();
-        let w_bytes = all.get(w.offset()..w.offset() + w_bytes).ok_or_else(|| {
-            RllmError::BackendError("quantized weight storage too small".to_string())
-        })?;
+        let w_bytes = all
+            .get(w.offset()..w.offset() + w_bytes)
+            .ok_or_else(|| RllmError::BackendError("quantized weight storage too small".to_string()))?;
 
         let x = x.contiguous()?;
         let x_slice = x.as_f32_slice()?;
@@ -182,16 +186,20 @@ impl Backend for CpuBackend {
                 let nc = chunk.min(n - j0);
                 let src = &w_bytes[j0 * row_bytes..(j0 + nc) * row_bytes];
                 if repacked {
-                    wf[..nc * k].par_chunks_mut(4 * k).zip(src.par_chunks(4 * row_bytes)).for_each(|(dst, src)| {
-                        let (r0, rest) = dst.split_at_mut(k);
-                        let (r1, rest) = rest.split_at_mut(k);
-                        let (r2, r3) = rest.split_at_mut(k);
-                        dequantize_q4_0x4_group(src, [r0, r1, r2, r3]);
-                    });
+                    wf[..nc * k]
+                        .par_chunks_mut(4 * k)
+                        .zip(src.par_chunks(4 * row_bytes))
+                        .for_each(|(dst, src)| {
+                            let (r0, rest) = dst.split_at_mut(k);
+                            let (r1, rest) = rest.split_at_mut(k);
+                            let (r2, r3) = rest.split_at_mut(k);
+                            dequantize_q4_0x4_group(src, [r0, r1, r2, r3]);
+                        });
                 } else {
-                    wf[..nc * k].par_chunks_mut(k).zip(src.par_chunks(row_bytes)).try_for_each(|(dst, src)| {
-                        dequantize_into(dtype, src, dst)
-                    })?;
+                    wf[..nc * k]
+                        .par_chunks_mut(k)
+                        .zip(src.par_chunks(row_bytes))
+                        .try_for_each(|(dst, src)| dequantize_into(dtype, src, dst))?;
                 }
                 sgemm_nt_cols(x_slice, &wf[..nc * k], out_slice, m, k, nc, j0, n);
                 j0 += nc;
@@ -224,9 +232,10 @@ impl Backend for CpuBackend {
     }
 
     fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-        let hidden_dim = *x.dims().last().ok_or_else(|| {
-            RllmError::BackendError("RMSNorm input tensor cannot be scalar".to_string())
-        })?;
+        let hidden_dim = *x
+            .dims()
+            .last()
+            .ok_or_else(|| RllmError::BackendError("RMSNorm input tensor cannot be scalar".to_string()))?;
         let batch_tokens = x.numel() / hidden_dim;
 
         let mut out = Tensor::zeros(x.shape().clone(), DType::F32, Device::Cpu)?;
@@ -246,15 +255,19 @@ impl Backend for CpuBackend {
         sin_table: &Tensor,
         positions: &[usize],
     ) -> Result<()> {
-        let head_dim = *q.dims().last().ok_or_else(|| {
-            RllmError::BackendError("RoPE query tensor cannot be scalar".to_string())
-        })?;
+        let head_dim = *q
+            .dims()
+            .last()
+            .ok_or_else(|| RllmError::BackendError("RoPE query tensor cannot be scalar".to_string()))?;
         let num_tokens = positions.len();
         let per_token = num_tokens * head_dim;
         if num_tokens == 0 || !q.numel().is_multiple_of(per_token) || !k.numel().is_multiple_of(per_token) {
             return Err(RllmError::BackendError(format!(
                 "RoPE: q {:?} / k {:?} not divisible into {} tokens of head_dim {}",
-                q.dims(), k.dims(), num_tokens, head_dim
+                q.dims(),
+                k.dims(),
+                num_tokens,
+                head_dim
             )));
         }
         let num_heads_q = q.numel() / (num_tokens * head_dim);
@@ -271,8 +284,22 @@ impl Backend for CpuBackend {
             )));
         }
 
-        rope_f32(q.as_mut_f32_slice()?, num_heads_q, head_dim, positions, cos_slice, sin_slice);
-        rope_f32(k.as_mut_f32_slice()?, num_heads_k, head_dim, positions, cos_slice, sin_slice);
+        rope_f32(
+            q.as_mut_f32_slice()?,
+            num_heads_q,
+            head_dim,
+            positions,
+            cos_slice,
+            sin_slice,
+        );
+        rope_f32(
+            k.as_mut_f32_slice()?,
+            num_heads_k,
+            head_dim,
+            positions,
+            cos_slice,
+            sin_slice,
+        );
         Ok(())
     }
 
@@ -338,7 +365,11 @@ impl Backend for CpuBackend {
                 let row_bytes = dtype.storage_bytes(hidden_dim);
                 let bytes = &table.storage().as_cpu()?.as_bytes()[table.offset()..];
                 for (dst, &id) in out_slice.chunks_exact_mut(hidden_dim).zip(ids) {
-                    dequantize_into(dtype, &bytes[id as usize * row_bytes..(id as usize + 1) * row_bytes], dst)?;
+                    dequantize_into(
+                        dtype,
+                        &bytes[id as usize * row_bytes..(id as usize + 1) * row_bytes],
+                        dst,
+                    )?;
                 }
             }
             other => {
@@ -434,7 +465,10 @@ impl Backend for CpuBackend {
         if num_rows < BATCHED_F32_MIN_ROWS {
             crate::pool::for_each_chunk_mut(out_slice, min_items * group_len, run_items);
         } else {
-            out_slice.par_chunks_mut(min_items * group_len).enumerate().for_each(|(t, items)| run_items(t, items));
+            out_slice
+                .par_chunks_mut(min_items * group_len)
+                .enumerate()
+                .for_each(|(t, items)| run_items(t, items));
         }
 
         Ok(out)
@@ -478,7 +512,11 @@ fn kv_data(t: &Tensor) -> Result<KvData<'_>> {
         DType::F32 => KvData::F32(t.as_f32_slice()?),
         DType::F16 => KvData::F16(t.storage().as_cpu()?.as_slice::<half::f16>()),
         other => {
-            return Err(RllmError::UnsupportedOp { op: "paged_attention", dtype: other.to_string(), device: "cpu".to_string() })
+            return Err(RllmError::UnsupportedOp {
+                op: "paged_attention",
+                dtype: other.to_string(),
+                device: "cpu".to_string(),
+            })
         }
     })
 }

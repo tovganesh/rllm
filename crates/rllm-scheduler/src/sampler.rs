@@ -45,11 +45,7 @@ impl Sampler {
     ///
     /// Applies repetition penalty, temperature scaling, stable softmax, top-K filtering,
     /// top-p nucleus truncation, and categorical sampling.
-    pub fn sample(
-        logits: &[f32],
-        params: &SamplingParams,
-        context_tokens: &[u32],
-    ) -> u32 {
+    pub fn sample(logits: &[f32], params: &SamplingParams, context_tokens: &[u32]) -> u32 {
         if params.temperature <= 0.0 || params.top_k == 1 {
             // Greedy argmax
             return logits

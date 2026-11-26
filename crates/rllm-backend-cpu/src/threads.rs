@@ -31,7 +31,13 @@ pub const LARGE_GEMM_MACS: usize = 1 << 29;
 fn macos_performance_cores() -> Option<usize> {
     use std::ffi::{c_char, c_int, c_void};
     extern "C" {
-        fn sysctlbyname(name: *const c_char, oldp: *mut c_void, oldlenp: *mut usize, newp: *mut c_void, newlen: usize) -> c_int;
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> c_int;
     }
     let mut value: c_int = 0;
     let mut len = std::mem::size_of::<c_int>();
@@ -79,7 +85,11 @@ pub fn hint_model_width(hidden_size: usize) {
         return;
     }
     let p = default_num_threads();
-    let n = if hidden_size >= WIDE_MODEL_HIDDEN { p + efficiency_cores().min(p) } else { p };
+    let n = if hidden_size >= WIDE_MODEL_HIDDEN {
+        p + efficiency_cores().min(p)
+    } else {
+        p
+    };
     DECODE_THREADS.store(n, Ordering::Relaxed);
 }
 
@@ -108,7 +118,13 @@ pub fn run_large<R: Send>(macs: usize, f: impl FnOnce() -> R + Send) -> R {
     let pool = ALL.get_or_init(|| {
         let n = all_cores();
         (n > rayon::current_num_threads())
-            .then(|| rayon::ThreadPoolBuilder::new().num_threads(n).thread_name(|i| format!("rllm-gemm-{i}")).build().ok())
+            .then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .thread_name(|i| format!("rllm-gemm-{i}"))
+                    .build()
+                    .ok()
+            })
             .flatten()
     });
     match pool {

@@ -4,14 +4,7 @@ use rayon::prelude::*;
 
 /// Computes RMSNorm:
 /// $$y_i = \frac{x_i}{\sqrt{\frac{1}{d} \sum_{j=1}^d x_j^2 + \epsilon}} \cdot w_i$$
-pub fn rms_norm_f32(
-    x: &[f32],
-    weight: &[f32],
-    out: &mut [f32],
-    batch_tokens: usize,
-    hidden_dim: usize,
-    eps: f32,
-) {
+pub fn rms_norm_f32(x: &[f32], weight: &[f32], out: &mut [f32], batch_tokens: usize, hidden_dim: usize, eps: f32) {
     debug_assert_eq!(x.len(), batch_tokens * hidden_dim);
     debug_assert_eq!(weight.len(), hidden_dim);
     debug_assert_eq!(out.len(), batch_tokens * hidden_dim);

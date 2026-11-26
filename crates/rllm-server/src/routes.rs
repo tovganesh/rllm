@@ -1,9 +1,9 @@
 //! Route handlers for OpenAI-compatible REST and RAG endpoints.
 
 use crate::api_types::{
-    ChatChoice, ChatChunkChoice, ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse, ChatDelta, ChatMessage, EmbeddingData, EmbeddingRequest,
-    EmbeddingResponse, RagIndexRequest, RagIndexResponse, RagQueryRequest, Usage,
+    ChatChoice, ChatChunkChoice, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatDelta,
+    ChatMessage, EmbeddingData, EmbeddingRequest, EmbeddingResponse, RagIndexRequest, RagIndexResponse,
+    RagQueryRequest, Usage,
 };
 use crate::metrics::ServerMetrics;
 use axum::{
@@ -15,14 +15,14 @@ use axum::{
     },
 };
 use futures_util::stream::{self, Stream};
-use std::convert::Infallible;
-use std::time::Instant;
 use rllm_backend_cpu::CpuBackend;
 use rllm_models::{BpeTokenizer, ChatTemplate, StreamDecoder, TextEmbedder};
 use rllm_rag::{grounded_messages, unrelated_response, verify_citations, RagEngine, RagResponse};
 use rllm_scheduler::{EngineHandle, FinishReason, GenerationStream, SamplingParams, SequenceEvent, SubmitError};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::info;
 
 /// Operating service mode for containerized or standalone deployment.
@@ -124,7 +124,9 @@ impl ApiError {
         match e {
             SubmitError::Invalid(msg) => Self::new(StatusCode::BAD_REQUEST, msg),
             SubmitError::Overloaded { .. } => {
-                metrics.rejected_overloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .rejected_overloaded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Self::new(StatusCode::TOO_MANY_REQUESTS, e.to_string())
             }
             SubmitError::ShutDown => Self::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
@@ -144,7 +146,8 @@ impl IntoResponse for ApiError {
         }));
         let mut resp = (self.status, body).into_response();
         if self.status == StatusCode::TOO_MANY_REQUESTS {
-            resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         resp
     }
@@ -169,9 +172,10 @@ pub async fn chat_completions_handler(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let start = Instant::now();
-    let engine = state.engine.clone().ok_or_else(|| {
-        ApiError::new(StatusCode::NOT_IMPLEMENTED, "inference is not enabled on this server")
-    })?;
+    let engine = state
+        .engine
+        .clone()
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_IMPLEMENTED, "inference is not enabled on this server"))?;
     if req.messages.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "messages must not be empty"));
     }
@@ -182,7 +186,10 @@ pub async fn chat_completions_handler(
     };
     if let Some(t) = req.temperature {
         if !(0.0..=2.0).contains(&t) {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "temperature must be between 0 and 2"));
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "temperature must be between 0 and 2",
+            ));
         }
         sampling.temperature = t;
     }
@@ -319,7 +326,12 @@ async fn collect_completion(
             }
             Some(SequenceEvent::Finished(r)) => break r,
             Some(SequenceEvent::Error(e)) => return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
-            None => return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "generation ended unexpectedly")),
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "generation ended unexpectedly",
+                ))
+            }
         }
     };
     let completion_tokens = tokens.len();
@@ -328,9 +340,19 @@ async fn collect_completion(
     }
     let content = match &ctx.tokenizer {
         Some(t) => t.decode(&tokens, true),
-        None => tokens.iter().map(|&t| legacy_token_text(t)).collect::<String>().trim().to_string(),
+        None => tokens
+            .iter()
+            .map(|&t| legacy_token_text(t))
+            .collect::<String>()
+            .trim()
+            .to_string(),
     };
-    Ok((content, finish_reason_str(reason).to_string(), completion_tokens, generation.prompt_tokens))
+    Ok((
+        content,
+        finish_reason_str(reason).to_string(),
+        completion_tokens,
+        generation.prompt_tokens,
+    ))
 }
 
 enum StreamPhase {
@@ -387,7 +409,13 @@ fn chat_stream(
             match std::mem::replace(&mut st.phase, StreamPhase::Closed) {
                 StreamPhase::Start => {
                     st.phase = StreamPhase::Generating;
-                    let ev = st.chunk(ChatDelta { role: Some("assistant".to_string()), content: None }, None);
+                    let ev = st.chunk(
+                        ChatDelta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                        },
+                        None,
+                    );
                     return Some((Ok(ev), st));
                 }
                 StreamPhase::Generating => match st.generation.next().await {
@@ -407,7 +435,13 @@ fn chat_stream(
                         if text.is_empty() {
                             continue;
                         }
-                        let ev = st.chunk(ChatDelta { role: None, content: Some(text) }, None);
+                        let ev = st.chunk(
+                            ChatDelta {
+                                role: None,
+                                content: Some(text),
+                            },
+                            None,
+                        );
                         return Some((Ok(ev), st));
                     }
                     Some(SequenceEvent::Finished(reason)) => {
@@ -417,8 +451,15 @@ fn chat_stream(
                             completion_tokens: st.completion_tokens,
                             total_tokens: st.generation.prompt_tokens + st.completion_tokens,
                         };
-                        st.phase = if st.include_usage { StreamPhase::Usage(usage) } else { StreamPhase::Done };
-                        let delta = ChatDelta { role: None, content: (!tail.is_empty()).then_some(tail) };
+                        st.phase = if st.include_usage {
+                            StreamPhase::Usage(usage)
+                        } else {
+                            StreamPhase::Done
+                        };
+                        let delta = ChatDelta {
+                            role: None,
+                            content: (!tail.is_empty()).then_some(tail),
+                        };
                         let ev = st.chunk(delta, Some(finish_reason_str(reason)));
                         return Some((Ok(ev), st));
                     }
@@ -461,12 +502,18 @@ pub async fn embeddings_handler(
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
     let embedder = state.embedder.clone().ok_or_else(|| {
-        ApiError::new(StatusCode::NOT_IMPLEMENTED, "no embedding model is loaded on this server")
+        ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "no embedding model is loaded on this server",
+        )
     })?;
     if req.input.is_empty() || req.input.len() > state.limits.max_embedding_inputs {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            format!("input must contain between 1 and {} texts", state.limits.max_embedding_inputs),
+            format!(
+                "input must contain between 1 and {} texts",
+                state.limits.max_embedding_inputs
+            ),
         ));
     }
     let model = embedder.name.clone();
@@ -498,9 +545,10 @@ pub async fn rag_index_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RagIndexRequest>,
 ) -> Result<Json<RagIndexResponse>, ApiError> {
-    let rag_engine = state.rag_engine.clone().ok_or_else(|| {
-        ApiError::new(StatusCode::NOT_IMPLEMENTED, "RAG is not enabled on this server")
-    })?;
+    let rag_engine = state
+        .rag_engine
+        .clone()
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_IMPLEMENTED, "RAG is not enabled on this server"))?;
     if req.text.trim().is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "text must not be empty"));
     }
@@ -528,9 +576,10 @@ pub async fn rag_query_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RagQueryRequest>,
 ) -> Result<Json<RagResponse>, ApiError> {
-    let rag_engine = state.rag_engine.clone().ok_or_else(|| {
-        ApiError::new(StatusCode::NOT_IMPLEMENTED, "RAG is not enabled on this server")
-    })?;
+    let rag_engine = state
+        .rag_engine
+        .clone()
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_IMPLEMENTED, "RAG is not enabled on this server"))?;
     if req.query.trim().is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "query must not be empty"));
     }
@@ -570,7 +619,10 @@ pub async fn rag_query_handler(
     let mut citations = retrieval.citations;
     let messages = grounded_messages(&req.query, &citations)
         .into_iter()
-        .map(|m| ChatMessage { role: m.role, content: m.content })
+        .map(|m| ChatMessage {
+            role: m.role,
+            content: m.content,
+        })
         .collect();
     let chat_req = ChatCompletionRequest {
         model: None,
@@ -591,7 +643,10 @@ pub async fn rag_query_handler(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(ApiError::new(StatusCode::BAD_GATEWAY, format!("inference service returned {status}: {body}")));
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("inference service returned {status}: {body}"),
+        ));
     }
     let chat: ChatCompletionResponse = resp
         .json()

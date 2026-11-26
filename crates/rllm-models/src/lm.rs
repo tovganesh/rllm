@@ -56,7 +56,10 @@ impl<B: Backend> LanguageModel for LlamaModel<B> {
             cache.k.push(Tensor::zeros(shape.clone(), self.kv_dtype, dev)?);
             cache.v.push(Tensor::zeros(shape.clone(), self.kv_dtype, dev)?);
         }
-        *self.kv_cache.lock().map_err(|_| RllmError::BackendError("KV cache lock poisoned".into()))? = cache;
+        *self
+            .kv_cache
+            .lock()
+            .map_err(|_| RllmError::BackendError("KV cache lock poisoned".into()))? = cache;
         Ok(())
     }
 
@@ -66,7 +69,9 @@ impl<B: Backend> LanguageModel for LlamaModel<B> {
             .lock()
             .map_err(|_| RllmError::BackendError("KV cache lock poisoned".into()))?;
         if cache.k.is_empty() {
-            return Err(RllmError::BackendError("KV cache not initialised; call init_kv_cache".into()));
+            return Err(RllmError::BackendError(
+                "KV cache not initialised; call init_kv_cache".into(),
+            ));
         }
         let KvCache { k, v } = &mut *cache;
         self.forward(batch, k, v)?.to_vec::<f32>()

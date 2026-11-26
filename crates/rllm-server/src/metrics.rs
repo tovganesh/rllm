@@ -29,7 +29,8 @@ pub struct ServerMetrics {
 impl ServerMetrics {
     /// Records a time-to-first-token observation.
     pub fn observe_ttft(&self, start: Instant) {
-        self.ttft_us_sum.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.ttft_us_sum
+            .fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.ttft_count.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -72,9 +73,15 @@ pub fn render(state: &AppState) -> String {
     let m = &state.metrics;
 
     let requests = m.requests.lock();
-    let _ = writeln!(out, "# HELP rllm_http_requests_total HTTP requests by route and status.\n# TYPE rllm_http_requests_total counter");
+    let _ = writeln!(
+        out,
+        "# HELP rllm_http_requests_total HTTP requests by route and status.\n# TYPE rllm_http_requests_total counter"
+    );
     for ((route, status), (count, _)) in requests.iter() {
-        let _ = writeln!(out, "rllm_http_requests_total{{route=\"{route}\",status=\"{status}\"}} {count}");
+        let _ = writeln!(
+            out,
+            "rllm_http_requests_total{{route=\"{route}\",status=\"{status}\"}} {count}"
+        );
     }
     let _ = writeln!(out, "# HELP rllm_http_request_duration_seconds Time until response headers, by route.\n# TYPE rllm_http_request_duration_seconds summary");
     let mut by_route: BTreeMap<&str, (u64, f64)> = BTreeMap::new();
@@ -84,38 +91,153 @@ pub fn render(state: &AppState) -> String {
         e.1 += secs;
     }
     for (route, (count, secs)) in by_route {
-        let _ = writeln!(out, "rllm_http_request_duration_seconds_sum{{route=\"{route}\"}} {secs:.6}");
-        let _ = writeln!(out, "rllm_http_request_duration_seconds_count{{route=\"{route}\"}} {count}");
+        let _ = writeln!(
+            out,
+            "rllm_http_request_duration_seconds_sum{{route=\"{route}\"}} {secs:.6}"
+        );
+        let _ = writeln!(
+            out,
+            "rllm_http_request_duration_seconds_count{{route=\"{route}\"}} {count}"
+        );
     }
     drop(requests);
-    metric(&mut out, "rllm_http_requests_in_flight", "gauge", "Requests currently being handled.", m.in_flight.load(Ordering::Relaxed));
-    metric(&mut out, "rllm_requests_rejected_overloaded_total", "counter", "Requests rejected with 429 because the queue was full.", m.rejected_overloaded.load(Ordering::Relaxed));
+    metric(
+        &mut out,
+        "rllm_http_requests_in_flight",
+        "gauge",
+        "Requests currently being handled.",
+        m.in_flight.load(Ordering::Relaxed),
+    );
+    metric(
+        &mut out,
+        "rllm_requests_rejected_overloaded_total",
+        "counter",
+        "Requests rejected with 429 because the queue was full.",
+        m.rejected_overloaded.load(Ordering::Relaxed),
+    );
     let _ = writeln!(out, "# HELP rllm_time_to_first_token_seconds Time from request to first generated token.\n# TYPE rllm_time_to_first_token_seconds summary");
-    let _ = writeln!(out, "rllm_time_to_first_token_seconds_sum {:.6}", m.ttft_us_sum.load(Ordering::Relaxed) as f64 / 1e6);
-    let _ = writeln!(out, "rllm_time_to_first_token_seconds_count {}", m.ttft_count.load(Ordering::Relaxed));
+    let _ = writeln!(
+        out,
+        "rllm_time_to_first_token_seconds_sum {:.6}",
+        m.ttft_us_sum.load(Ordering::Relaxed) as f64 / 1e6
+    );
+    let _ = writeln!(
+        out,
+        "rllm_time_to_first_token_seconds_count {}",
+        m.ttft_count.load(Ordering::Relaxed)
+    );
 
     if let Some(engine) = &state.engine {
         let s = engine.scheduler();
         let sm = &s.metrics;
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        metric(&mut out, "rllm_sequences_running", "gauge", "Sequences in the running batch.", s.num_running());
-        metric(&mut out, "rllm_sequences_waiting", "gauge", "Sequences waiting for admission.", s.num_waiting());
-        metric(&mut out, "rllm_kv_blocks_total", "gauge", "KV-cache blocks in the pool.", s.config.total_blocks);
-        metric(&mut out, "rllm_kv_blocks_free", "gauge", "Free KV-cache blocks.", s.num_free_blocks());
-        metric(&mut out, "rllm_kv_blocks_prefix_cached", "gauge", "KV-cache blocks held by the prefix cache.", s.num_cached_blocks());
-        metric(&mut out, "rllm_sequences_submitted_total", "counter", "Sequences accepted by the scheduler.", get(&sm.sequences_submitted));
+        metric(
+            &mut out,
+            "rllm_sequences_running",
+            "gauge",
+            "Sequences in the running batch.",
+            s.num_running(),
+        );
+        metric(
+            &mut out,
+            "rllm_sequences_waiting",
+            "gauge",
+            "Sequences waiting for admission.",
+            s.num_waiting(),
+        );
+        metric(
+            &mut out,
+            "rllm_kv_blocks_total",
+            "gauge",
+            "KV-cache blocks in the pool.",
+            s.config.total_blocks,
+        );
+        metric(
+            &mut out,
+            "rllm_kv_blocks_free",
+            "gauge",
+            "Free KV-cache blocks.",
+            s.num_free_blocks(),
+        );
+        metric(
+            &mut out,
+            "rllm_kv_blocks_prefix_cached",
+            "gauge",
+            "KV-cache blocks held by the prefix cache.",
+            s.num_cached_blocks(),
+        );
+        metric(
+            &mut out,
+            "rllm_sequences_submitted_total",
+            "counter",
+            "Sequences accepted by the scheduler.",
+            get(&sm.sequences_submitted),
+        );
         let _ = writeln!(out, "# HELP rllm_sequences_finished_total Finished sequences by reason.\n# TYPE rllm_sequences_finished_total counter");
-        for (reason, c) in [("stop", &sm.finished_stop), ("length", &sm.finished_length), ("abort", &sm.finished_abort), ("error", &sm.failed)] {
+        for (reason, c) in [
+            ("stop", &sm.finished_stop),
+            ("length", &sm.finished_length),
+            ("abort", &sm.finished_abort),
+            ("error", &sm.failed),
+        ] {
             let _ = writeln!(out, "rllm_sequences_finished_total{{reason=\"{reason}\"}} {}", get(c));
         }
-        metric(&mut out, "rllm_preemptions_total", "counter", "Sequences preempted for lack of KV blocks.", s.num_preemptions());
-        metric(&mut out, "rllm_prompt_tokens_computed_total", "counter", "Prompt tokens run through the model.", get(&sm.prefill_tokens));
-        metric(&mut out, "rllm_prompt_tokens_cached_total", "counter", "Prompt tokens reused from the prefix cache.", get(&sm.cached_prompt_tokens));
-        metric(&mut out, "rllm_generated_tokens_total", "counter", "Generated tokens.", get(&sm.generated_tokens));
-        metric(&mut out, "rllm_draft_tokens_total", "counter", "Prompt-lookup draft tokens verified.", get(&sm.draft_tokens));
-        metric(&mut out, "rllm_draft_tokens_accepted_total", "counter", "Prompt-lookup draft tokens accepted.", get(&sm.accepted_draft_tokens));
-        metric(&mut out, "rllm_forward_passes_total", "counter", "Model forward passes.", get(&sm.forward_passes));
-        metric(&mut out, "rllm_forward_seconds_total", "counter", "Time spent in forward passes.", format!("{:.6}", get(&sm.forward_time_us) as f64 / 1e6));
+        metric(
+            &mut out,
+            "rllm_preemptions_total",
+            "counter",
+            "Sequences preempted for lack of KV blocks.",
+            s.num_preemptions(),
+        );
+        metric(
+            &mut out,
+            "rllm_prompt_tokens_computed_total",
+            "counter",
+            "Prompt tokens run through the model.",
+            get(&sm.prefill_tokens),
+        );
+        metric(
+            &mut out,
+            "rllm_prompt_tokens_cached_total",
+            "counter",
+            "Prompt tokens reused from the prefix cache.",
+            get(&sm.cached_prompt_tokens),
+        );
+        metric(
+            &mut out,
+            "rllm_generated_tokens_total",
+            "counter",
+            "Generated tokens.",
+            get(&sm.generated_tokens),
+        );
+        metric(
+            &mut out,
+            "rllm_draft_tokens_total",
+            "counter",
+            "Prompt-lookup draft tokens verified.",
+            get(&sm.draft_tokens),
+        );
+        metric(
+            &mut out,
+            "rllm_draft_tokens_accepted_total",
+            "counter",
+            "Prompt-lookup draft tokens accepted.",
+            get(&sm.accepted_draft_tokens),
+        );
+        metric(
+            &mut out,
+            "rllm_forward_passes_total",
+            "counter",
+            "Model forward passes.",
+            get(&sm.forward_passes),
+        );
+        metric(
+            &mut out,
+            "rllm_forward_seconds_total",
+            "counter",
+            "Time spent in forward passes.",
+            format!("{:.6}", get(&sm.forward_time_us) as f64 / 1e6),
+        );
     }
     out
 }

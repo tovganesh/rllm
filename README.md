@@ -1,5 +1,6 @@
 # `rllm`: LLM Inference & RAG Engine in Rust
 
+[![CI](https://github.com/tovganesh/rllm/actions/workflows/ci.yml/badge.svg)](https://github.com/tovganesh/rllm/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-early%20prototype-yellow.svg)](#-project-status)
@@ -7,7 +8,7 @@
 A modular, multi-backend LLM inference engine and hybrid RAG platform written in Rust from the ground up.
 
 > [!WARNING]
-> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU or an Apple GPU (Metal), with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. On an Apple M4 its CPU prompt processing is 1.3–3.3x faster than llama.cpp's CPU backend at 512 tokens, decode is at parity with llama.cpp or ahead on both CPU and Metal across Q8_0 / Q4_K_M / Q4_0 (CPU 0.97–1.08x), and Metal prompt processing is 0.85–0.95x of llama.cpp's Metal backend. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
+> **`rllm` is an early-stage prototype.** It can load and run small LLaMA-architecture GGUF chat models and BERT-architecture GGUF embedding models on the CPU or an Apple GPU (Metal), with outputs verified against llama.cpp, and answer questions over indexed documents with cited sources. On an Apple M4 its CPU prompt processing is 1.3–3.3x faster than llama.cpp's CPU backend at 512 tokens, decode is at parity with llama.cpp or ahead on both CPU and Metal across Q8_0 / Q4_K_M / Q4_0 (CPU 0.97–1.08x), and Metal prompt processing is 0.94–1.10x of llama.cpp's Metal backend. See [Known Issues & Limitations](#-known-issues--limitations). Do not use it for anything beyond experimentation and development.
 
 ---
 
@@ -136,6 +137,8 @@ cargo build --release
 cargo test --workspace
 cargo doc --workspace --no-deps --open
 ```
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy -D warnings` and the tests on macOS arm64 (including the Metal tests), Linux x86_64 and Linux arm64, plus a `cargo check` on the minimum supported Rust version (1.88). Tests that need GGUF files under `models/` skip themselves when the files are absent.
 
 ### Run a real model
 

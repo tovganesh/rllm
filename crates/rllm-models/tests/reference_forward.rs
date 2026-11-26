@@ -198,7 +198,10 @@ fn prefill_matches_reference_at_every_position() {
 
     let block_size = 4;
     // Deliberately scrambled, non-contiguous physical blocks.
-    let table = BlockTable { block_size, block_ids: vec![6, 1, 4] };
+    let table = BlockTable {
+        block_size,
+        block_ids: vec![6, 1, 4],
+    };
     let mut c = cache(&m, 8, block_size);
     let positions: Vec<usize> = (0..TOKENS.len()).collect();
     let tables = vec![table; TOKENS.len()];
@@ -227,7 +230,10 @@ fn prefill_then_decode_matches_reference() {
     let m = model();
     let expected = reference_logits(&m, &TOKENS);
     let block_size = 4;
-    let table = BlockTable { block_size, block_ids: vec![2, 7, 0] };
+    let table = BlockTable {
+        block_size,
+        block_ids: vec![2, 7, 0],
+    };
     let mut c = cache(&m, 8, block_size);
 
     // Prefill the first 5 tokens, asking only for the last row's logits.
@@ -251,7 +257,13 @@ fn prefill_then_decode_matches_reference() {
     // Decode the remaining tokens one at a time through the KV cache.
     for pos in prompt..TOKENS.len() {
         let logits = m
-            .forward_decode(&[TOKENS[pos]], &mut c.k, &mut c.v, std::slice::from_ref(&table), &[pos + 1])
+            .forward_decode(
+                &[TOKENS[pos]],
+                &mut c.k,
+                &mut c.v,
+                std::slice::from_ref(&table),
+                &[pos + 1],
+            )
             .unwrap();
         assert_close(&rows(&logits)[0], &expected[pos], &format!("decode position {pos}"));
     }
@@ -266,8 +278,14 @@ fn mixed_batch_of_two_sequences_matches_reference() {
     let exp_b = reference_logits(&m, seq_b);
 
     let block_size = 4;
-    let table_a = BlockTable { block_size, block_ids: vec![5, 0, 9] };
-    let table_b = BlockTable { block_size, block_ids: vec![3, 8] };
+    let table_a = BlockTable {
+        block_size,
+        block_ids: vec![5, 0, 9],
+    };
+    let table_b = BlockTable {
+        block_size,
+        block_ids: vec![3, 8],
+    };
     let mut c = cache(&m, 10, block_size);
 
     // Step 1: prefill A[..7] and B[..4] together in one call.
@@ -316,7 +334,10 @@ fn mixed_batch_of_two_sequences_matches_reference() {
 fn forward_rejects_out_of_range_positions_instead_of_panicking() {
     let m = model();
     let mut c = cache(&m, 2, 4);
-    let table = BlockTable { block_size: 4, block_ids: vec![0, 1] };
+    let table = BlockTable {
+        block_size: 4,
+        block_ids: vec![0, 1],
+    };
 
     // Position beyond the model's context window.
     let err = m.forward_decode(
@@ -333,7 +354,10 @@ fn forward_rejects_out_of_range_positions_instead_of_panicking() {
     assert!(err.is_err());
 
     // Token outside the vocabulary.
-    let table = BlockTable { block_size: 4, block_ids: vec![0] };
+    let table = BlockTable {
+        block_size: 4,
+        block_ids: vec![0],
+    };
     let err = m.forward_decode(&[m.config.vocab_size as u32], &mut c.k, &mut c.v, &[table], &[1]);
     assert!(err.is_err());
 }

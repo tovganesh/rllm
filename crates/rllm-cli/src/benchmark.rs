@@ -24,9 +24,7 @@ use rllm_core::{
     tensor::Tensor,
 };
 use rllm_models::{LlamaConfig, LlamaModel};
-use rllm_scheduler::{
-    ContinuousBatchScheduler, SamplingParams, SchedulerConfig, Sequence,
-};
+use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, SchedulerConfig, Sequence};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -112,9 +110,16 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
 
     println!("📋 Target Model Architecture & 4GB Fit Analysis:");
     println!("   • Preset:              {}", opts.preset);
-    println!("   • Parameter Count:     {:.2} Million", params_count as f64 / 1_000_000.0);
-    println!("   • Hidden Size:         {} (Intermediate: {})", config.hidden_size, config.intermediate_size);
-    println!("   • Attention Heads:     {} (KV Heads: {}, GQA {:.1}:1)",
+    println!(
+        "   • Parameter Count:     {:.2} Million",
+        params_count as f64 / 1_000_000.0
+    );
+    println!(
+        "   • Hidden Size:         {} (Intermediate: {})",
+        config.hidden_size, config.intermediate_size
+    );
+    println!(
+        "   • Attention Heads:     {} (KV Heads: {}, GQA {:.1}:1)",
         config.num_attention_heads,
         config.num_key_value_heads,
         config.num_attention_heads as f64 / config.num_key_value_heads as f64
@@ -125,13 +130,25 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
     println!("   ┌────────────────────────┬─────────────┬─────────────┬────────────────┐");
     println!("   │ Format                 │ Weights     │ KV Cache    │ Total RAM (%4G)│");
     println!("   ├────────────────────────┼─────────────┼─────────────┼────────────────┤");
-    println!("   │ FP32 (Unquantized)     │ {:>7.1} MB  │ {:>7.1} MB  │ {:>6.1} MB ({:>4.1}%)│",
-        weights_fp32, kv_fp32, total_fp32, (total_fp32 / 4096.0) * 100.0);
-    println!("   │ Q4_0 (4-bit Block)     │ {:>7.1} MB  │ {:>7.1} MB  │ {:>6.1} MB ({:>4.1}%)│",
-        weights_q4, kv_fp32, total_q4, (total_q4 / 4096.0) * 100.0);
+    println!(
+        "   │ FP32 (Unquantized)     │ {:>7.1} MB  │ {:>7.1} MB  │ {:>6.1} MB ({:>4.1}%)│",
+        weights_fp32,
+        kv_fp32,
+        total_fp32,
+        (total_fp32 / 4096.0) * 100.0
+    );
+    println!(
+        "   │ Q4_0 (4-bit Block)     │ {:>7.1} MB  │ {:>7.1} MB  │ {:>6.1} MB ({:>4.1}%)│",
+        weights_q4,
+        kv_fp32,
+        total_q4,
+        (total_q4 / 4096.0) * 100.0
+    );
     println!("   └────────────────────────┴─────────────┴─────────────┴────────────────┘");
-    println!("   💡 Headroom on 4GB Device: {:.1} MB available for OS & user applications.\n",
-        4096.0 - total_fp32);
+    println!(
+        "   💡 Headroom on 4GB Device: {:.1} MB available for OS & user applications.\n",
+        4096.0 - total_fp32
+    );
 
     // ──────────────────────────────────────────────────────────────────
     // 1. Kernel Micro-Benchmarks (GEMV, Quantized GEMV, RoPE, PagedAttn)
@@ -143,8 +160,10 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
     // 2. End-to-End LLM Generation Benchmark
     // ──────────────────────────────────────────────────────────────────
     println!("\n🚀 End-to-End Inference Generation Benchmark:");
-    println!("   Batch Size: {}, Context Prompt: {} tokens, Generated: {} tokens",
-        opts.batch_size, opts.prompt_tokens, opts.generate_tokens);
+    println!(
+        "   Batch Size: {}, Context Prompt: {} tokens, Generated: {} tokens",
+        opts.batch_size, opts.prompt_tokens, opts.generate_tokens
+    );
 
     let backend = Arc::new(CpuBackend);
     let model = Arc::new(LlamaModel::new_random(config.clone(), backend)?);
@@ -157,9 +176,11 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
     };
     let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, model)?);
 
-    let mut sampling = SamplingParams::default();
-    sampling.max_tokens = opts.generate_tokens;
-    sampling.stop_tokens.clear(); // Ensure deterministic run
+    let sampling = SamplingParams {
+        max_tokens: opts.generate_tokens,
+        stop_tokens: Vec::new(),
+        ..Default::default()
+    }; // no stop tokens: deterministic length
 
     let prompt: Vec<u32> = (0..opts.prompt_tokens).map(|i| (i % 500 + 1) as u32).collect();
 
@@ -232,7 +253,10 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
     println!("   • Median (P50):             {:.2} ms / token", stats.p50_ms);
     println!("   • P90:                      {:.2} ms / token", stats.p90_ms);
     println!("   • P99:                      {:.2} ms / token", stats.p99_ms);
-    println!("   • Min / Max:                {:.2} ms / {:.2} ms", stats.min_ms, stats.max_ms);
+    println!(
+        "   • Min / Max:                {:.2} ms / {:.2} ms",
+        stats.min_ms, stats.max_ms
+    );
 
     // ──────────────────────────────────────────────────────────────────
     // 3. Batch Scaling Efficiency
@@ -286,7 +310,10 @@ fn benchmark_micro_kernels(config: &LlamaConfig) -> Result<()> {
     println!("   • GEMV [{}, {}]:", n, k);
     println!("     - FP32 GEMV Latency:      {:.2?}", f32_dur);
     println!("     - Q4_0 Quantized GEMV:    {:.2?}", q4_dur);
-    println!("     - Quantization Speedup:   {:.2}x faster (memory bandwidth savings)", speedup);
+    println!(
+        "     - Quantization Speedup:   {:.2}x faster (memory bandwidth savings)",
+        speedup
+    );
 
     // 2. RMSNorm
     let mut norm_out = vec![0.0f32; k];
@@ -358,9 +385,11 @@ fn run_batch_scaling_analysis(config: &LlamaConfig) -> Result<()> {
         };
         let scheduler = ContinuousBatchScheduler::new(sched_cfg, model.clone())?;
 
-        let mut sampling = SamplingParams::default();
-        sampling.max_tokens = 8;
-        sampling.stop_tokens.clear();
+        let sampling = SamplingParams {
+            max_tokens: 8,
+            stop_tokens: Vec::new(),
+            ..Default::default()
+        };
 
         for i in 0..bs {
             let seq = Sequence::new(
@@ -388,12 +417,16 @@ fn run_batch_scaling_analysis(config: &LlamaConfig) -> Result<()> {
 
         if bs == 1 {
             base_tps = tps;
-            println!("   │ {:>10} │ {:>13.1} t/s │ {:>12.2} ms │ {:>11.1}x │",
-                bs, tps, per_seq_lat, 1.0);
+            println!(
+                "   │ {:>10} │ {:>13.1} t/s │ {:>12.2} ms │ {:>11.1}x │",
+                bs, tps, per_seq_lat, 1.0
+            );
         } else {
             let scaling = tps / base_tps.max(1e-6);
-            println!("   │ {:>10} │ {:>13.1} t/s │ {:>12.2} ms │ {:>11.2}x │",
-                bs, tps, per_seq_lat, scaling);
+            println!(
+                "   │ {:>10} │ {:>13.1} t/s │ {:>12.2} ms │ {:>11.2}x │",
+                bs, tps, per_seq_lat, scaling
+            );
         }
     }
     println!("   └────────────┴──────────────────┴─────────────────┴──────────────┘");
@@ -412,9 +445,11 @@ fn run_prefix_cache_benchmark(config: &LlamaConfig) -> Result<()> {
     };
     let scheduler = ContinuousBatchScheduler::new(sched_cfg, model)?;
 
-    let mut sampling = SamplingParams::default();
-    sampling.max_tokens = 4;
-    sampling.stop_tokens.clear();
+    let sampling = SamplingParams {
+        max_tokens: 4,
+        stop_tokens: Vec::new(),
+        ..Default::default()
+    };
 
     // 64-token shared system prompt
     let shared_prompt: Vec<u32> = (0..64).map(|i| (i % 500 + 1) as u32).collect();
@@ -452,7 +487,10 @@ fn run_prefix_cache_benchmark(config: &LlamaConfig) -> Result<()> {
     println!("   • Cold Prefill + Generation: {:.2?}", cold_dur);
     println!("   • Warm Prefix Hit + Gen:     {:.2?}", warm_dur);
     let speedup = cold_dur.as_secs_f64() / warm_dur.as_secs_f64().max(1e-9);
-    println!("   • Radix Cache Speedup:       {:.2}x faster prefill turnaround!", speedup);
+    println!(
+        "   • Radix Cache Speedup:       {:.2}x faster prefill turnaround!",
+        speedup
+    );
 
     Ok(())
 }
