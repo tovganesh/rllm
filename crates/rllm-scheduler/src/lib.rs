@@ -62,9 +62,11 @@ mod tests {
         };
         let scheduler = ContinuousBatchScheduler::new(sched_cfg, model).unwrap();
 
-        let mut params = SamplingParams::default();
-        params.max_tokens = 3;
-        params.stop_tokens.clear();
+        let params = SamplingParams {
+            max_tokens: 3,
+            stop_tokens: Vec::new(),
+            ..Default::default()
+        };
 
         let seq1 = Sequence::new(1, vec![10, 20], params.clone(), 4, None);
         let seq2 = Sequence::new(2, vec![30, 40, 50], params.clone(), 4, None);

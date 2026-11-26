@@ -176,9 +176,11 @@ pub fn run_comprehensive_benchmark(opts: BenchmarkOptions) -> Result<()> {
     };
     let scheduler = Arc::new(ContinuousBatchScheduler::new(sched_cfg, model)?);
 
-    let mut sampling = SamplingParams::default();
-    sampling.max_tokens = opts.generate_tokens;
-    sampling.stop_tokens.clear(); // Ensure deterministic run
+    let sampling = SamplingParams {
+        max_tokens: opts.generate_tokens,
+        stop_tokens: Vec::new(),
+        ..Default::default()
+    }; // no stop tokens: deterministic length
 
     let prompt: Vec<u32> = (0..opts.prompt_tokens).map(|i| (i % 500 + 1) as u32).collect();
 
@@ -383,9 +385,11 @@ fn run_batch_scaling_analysis(config: &LlamaConfig) -> Result<()> {
         };
         let scheduler = ContinuousBatchScheduler::new(sched_cfg, model.clone())?;
 
-        let mut sampling = SamplingParams::default();
-        sampling.max_tokens = 8;
-        sampling.stop_tokens.clear();
+        let sampling = SamplingParams {
+            max_tokens: 8,
+            stop_tokens: Vec::new(),
+            ..Default::default()
+        };
 
         for i in 0..bs {
             let seq = Sequence::new(
@@ -441,9 +445,11 @@ fn run_prefix_cache_benchmark(config: &LlamaConfig) -> Result<()> {
     };
     let scheduler = ContinuousBatchScheduler::new(sched_cfg, model)?;
 
-    let mut sampling = SamplingParams::default();
-    sampling.max_tokens = 4;
-    sampling.stop_tokens.clear();
+    let sampling = SamplingParams {
+        max_tokens: 4,
+        stop_tokens: Vec::new(),
+        ..Default::default()
+    };
 
     // 64-token shared system prompt
     let shared_prompt: Vec<u32> = (0..64).map(|i| (i % 500 + 1) as u32).collect();

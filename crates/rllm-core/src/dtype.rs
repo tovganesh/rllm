@@ -72,7 +72,7 @@ impl DType {
     /// Computes total storage bytes required to store `num_elements` elements.
     pub fn storage_bytes(&self, num_elements: usize) -> usize {
         if let Some((block_size, bytes_per_block)) = self.block_info() {
-            let num_blocks = (num_elements + block_size - 1) / block_size;
+            let num_blocks = num_elements.div_ceil(block_size);
             num_blocks * bytes_per_block
         } else {
             num_elements * self.size_in_bytes()

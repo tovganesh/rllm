@@ -64,3 +64,10 @@ codegen-units = 1
 opt-level = 1
 debug = true
 
+
+# CI builds: release optimisation without thin LTO and single-unit codegen (faster to
+# compile; the tests check results, not speed).
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16

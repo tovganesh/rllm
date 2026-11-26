@@ -94,14 +94,14 @@ mod tests {
         .unwrap();
 
         let k_cache = Tensor::from_f32(
-            &vec![1.0f32; 1 * num_heads_kv * block_size * head_dim],
+            &vec![1.0f32; num_heads_kv * block_size * head_dim],
             Shape::new(vec![1, num_heads_kv, block_size, head_dim]),
             Device::Cpu,
         )
         .unwrap();
 
         let v_cache = Tensor::from_f32(
-            &vec![2.0f32; 1 * num_heads_kv * block_size * head_dim],
+            &vec![2.0f32; num_heads_kv * block_size * head_dim],
             Shape::new(vec![1, num_heads_kv, block_size, head_dim]),
             Device::Cpu,
         )
