@@ -78,3 +78,16 @@ jobs:
               models/SmolLM2-135M-Instruct-Q8_0.gguf models/SmolLM2-135M-Instruct-Q4_K_M.requant.gguf models/SmolLM2-135M-Instruct-Q4_0.requant.gguf \
               models/Llama-3.2-1B-Instruct-Q8_0.gguf models/Llama-3.2-1B-Instruct-Q4_K_M.requant.gguf models/Llama-3.2-1B-Instruct-Q4_0.requant.gguf
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Where decode time goes (best effort: needs perf for the runner's kernel).
+      - name: Profile decode
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y -qq "linux-tools-$(uname -r)" linux-tools-generic > /dev/null
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          for m in SmolLM2-135M-Instruct-Q8_0.gguf Llama-3.2-1B-Instruct-Q4_0.requant.gguf; do
+            perf record -q -F 2000 -g -o perf.data -- target/release/rllm --threads "$(nproc)" bench \
+              --model models/$m --prompt-tokens 16 --generate-tokens 128 --repetitions 2 > /dev/null
+            echo "#### $m (decode-heavy run)"
+            perf report -i perf.data --stdio --no-children --sort symbol --percent-limit 1.5 2> /dev/null \
+              | grep -E "^ +[0-9]" | cut -c1-140 | head -30
+          done | tee -a "$GITHUB_STEP_SUMMARY"
