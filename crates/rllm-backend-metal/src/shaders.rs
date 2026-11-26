@@ -493,6 +493,177 @@ MVN_ALL(MvQ4, "q4_0")
 MVN_ALL(MvQ4K, "q4_k")
 MVN_ALL(MvQ6K, "q6_k")
 
+// ── few-row GEMM for 2-8 activation rows on simdgroup matrices (Q8_0 / Q4_0) ──
+// Ported from llama.cpp's `kernel_mul_mv_mma_blk` (MIT). A threadgroup computes 8*NT
+// weight rows x 8*RT activation rows; its NSG simdgroups split K (simdgroup s takes
+// blocks s, s + NSG, ...) and add their partial tiles through threadgroup memory at the
+// end. Each lane fills its two elements of every 8x8 fragment straight from registers,
+// with no threadgroup staging: the weight fragment holds raw quants as exact halves
+// (`1024 + q` built by OR-ing q into the bits of 1024.0h, minus the bias), the block
+// scale is applied once per block to the product, and the activation fragment reads F32
+// activations in the k order that the quant layout gives (so `x` needs no conversion to
+// half). The next block's quants and activations load before the current block's
+// products. In an 8x8 fragment lane l holds row fm, columns fn and fn + 1.
+// Per Llama-3.2-1B layer on an M4: Q4_0 is 8% faster than `mv2` at 2 rows, 38% faster
+// than `mv4` at 3-4 and 27% faster than `mms` at 8; Q8_0 is equal at 2 and 6-13% faster
+// at 3-8. One row keeps `mv` (as fast for Q8_0, 4% faster for Q4_0). The kernel takes
+// RT 8-row activation tiles; `RT = 2` (9-16 rows) was faster than `mmh` alone, but not
+// than `mmh` with split-K, so only `RT = 1` is instantiated.
+inline half2 mvm_1024_plus(ushort2 q) { return as_type<half2>(q | ushort2(0x6400)); }
+
+// Q4_0: lane (row fm, column fn) holds qs ushorts fn, fn + 1. A high nibble stays in
+// place as 16*q, so the activations it multiplies (b1) are divided by 16. Activation lane
+// k = fm holds values 2k, 2k + 1 (b0, low nibbles) and 2k + 16, 2k + 17 (b1) of a block;
+// step s takes b1 for odd s and the .y value for s >= 2.
+struct MvmQ4 {
+    typedef block_q4_0 block;
+    typedef ushort2 quants;
+    enum { b1 = 8 };   // float2 offset of b1 within a block of activations
+    static short a_off(short fn) { return 1 + fn; }
+    static short b_off(short fm) { return 2 * fm; }
+    static quants load(device const ushort* qs) { return ushort2(qs[0], qs[1]); }
+    static quants prep(quants q) { return q; }
+    static float2 prep_b1(float2 v) { return v * (1.0f / 16); }
+    static bool b1_step(short s) { return s % 2 != 0; }
+    static bool y_step(short s) { return s >= 2; }
+    static half2 frag(quants q, short s) {
+        const ushort2 qq = s < 2 ? q : q >> 8;
+        return s % 2 == 0 ? mvm_1024_plus(qq & ushort2(0x000F)) - half2(1024.0h + 8.0h)
+                          : mvm_1024_plus(qq & ushort2(0x00F0)) - half2(1024.0h + 128.0h);
+    }
+};
+// Q8_0: lane (row fm, column fn) holds qs bytes 2fn .. 2fn + 7; flipping the sign bit of
+// a byte gives the unsigned q + 128. Activation lane k = fm holds values b, b + 1 (b0) and
+// b + 4, b + 5 (b1) of a block, b = 8 (k / 2) + 2 (k % 2).
+struct MvmQ8 {
+    typedef block_q8_0 block;
+    typedef ushort4 quants;
+    enum { b1 = 2 };
+    static short a_off(short fn) { return 1 + 2 * fn; }
+    static short b_off(short fm) { return 8 * (fm / 2) + 2 * (fm % 2); }
+    static quants load(device const ushort* qs) { return ushort4(qs[0], qs[1], qs[2], qs[3]); }
+    static quants prep(quants q) { return q ^ ushort4(0x8080); }
+    static float2 prep_b1(float2 v) { return v; }
+    static bool b1_step(short s) { return s >= 2; }
+    static bool y_step(short s) { return s % 2 != 0; }
+    static half2 frag(quants q, short s) {
+        const ushort2 w = s < 2 ? q.xy : q.zw;
+        const ushort2 qq = s % 2 == 0 ? w : w >> 8;
+        return mvm_1024_plus(qq & ushort2(0x00FF)) - half2(1024.0h + 128.0h);
+    }
+};
+
+template <short NT, short RT, short NSG, typename Q>
+kernel void mvm(LINEAR_ARGS, uint2 tgp [[threadgroup_position_in_grid]],
+                ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[NSG * RT * NT * 64];
+    const short fm = ((lane / 4) & 4) + ((lane / 2) % 4), fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
+    const uint i01 = tgp.x * (8 * NT), i11 = tgp.y * (8 * RT);
+    const uint nb = k / 32;
+    constexpr short us_blk = sizeof(typename Q::block) / 2;
+    // Rows past n (weights) and m (activations) repeat the last row; their outputs are
+    // not written.
+    device const ushort* xq[NT];
+    for (short t = 0; t < NT; ++t) {
+        const uint r = min(i01 + 8 * t + fm, n - 1);
+        xq[t] = (device const ushort*)(w + (ulong)r * nb * sizeof(typename Q::block)) + Q::a_off(fn);
+    }
+    device const float2* yp[RT][2];
+    for (short rt = 0; rt < RT; ++rt)
+        for (short e = 0; e < 2; ++e)
+            yp[rt][e] = (device const float2*)(x + (ulong)min(i11 + 8 * rt + fn + e, m - 1) * k + Q::b_off(fm));
+    float acc[RT][NT][2];
+    for (short rt = 0; rt < RT; ++rt)
+        for (short t = 0; t < NT; ++t) acc[rt][t][0] = acc[rt][t][1] = 0.0f;
+    typename Q::quants q[NT];
+    float d[NT];
+    float2 b0[RT][2], b1[RT][2];
+    const uint ib0 = min((uint)sg, nb - 1);
+    for (short t = 0; t < NT; ++t) {
+        device const ushort* qs = xq[t] + ib0 * us_blk;
+        q[t] = Q::load(qs);
+        d[t] = float(as_type<half>(*(qs - Q::a_off(fn))));
+    }
+    for (short rt = 0; rt < RT; ++rt)
+        for (short e = 0; e < 2; ++e) {
+            b0[rt][e] = yp[rt][e][ib0 * 16];
+            b1[rt][e] = yp[rt][e][ib0 * 16 + Q::b1];
+        }
+    for (uint ib = sg; ib < nb; ib += NSG) {
+        typename Q::quants qc[NT];
+        float dc[NT];
+        float2 b0c[RT][2], b1c[RT][2];
+        for (short t = 0; t < NT; ++t) {
+            qc[t] = Q::prep(q[t]);
+            dc[t] = d[t];
+        }
+        for (short rt = 0; rt < RT; ++rt)
+            for (short e = 0; e < 2; ++e) {
+                b0c[rt][e] = b0[rt][e];
+                b1c[rt][e] = Q::prep_b1(b1[rt][e]);
+            }
+        const uint ibn = min(ib + NSG, nb - 1);
+        for (short t = 0; t < NT; ++t) {
+            device const ushort* qs = xq[t] + ibn * us_blk;
+            q[t] = Q::load(qs);
+            d[t] = float(as_type<half>(*(qs - Q::a_off(fn))));
+        }
+        for (short rt = 0; rt < RT; ++rt)
+            for (short e = 0; e < 2; ++e) {
+                b0[rt][e] = yp[rt][e][ibn * 16];
+                b1[rt][e] = yp[rt][e][ibn * 16 + Q::b1];
+            }
+        simdgroup_float8x8 mp[RT][NT];
+        for (short rt = 0; rt < RT; ++rt)
+            for (short t = 0; t < NT; ++t) mp[rt][t] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        for (short s = 0; s < 4; ++s) {
+            simdgroup_float8x8 mb[RT];
+            for (short rt = 0; rt < RT; ++rt) {
+                const float2 v0 = Q::b1_step(s) ? b1c[rt][0] : b0c[rt][0];
+                const float2 v1 = Q::b1_step(s) ? b1c[rt][1] : b0c[rt][1];
+                mb[rt].thread_elements()[0] = Q::y_step(s) ? v0.y : v0.x;
+                mb[rt].thread_elements()[1] = Q::y_step(s) ? v1.y : v1.x;
+            }
+            for (short t = 0; t < NT; ++t) {
+                const half2 h = Q::frag(qc[t], s);
+                simdgroup_half8x8 ma;
+                ma.thread_elements()[0] = h.x;
+                ma.thread_elements()[1] = h.y;
+                for (short rt = 0; rt < RT; ++rt) simdgroup_multiply_accumulate(mp[rt][t], ma, mb[rt], mp[rt][t]);
+            }
+        }
+        for (short t = 0; t < NT; ++t)
+            for (short rt = 0; rt < RT; ++rt) {
+                acc[rt][t][0] = fma(dc[t], mp[rt][t].thread_elements()[0], acc[rt][t][0]);
+                acc[rt][t][1] = fma(dc[t], mp[rt][t].thread_elements()[1], acc[rt][t][1]);
+            }
+    }
+    // Sum the simdgroups' K slices; element idx of a tile is lane idx/2's element idx%2.
+    for (short rt = 0; rt < RT; ++rt)
+        for (short t = 0; t < NT; ++t) {
+            red[((sg * RT + rt) * NT + t) * 64 + 2 * lane] = acc[rt][t][0];
+            red[((sg * RT + rt) * NT + t) * 64 + 2 * lane + 1] = acc[rt][t][1];
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short idx = sg * 32 + lane; idx < RT * NT * 64; idx += NSG * 32) {
+        float sum = 0.0f;
+        for (short s = 0; s < NSG; ++s) sum += red[s * (RT * NT * 64) + idx];
+        const short rt = idx / (NT * 64), t = (idx / 64) % NT, l = (idx % 64) / 2;
+        const uint r0 = i01 + 8 * t + (((l / 4) & 4) + ((l / 2) % 4));
+        const uint r1 = i11 + 8 * rt + (((l / 4) & 2) * 2 + (l % 2) * 2) + idx % 2;
+        if (r0 < n && r1 < m) {
+            device float* o = y + (ulong)r1 * ldy + r0;
+            *o = accumulate ? *o + sum : sum;
+        }
+    }
+}
+// Per threadgroup: Q4_0 two 8-row weight tiles and 8 simdgroups, Q8_0 one tile and 16
+// simdgroups (swept on an M4 over 1, 2 or 4 tiles and 8 or 16 simdgroups, then end to end
+// for Q8_0). Keep in sync with `mvm_shape` in llama.rs.
+typedef decltype(mvm<2, 1, 8, MvmQ4>) mvm_t;
+template [[host_name("mvm_q4_0")]] kernel mvm_t mvm<2, 1, 8, MvmQ4>;
+template [[host_name("mvm_q8_0")]] kernel mvm_t mvm<1, 1, 16, MvmQ8>;
+
 // ── small-batch GEMM: up to 8*NT activation rows on simdgroup matrices ──
 // Each simdgroup owns 8 weight rows. Per 32-value block, its 32 lanes dequantize the
 // 8x32 weight tile once (8 values each, as the tiled GEMM does) into threadgroup memory

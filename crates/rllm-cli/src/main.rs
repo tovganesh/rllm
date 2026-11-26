@@ -214,6 +214,13 @@ enum Commands {
         /// request (prefix cache warm) versus not (cold).
         #[arg(long)]
         shared_prefix: Option<usize>,
+
+        /// With --model: N independent sequences processed together, as a server
+        /// batches concurrent requests (like llama-batched-bench -npl N): one pass over
+        /// all N prompts of --prompt-tokens tokens, then --generate-tokens steps that
+        /// each decode one token per sequence. Reports aggregate tokens/s.
+        #[arg(long)]
+        parallel: Option<usize>,
     },
 
     /// Run end-to-end RAG interactive demonstration with citations and relevance verification
@@ -426,11 +433,13 @@ async fn main() -> anyhow::Result<()> {
             repetitions,
             depth,
             shared_prefix,
+            parallel,
         } => {
             if let Some(path) = model {
-                match shared_prefix {
-                    Some(shared) => run_prefix_bench(&path, prompt_tokens, shared, repetitions.max(1), device)?,
-                    None => run_model_bench(&path, prompt_tokens, generate_tokens, depth, repetitions.max(1), device)?,
+                match (shared_prefix, parallel) {
+                    (Some(shared), _) => run_prefix_bench(&path, prompt_tokens, shared, repetitions.max(1), device)?,
+                    (None, Some(n)) => run_parallel_bench(&path, prompt_tokens, generate_tokens, n.max(1), repetitions.max(1), device)?,
+                    (None, None) => run_model_bench(&path, prompt_tokens, generate_tokens, depth, repetitions.max(1), device)?,
                 }
                 return Ok(());
             }
@@ -775,6 +784,72 @@ fn run_model_bench(path: &std::path::Path, pp: usize, tg: usize, depth: usize, r
     }
     if !tg_rates.is_empty() {
         println!("| {name} | {} | tg{tg}{at} | {:.1} |", lm.device_name(), median(tg_rates));
+    }
+    Ok(())
+}
+
+/// `rllm bench --model --parallel N`: aggregate throughput of `n` independent sequences
+/// batched together (llama-batched-bench's S_PP and S_TG): one forward pass over all
+/// `n` prompts of `pp` tokens, then `tg` steps of one token per sequence (positions
+/// `pp..pp + tg`, so the context grows as in a real decode).
+fn run_parallel_bench(path: &std::path::Path, pp: usize, tg: usize, n: usize, reps: usize, device: LlmDevice) -> anyhow::Result<()> {
+    use rllm_core::backend::BlockTable;
+    use rllm_models::ForwardBatch;
+
+    anyhow::ensure!(pp > 0, "--parallel needs --prompt-tokens > 0");
+    let ctx = pp + tg;
+    let bundle = GgufBundle::load(path, Arc::new(CpuBackend), &load_opts(ctx.max(16)))?;
+    let vocab = bundle.model.config.vocab_size as u32;
+    let lm = device.executor(bundle.model)?;
+    let block = 16;
+    let per_seq = ctx.div_ceil(block);
+    lm.init_kv_cache(n * per_seq, block)?;
+    let tables: Vec<BlockTable> =
+        (0..n).map(|s| BlockTable { block_size: block, block_ids: (s * per_seq..(s + 1) * per_seq).collect() }).collect();
+    // Deterministic pseudo-random tokens, different for each sequence.
+    let token = |s: usize, i: usize| (((s * 100_003 + i) as u32).wrapping_mul(2654435761) >> 8) % vocab;
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    let (mut tokens, mut positions, mut row_tables, mut last) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (s, t) in tables.iter().enumerate() {
+        tokens.extend((0..pp).map(|i| token(s, i)));
+        positions.extend(0..pp);
+        row_tables.extend(std::iter::repeat_n(t.clone(), pp));
+        last.push((s + 1) * pp - 1);
+    }
+    let prompts = ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &row_tables, logits_rows: &last };
+    let rows: Vec<usize> = (0..n).collect();
+    let decode = || -> anyhow::Result<()> {
+        for i in 0..tg {
+            let toks: Vec<u32> = (0..n).map(|s| token(s, pp + i)).collect();
+            let pos = vec![pp + i; n];
+            lm.forward_cached(&ForwardBatch { tokens: &toks, positions: &pos, block_tables: &tables, logits_rows: &rows })?;
+        }
+        Ok(())
+    };
+    // Warm-up (shader/pipeline caches, page faults).
+    lm.forward_cached(&prompts)?;
+    decode()?;
+
+    let (mut pp_rates, mut tg_rates) = (Vec::new(), Vec::new());
+    for _ in 0..reps {
+        let t = Instant::now();
+        lm.forward_cached(&prompts)?;
+        pp_rates.push((n * pp) as f64 / t.elapsed().as_secs_f64());
+        if tg > 0 {
+            let t = Instant::now();
+            decode()?;
+            tg_rates.push((n * tg) as f64 / t.elapsed().as_secs_f64());
+        }
+    }
+    println!("| model | device | test | t/s |");
+    println!("| --- | --- | --- | ---: |");
+    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    println!("| {name} | {} | pp{pp} x{n} | {:.1} |", lm.device_name(), median(pp_rates));
+    if !tg_rates.is_empty() {
+        println!("| {name} | {} | tg{tg} x{n} | {:.1} |", lm.device_name(), median(tg_rates));
     }
     Ok(())
 }

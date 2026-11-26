@@ -167,12 +167,62 @@ One forward pass over N tokens (`rllm bench --model M --prompt-tokens N`, llama-
 
 On the CPU, K-quants are 1.3–1.65x ahead of llama.cpp up to 16 tokens and Q8_0 is 0.82–0.86x from 4 tokens (llama.cpp repacks Q8_0 for i8mm; rllm interleaves rows on the fly). On Metal rllm is at 0.91–1.07x of llama.cpp up to 8 tokens for Q8_0 and Q4_K_M (Q4_0 0.77–1.03x) and 0.65–0.82x at 16–32, where the small-batch GEMM runs at ~45% of the half-precision peak.
 
-**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x).
+Since PR #28 (few-row Metal GEMM, below), Metal one-pass batches of 2 / 4 / 8 tokens run at 206 / 408 / 811 tok/s on 1B Q4_0 (llama.cpp 179 / 371 / 706: 1.15 / 1.10 / 1.15x) and 116 / 241 / 456 on 1B Q8_0 (llama.cpp 113 / 235 / 431: 1.03 / 1.03 / 1.06x).
+
+#### Parallel sequences
+
+`rllm bench --model M --prompt-tokens 128 --generate-tokens 64 --parallel N` against `llama-batched-bench -npp 128 -ntg 64 -npl N` (both `-ngl 99` / Metal): N independent sequences, one pass over all N prompts, then 64 steps that each decode one token per sequence (a server batching N concurrent requests). Aggregate decode tok/s (S_TG); the machine was under background load, so single figures vary by ~5–10%.
+
+| model | sequences | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
+| --- | ---: | ---: | ---: | ---: |
+| Llama-3.2-1B-Instruct-Q4_0.requant | 1 | 82 | 92 | 1.12x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | 2 | 156 | 167 | 1.07x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | 4 | 317 | 337 | 1.06x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | 8 | 546 | 601 | 1.10x |
+| Llama-3.2-1B-Instruct-Q4_0.requant | 16 | 739 | 691 | 0.94x |
+| Llama-3.2-1B-Instruct-Q8_0 | 1 | 51 | 55 | 1.08x |
+| Llama-3.2-1B-Instruct-Q8_0 | 2 | 97 | 112 | 1.16x |
+| Llama-3.2-1B-Instruct-Q8_0 | 4 | 205 | 211 | 1.03x |
+| Llama-3.2-1B-Instruct-Q8_0 | 8 | 375 | 371 | 0.99x |
+| SmolLM2-135M-Instruct-Q8_0 | 2 | 435 | 492 | 1.13x |
+| SmolLM2-135M-Instruct-Q8_0 | 4 | 895 | 986 | 1.10x |
+| SmolLM2-135M-Instruct-Q8_0 | 8 | 1,641 | 1,698 | 1.03x |
+
+Before PR #28, 1B Q4_0 was at 0.79x with 4 sequences (247 tok/s): a 4-row step cost more than an 8-row one.
+
+**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x); Metal batches of 2–8 tokens on 1B Q4_0 (1.10–1.15x) and 2–8 sequences decoding together (0.99–1.16x).
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
 - Metal prompt processing on Llama-3.2-1B, 0.94–0.96x (128–512 tokens); SmolLM2 F16 is at parity or ahead (0.99–1.07x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 - Metal decode at 4k context: SmolLM2 F16 0.95x, 1B Q4_K_M 0.93x (Q8_0 and Q4_0 at parity). Decode attention reaches ~80 GB/s of the ~100 GB/s a plain streaming read gets; see "Metal decode attention" below.
+
+**Metal few-row GEMM for 2–8 rows (PR #28)**
+
+A new `rllm bench --parallel N` mode (above) showed 1B Q4_0 decoding 4 sequences at 0.79x of `llama-batched-bench`, with a 4-row step (16.0 ms) slower than an 8-row one (15.0 ms). Leaving parts of the step out put the cost in the linear layers: `mv4_q4_0` took 664 µs per layer at 4 rows against 405 µs for `mv_q4_0` at one, so it was compute-bound rather than reading weights at memory speed. Cheaper nibble unpacking, more weight rows per simdgroup, a port of llama.cpp's older `mul_mv_ext` kernel and simdgroup-matrix variants that stage activations in threadgroup memory all measured the same or slower: feeding the activations cost 100–150 µs per layer whichever way they were loaded.
+
+`llama-batched-bench -v` lists the kernels llama.cpp actually runs: a newer `kernel_mul_mv_mma_*`, ported here as `mvm` for Q8_0 and Q4_0 (MIT). Each lane fills its two elements of every 8x8 fragment from registers. Weights are raw quants made exact halves by OR-ing them into the bits of 1024.0h, and the block scale is applied once per block. Activations are read as F32 pairs in the k order of the quant layout, so the layer input needs no half-precision conversion. The 8–16 simdgroups of a threadgroup split K, and each issues the next block's loads before the current block's products. Per 1B layer (`tests/gemm_bench.rs`, µs):
+
+| rows | Q4_0 before | Q4_0 `mvm` | Q8_0 before | Q8_0 `mvm` |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 (`mv`, kept) | 405 | 423 | 764 | 761 |
+| 2 (`mv2`) | 458 | 420 | 746 | 757 |
+| 3–4 (`mv4`) | 664–672 | 418 | 813–853 | 762 |
+| 8 (`mms`) | 574 | 420 | 878 | 765 |
+| 12–16 (`mmh`, no split-K) | 953–994 | 803 | 1,083–1,151 | 924–989 |
+
+At 16 rows `mmh` with split-K (PR #27) was 10% faster end to end and equal at 12, so `mvm` covers 2–8 rows. Interleaved A/B (mean of 3 rounds), aggregate decode tok/s with N sequences / one-pass prompt tok/s:
+
+| model | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: |
+| 1B Q4_0, sequences | 170 → 170 | 254 → 330 (+30%) | 517 → 640 (+24%) |
+| 1B Q8_0, sequences | 109 → 110 | 203 → 213 (+5%) | 379 → 422 (+11%) |
+| SmolLM2 Q8_0, sequences | 511 → 541 (+6%) | 897 → 1,043 (+16%) | 1,677 → 1,888 (+13%) |
+| SmolLM2 Q4_0, sequences | 536 → 649 (+21%) | 845 → 1,159 (+37%) | 1,782 → 2,207 (+24%) |
+| 1B Q4_0, prompt | 196 → 206 (+5%) | 302 → 408 (+35%) | 678 → 811 (+20%) |
+| 1B Q8_0, prompt | 110 → 115 (+4%) | 232 → 241 (+4%) | 421 → 456 (+8%) |
+
+Single-sequence decode and prompts from 9 tokens are unchanged (same kernels). Tests: the Metal-vs-CPU batch tests run Q8_0 and Q4_0 layers at 2–8 tokens; a wrong Q4_0 or Q8_0 bias, a dropped accumulation or a skipped simdgroup in the K reduction each fail 2–3 of them.
 
 **Metal split-K for small GEMM grids (PR #27)**
 
@@ -562,6 +612,10 @@ cargo run --release -p rllm-cli -- perplexity --model models/SmolLM2-135M-Instru
 cargo run --release -p rllm-cli -- generate --model models/SmolLM2-135M-Instruct-Q8_0.gguf \
   --raw --prompt "Once upon a time" --temperature 0 --max-tokens 128
 llama-bench -m models/SmolLM2-135M-Instruct-Q8_0.gguf -ngl 0 -p 128,512 -n 128
+# Several sequences decoding together (aggregate tok/s)
+cargo run --release -p rllm-cli -- --device metal bench --model models/SmolLM2-135M-Instruct-Q8_0.gguf \
+  --prompt-tokens 128 --generate-tokens 64 --parallel 4
+llama-batched-bench -m models/SmolLM2-135M-Instruct-Q8_0.gguf -ngl 99 -npp 128 -ntg 64 -npl 4
 llama-perplexity -m models/SmolLM2-135M-Instruct-Q8_0.gguf -f LICENSE -c 128 -ngl 0
 
 # Synthetic presets
