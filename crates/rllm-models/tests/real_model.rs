@@ -53,8 +53,17 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
-/// Greedy generation driven directly through `LlamaModel::forward`.
-fn greedy(model: &LlamaModel<CpuBackend>, prompt: &[u32], max_tokens: usize, stops: &[u32]) -> Vec<u32> {
+/// Greedy generation driven directly through `LlamaModel::forward` (prefill, then
+/// single-token decode steps). With `forced`, those tokens are fed back instead of the
+/// argmax; the result also carries the largest gap (logits) between the argmax and the
+/// token taken at a step.
+fn greedy(
+    model: &LlamaModel<CpuBackend>,
+    prompt: &[u32],
+    max_tokens: usize,
+    stops: &[u32],
+    forced: Option<&[u32]>,
+) -> (Vec<u32>, f32) {
     let c = &model.config;
     let block = 16;
     let blocks = (prompt.len() + max_tokens).div_ceil(block);
@@ -82,9 +91,16 @@ fn greedy(model: &LlamaModel<CpuBackend>, prompt: &[u32], max_tokens: usize, sto
         )
         .unwrap();
     let mut out = Vec::new();
+    let mut worst = 0f32;
     loop {
         let row: Vec<f32> = logits.to_vec().unwrap();
-        let next = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        let argmax = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        let next = match forced {
+            Some(f) if out.len() == f.len() => break,
+            Some(f) => f[out.len()],
+            None => argmax as u32,
+        };
+        worst = worst.max(row[argmax] - row[next as usize]);
         if stops.contains(&next) {
             break;
         }
@@ -97,7 +113,7 @@ fn greedy(model: &LlamaModel<CpuBackend>, prompt: &[u32], max_tokens: usize, sto
             .forward_decode(&[next], &mut k, &mut v, std::slice::from_ref(&table), &[pos + 1])
             .unwrap();
     }
-    out
+    (out, worst)
 }
 
 #[test]
@@ -128,6 +144,11 @@ fn tokenizer_matches_llama_cpp() {
     );
 }
 
+/// On aarch64 rllm's greedy completions equal llama.cpp's exactly (the SDOT kernels sum
+/// in the same order). Elsewhere the portable kernels round differently and a near-tie
+/// can flip a token, so llama.cpp's completion is fed through the same single-token decode
+/// path and its token must be within 0.25 logits of rllm's argmax at every step (as in
+/// `check_teacher_forced`; kernel bugs move logits by whole units).
 fn check_greedy(b: &GgufBundle<CpuBackend>, fixture_name: &str) {
     let fx = fixture(fixture_name);
     for case in fx["cases"].as_array().unwrap() {
@@ -135,9 +156,18 @@ fn check_greedy(b: &GgufBundle<CpuBackend>, fixture_name: &str) {
         let expected = case["completion"].as_str().unwrap();
         let max_tokens = case["max_tokens"].as_u64().unwrap() as usize;
         let ids = b.tokenizer.encode(prompt, true, true);
-        let out = greedy(&b.model, &ids, max_tokens, &b.tokenizer.stop_token_ids);
-        let text = b.tokenizer.decode(&out, true);
-        assert_eq!(text, expected, "[{fixture_name}] greedy completion of {prompt:?}");
+        if cfg!(target_arch = "aarch64") {
+            let (out, _) = greedy(&b.model, &ids, max_tokens, &b.tokenizer.stop_token_ids, None);
+            let text = b.tokenizer.decode(&out, true);
+            assert_eq!(text, expected, "[{fixture_name}] greedy completion of {prompt:?}");
+        } else {
+            let completion = b.tokenizer.encode(expected, false, false);
+            let (_, gap) = greedy(&b.model, &ids, max_tokens, &[], Some(&completion));
+            assert!(
+                gap <= 0.25,
+                "[{fixture_name}] {prompt:?}: llama.cpp token {gap:.4} logits below rllm's argmax"
+            );
+        }
     }
 }
 
