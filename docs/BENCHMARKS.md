@@ -187,15 +187,47 @@ Since PR #28 (few-row Metal GEMM, below), Metal one-pass batches of 2 / 4 / 8 to
 | SmolLM2-135M-Instruct-Q8_0 | 2 | 435 | 492 | 1.13x |
 | SmolLM2-135M-Instruct-Q8_0 | 4 | 895 | 986 | 1.10x |
 | SmolLM2-135M-Instruct-Q8_0 | 8 | 1,641 | 1,698 | 1.03x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | 1 | 115 | 110 | 0.96x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | 2 | 191 | 184 | 0.97x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | 4 | 348 | 356 | 1.02x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | 8 | 639 | 677 | 1.06x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | 16 | 725 | 707 | 0.98x |
 
-Before PR #28, 1B Q4_0 was at 0.79x with 4 sequences (247 tok/s): a 4-row step cost more than an 8-row one.
+Before PR #28, 1B Q4_0 was at 0.79x with 4 sequences (247 tok/s): a 4-row step cost more than an 8-row one. Before PR #29, 1B Q4_K_M was at 0.84–0.93x with 2–8 sequences.
 
-**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x); Metal batches of 2–8 tokens on 1B Q4_0 (1.10–1.15x) and 2–8 sequences decoding together (0.99–1.16x).
+**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x); Metal batches of 2–8 tokens on 1B Q4_0 (1.10–1.15x) and 2–8 sequences decoding together (Q4_0/Q8_0 0.99–1.16x, Q4_K_M 0.97–1.06x).
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
 - Metal prompt processing on Llama-3.2-1B, 0.94–0.96x (128–512 tokens); SmolLM2 F16 is at parity or ahead (0.99–1.07x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
 - Metal decode at 4k context: SmolLM2 F16 0.95x, 1B Q4_K_M 0.93x (Q8_0 and Q4_0 at parity). Decode attention reaches ~80 GB/s of the ~100 GB/s a plain streaming read gets; see "Metal decode attention" below.
+
+**Metal few-row GEMM for K-quants (PR #29)**
+
+PR #28's `mvm` covered Q8_0 and Q4_0 only. On Llama-3.2-1B Q4_K_M, whose Q4_K layers and Q6_K output projection (the 215 MB tied embedding, plus some `ffn_down`/`attn_v`) each make up a large share of the bytes read per step, 2–8 sequences decoded at 0.84–0.93x of llama.cpp. Per 1B layer, `mv_q4_k` took 370–386 µs for one row but `mv2`/`mms` took 545–604 µs for 2–8 rows (Q6_K: 499 against 683–746 µs).
+
+llama.cpp runs a generic variant of its kernel for Q4_K and Q6_K that dequantizes 16 weights per lane to F32. A port of it (reusing our `load16`) was 3–16% slower than the current kernels per layer. The new kernels instead keep `mvm`'s approach: raw quants as exact halves and scales applied to each 64-weight unit's MMA result.
+- **`mvm_q4_k`** is adapted from llama.cpp's `kernel_mul_mv_mma_q5_K_f32` (MIT). Q4_K is Q5_K without the high bits. A unit is a pair of 32-value sub-blocks sharing qs bytes; the high nibbles are used in place (16q) and scaled by 1/16. The sub-block minimums are subtracted using per-sub-block activation sums (three lane shuffles).
+- **`mvm_q6_k`** is new. A unit is the two groups of a half super-block that share ql and qh bytes. Quants minus 32 (times 16 for high nibbles) are exact halves, so no sums are needed. Q6_K has a scale per 16 values, so each lane's k index maps to byte `16*(s/2) + s%2 + 2j` of a group: MMA steps 0–1 and 2–3 each stay inside one scale group, and both 16-value halves are read with float2 loads.
+
+Two 8-row weight tiles and 8 simdgroups per threadgroup were fastest for both. Per 1B layer (`tests/gemm_bench.rs`, µs):
+
+| rows | Q4_K before | `mvm_q4_k` | Q6_K before | `mvm_q6_k` |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 (`mv`, kept) | 370–386 | 449 | 499–546 | 529 |
+| 2 (`mv2`) | 545–556 | 450 | 683 | 532 |
+| 4 (`mms`) | 583–604 | 450 | 735–746 | 533 |
+| 8 (`mms`) | 589–609 | 451 | 743–746 | 536 |
+
+Results match `mv2`'s F32 output to within 5e-7 (relative). F16 weights were already near memory speed with `mv2`/`mms`, and the generic kernel was 5–10% slower for them. Interleaved A/B (3 rounds each), aggregate decode tok/s with N sequences / one-pass prompt tok/s:
+
+| model | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: |
+| 1B Q4_K_M, sequences | 157 → 184 (+17%) | 284 → 356 (+25%) | 545 → 677 (+24%) |
+| SmolLM2 Q4_K_M, sequences | 701 → 761 (+9%) | 1,357 → 1,481 (+9%) | 2,526 → 2,687 (+6%) |
+| 1B Q4_K_M, prompt | 170 → 196 (+16%) | 324 → 390 (+20%) | 645 → 774 (+20%) |
+
+One sequence and 16 sequences are unchanged. Tests: the Metal-vs-CPU small-batch test runs a Q4_K/Q6_K model at 2–9 tokens. A wrong Q4_K minimum sign, a wrong Q6_K scale or qh shift, or a dropped second weight tile each fail it.
 
 **Metal few-row GEMM for 2–8 rows (PR #28)**
 

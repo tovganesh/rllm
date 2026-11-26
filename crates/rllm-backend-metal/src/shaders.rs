@@ -553,6 +553,30 @@ struct MvmQ8 {
     }
 };
 
+// Sums the K slices of the NSG simdgroups of an `mvm`-style kernel and writes the
+// 8*NT x 8*RT output tile; element idx of a tile is lane idx/2's element idx%2.
+template <short NT, short RT, short NSG>
+inline void mvm_store(thread float (&acc)[RT][NT][2], threadgroup float* red, device float* y, uint n, uint m,
+                      uint accumulate, uint ldy, uint i01, uint i11, ushort lane, ushort sg) {
+    for (short rt = 0; rt < RT; ++rt)
+        for (short t = 0; t < NT; ++t) {
+            red[((sg * RT + rt) * NT + t) * 64 + 2 * lane] = acc[rt][t][0];
+            red[((sg * RT + rt) * NT + t) * 64 + 2 * lane + 1] = acc[rt][t][1];
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short idx = sg * 32 + lane; idx < RT * NT * 64; idx += NSG * 32) {
+        float sum = 0.0f;
+        for (short s = 0; s < NSG; ++s) sum += red[s * (RT * NT * 64) + idx];
+        const short rt = idx / (NT * 64), t = (idx / 64) % NT, l = (idx % 64) / 2;
+        const uint r0 = i01 + 8 * t + (((l / 4) & 4) + ((l / 2) % 4));
+        const uint r1 = i11 + 8 * rt + (((l / 4) & 2) * 2 + (l % 2) * 2) + idx % 2;
+        if (r0 < n && r1 < m) {
+            device float* o = y + (ulong)r1 * ldy + r0;
+            *o = accumulate ? *o + sum : sum;
+        }
+    }
+}
+
 template <short NT, short RT, short NSG, typename Q>
 kernel void mvm(LINEAR_ARGS, uint2 tgp [[threadgroup_position_in_grid]],
                 ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -638,24 +662,7 @@ kernel void mvm(LINEAR_ARGS, uint2 tgp [[threadgroup_position_in_grid]],
                 acc[rt][t][1] = fma(dc[t], mp[rt][t].thread_elements()[1], acc[rt][t][1]);
             }
     }
-    // Sum the simdgroups' K slices; element idx of a tile is lane idx/2's element idx%2.
-    for (short rt = 0; rt < RT; ++rt)
-        for (short t = 0; t < NT; ++t) {
-            red[((sg * RT + rt) * NT + t) * 64 + 2 * lane] = acc[rt][t][0];
-            red[((sg * RT + rt) * NT + t) * 64 + 2 * lane + 1] = acc[rt][t][1];
-        }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (short idx = sg * 32 + lane; idx < RT * NT * 64; idx += NSG * 32) {
-        float sum = 0.0f;
-        for (short s = 0; s < NSG; ++s) sum += red[s * (RT * NT * 64) + idx];
-        const short rt = idx / (NT * 64), t = (idx / 64) % NT, l = (idx % 64) / 2;
-        const uint r0 = i01 + 8 * t + (((l / 4) & 4) + ((l / 2) % 4));
-        const uint r1 = i11 + 8 * rt + (((l / 4) & 2) * 2 + (l % 2) * 2) + idx % 2;
-        if (r0 < n && r1 < m) {
-            device float* o = y + (ulong)r1 * ldy + r0;
-            *o = accumulate ? *o + sum : sum;
-        }
-    }
+    mvm_store<NT, RT, NSG>(acc, red, y, n, m, accumulate, ldy, i01, i11, lane, sg);
 }
 // Per threadgroup: Q4_0 two 8-row weight tiles and 8 simdgroups, Q8_0 one tile and 16
 // simdgroups (swept on an M4 over 1, 2 or 4 tiles and 8 or 16 simdgroups, then end to end
@@ -663,6 +670,242 @@ kernel void mvm(LINEAR_ARGS, uint2 tgp [[threadgroup_position_in_grid]],
 typedef decltype(mvm<2, 1, 8, MvmQ4>) mvm_t;
 template [[host_name("mvm_q4_0")]] kernel mvm_t mvm<2, 1, 8, MvmQ4>;
 template [[host_name("mvm_q8_0")]] kernel mvm_t mvm<1, 1, 16, MvmQ8>;
+
+// ── few-row MMA GEMM for K-quants (2-8 activation rows) ──
+// Same scheme as `mvm`: one 64-weight unit per simdgroup step, quants as exact halves,
+// scales applied to each unit's MMA result, K split over NSG simdgroups, the next unit
+// prefetched. Q4_K is adapted from llama.cpp's `kernel_mul_mv_mma_q5_K_f32` (MIT; Q4_K
+// is Q5_K without the high bits): a unit is a pair of 32-value sub-blocks sharing qs
+// bytes (low / high nibble), lane k-index j of MMA step s holds byte
+// 8*(j/2) + 2*(j%2) + 4*(s/2) + s%2 of the pair; mins are removed with per-sub-block
+// activation sums.
+inline float2 mvk_scale_min(thread const uint* w, short j) {
+    if (j < 4) return float2((w[0] >> 8 * j) & 63, (w[1] >> 8 * j) & 63);
+    const short s = 8 * (j - 4);
+    return float2(((w[2] >> s) & 0xF) | (((w[0] >> (s + 6)) & 3) << 4),
+                  ((w[2] >> (s + 4)) & 0xF) | (((w[1] >> (s + 6)) & 3) << 4));
+}
+struct MvkQ4K { uint2 q; uint sc[3]; uint dm; };
+template <short NT>
+inline void mvk_load(device const block_q4_K* const* xr, uint ip, short fn, thread MvkQ4K* a) {
+    for (short t = 0; t < NT; ++t) {
+        device const block_q4_K* xb = xr[t] + ip / 4;
+        device const uint* sp = (device const uint*)xb->scales;
+        a[t].q = *((device const uint2*)(xb->qs + 32 * (ip % 4)) + fn / 2);
+        a[t].sc[0] = sp[0];
+        a[t].sc[1] = sp[1];
+        a[t].sc[2] = sp[2];
+        a[t].dm = *(device const uint*)xb;
+    }
+}
+// xs[rt][e][h]: values b, b+1 and b+4, b+5 (b = 8*(fm/2) + 2*(fm%2)) of sub-block h.
+template <short RT>
+inline void mvk_load_x(device const float2* const (*yp)[2], uint ip, thread float2 (*xs)[2][2][2]) {
+    for (short rt = 0; rt < RT; ++rt)
+        for (short e = 0; e < 2; ++e)
+            for (short h = 0; h < 2; ++h) {
+                xs[rt][e][h][0] = yp[rt][e][ip * 32 + h * 16];
+                xs[rt][e][h][1] = yp[rt][e][ip * 32 + h * 16 + 2];
+            }
+}
+template <short NT, short RT, short NSG>
+kernel void mvm_q4k(LINEAR_ARGS, uint2 tgp [[threadgroup_position_in_grid]],
+                    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[NSG * RT * NT * 64];
+    const short fm = ((lane / 4) & 4) + ((lane / 2) % 4), fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
+    const uint i01 = tgp.x * (8 * NT), i11 = tgp.y * (8 * RT);
+    device const block_q4_K* xr[NT];
+    for (short t = 0; t < NT; ++t) xr[t] = (device const block_q4_K*)w + (ulong)min(i01 + 8 * t + fm, n - 1) * (k / 256);
+    device const float2* yp[RT][2];
+    for (short rt = 0; rt < RT; ++rt)
+        for (short e = 0; e < 2; ++e)
+            yp[rt][e] = (device const float2*)(x + (ulong)min(i11 + 8 * rt + fn + e, m - 1) * k + 8 * (fm / 2) + 2 * (fm % 2));
+    float acc[RT][NT][2];
+    for (short rt = 0; rt < RT; ++rt)
+        for (short t = 0; t < NT; ++t) acc[rt][t][0] = acc[rt][t][1] = 0.0f;
+    const uint np = k / 64;
+    MvkQ4K an[NT];
+    float2 xn[RT][2][2][2];
+    const uint ip0 = min((uint)sg, np - 1);
+    mvk_load<NT>(xr, ip0, fn, an);
+    mvk_load_x<RT>(yp, ip0, xn);
+    for (uint ip = sg; ip < np; ip += NSG) {
+        MvkQ4K ac[NT];
+        float2 xs[RT][2][2][2];
+        for (short t = 0; t < NT; ++t) ac[t] = an[t];
+        for (short rt = 0; rt < RT; ++rt)
+            for (short e = 0; e < 2; ++e)
+                for (short h = 0; h < 2; ++h) {
+                    xs[rt][e][h][0] = xn[rt][e][h][0];
+                    xs[rt][e][h][1] = xn[rt][e][h][1];
+                }
+        const uint ipn = min(ip + NSG, np - 1);
+        mvk_load<NT>(xr, ipn, fn, an);
+        mvk_load_x<RT>(yp, ipn, xn);
+        // Activation sums per sub-block (over the 8 lanes sharing fn).
+        float c[RT][2][2];
+        for (short rt = 0; rt < RT; ++rt)
+            for (short e = 0; e < 2; ++e)
+                for (short h = 0; h < 2; ++h) {
+                    float u = xs[rt][e][h][0].x + xs[rt][e][h][0].y + xs[rt][e][h][1].x + xs[rt][e][h][1].y;
+                    u += simd_shuffle_xor(u, 2);
+                    u += simd_shuffle_xor(u, 4);
+                    u += simd_shuffle_xor(u, 16);
+                    c[rt][e][h] = u;
+                }
+        for (short t = 0; t < NT; ++t) {
+            const float2 dm = float2(as_type<half2>(ac[t].dm));
+            // a[h][word][odd bytes]: low nibbles q, high nibbles 16q.
+            half2 a[2][2][2];
+            for (short wd = 0; wd < 2; ++wd) {
+                const ushort2 qw = as_type<ushort2>(wd ? ac[t].q.y : ac[t].q.x);
+                a[0][wd][0] = mvm_1024_plus(qw & ushort2(0x000F)) - half2(1024.0h);
+                a[0][wd][1] = mvm_1024_plus((qw >> 8) & ushort2(0x000F)) - half2(1024.0h);
+                a[1][wd][0] = mvm_1024_plus(qw & ushort2(0x00F0)) - half2(1024.0h);
+                a[1][wd][1] = mvm_1024_plus((qw >> 8) & ushort2(0x00F0)) - half2(1024.0h);
+            }
+            for (short h = 0; h < 2; ++h) {
+                simdgroup_float8x8 mp[RT];
+                for (short rt = 0; rt < RT; ++rt) mp[rt] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                for (short s = 0; s < 4; ++s) {
+                    simdgroup_half8x8 ma;
+                    ma.thread_elements()[0] = a[h][s / 2][s % 2].x;
+                    ma.thread_elements()[1] = a[h][s / 2][s % 2].y;
+                    for (short rt = 0; rt < RT; ++rt) {
+                        simdgroup_float8x8 mb;
+                        mb.thread_elements()[0] = s % 2 == 0 ? xs[rt][0][h][s / 2].x : xs[rt][0][h][s / 2].y;
+                        mb.thread_elements()[1] = s % 2 == 0 ? xs[rt][1][h][s / 2].x : xs[rt][1][h][s / 2].y;
+                        simdgroup_multiply_accumulate(mp[rt], ma, mb, mp[rt]);
+                    }
+                }
+                const float2 sm = mvk_scale_min(ac[t].sc, 2 * (ip % 4) + h);
+                const float ds = dm.x * sm.x * (h == 0 ? 1.0f : 1.0f / 16), dmn = dm.y * sm.y;
+                for (short rt = 0; rt < RT; ++rt) {
+                    acc[rt][t][0] = fma(ds, mp[rt].thread_elements()[0], fma(-dmn, c[rt][0][h], acc[rt][t][0]));
+                    acc[rt][t][1] = fma(ds, mp[rt].thread_elements()[1], fma(-dmn, c[rt][1][h], acc[rt][t][1]));
+                }
+            }
+        }
+    }
+    mvm_store<NT, RT, NSG>(acc, red, y, n, m, accumulate, ldy, i01, i11, lane, sg);
+}
+
+// Q6_K: unit ip is groups g = ip%2 and g + 2 of half (ip/2)%2 of super-block ip/4, which
+// share ql bytes (low / high nibble) and qh bytes (bits 2g, 2g + 4). Lane k-index j of MMA
+// step s holds byte 16*(s/2) + s%2 + 2*j of the group, so steps 0-1 and 2-3 each stay in
+// one 16-value scale group. Quants minus 32 (times 16 for high nibbles) are exact halves.
+struct MvkQ6K { ushort2 l[2], h[2]; char2 s0, s1; half d; };
+template <short NT>
+inline void mvk_load(device const block_q6_K* const* xr, uint ip, short fn, thread MvkQ6K* a) {
+    const uint hf = (ip / 2) % 2, g = ip % 2;
+    for (short t = 0; t < NT; ++t) {
+        device const block_q6_K* xb = xr[t] + ip / 4;
+        // Blocks are 210 bytes: 2-byte loads.
+        device const ushort* ql = (device const ushort*)(xb->ql + hf * 64 + g * 32) + fn;
+        device const ushort* qh = (device const ushort*)(xb->qh + hf * 32) + fn;
+        a[t].l[0] = ushort2(ql[0], ql[1]);
+        a[t].l[1] = ushort2(ql[8], ql[9]);
+        a[t].h[0] = ushort2(qh[0], qh[1]);
+        a[t].h[1] = ushort2(qh[8], qh[9]);
+        device const char2* sc = (device const char2*)(xb->scales + hf * 8 + 2 * g);
+        a[t].s0 = sc[0];
+        a[t].s1 = sc[2];
+        a[t].d = xb->d;
+    }
+}
+// xs[rt][e][h][q]: values 2*fm, 2*fm + 1 of 16-value quarter q of group g + 2h.
+template <short RT>
+inline void mvk6_load_x(device const float* const (*yp)[2], uint ip, thread float2 (*xs)[2][2][2]) {
+    const uint base = (ip / 4) * 256 + ((ip / 2) % 2) * 128 + (ip % 2) * 32;
+    for (short rt = 0; rt < RT; ++rt)
+        for (short e = 0; e < 2; ++e)
+            for (short h = 0; h < 2; ++h) {
+                xs[rt][e][h][0] = *(device const float2*)(yp[rt][e] + base + 64 * h);
+                xs[rt][e][h][1] = *(device const float2*)(yp[rt][e] + base + 64 * h + 16);
+            }
+}
+template <short NT, short RT, short NSG>
+kernel void mvm_q6k(LINEAR_ARGS, uint2 tgp [[threadgroup_position_in_grid]],
+                    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[NSG * RT * NT * 64];
+    const short fm = ((lane / 4) & 4) + ((lane / 2) % 4), fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
+    const uint i01 = tgp.x * (8 * NT), i11 = tgp.y * (8 * RT);
+    device const block_q6_K* xr[NT];
+    for (short t = 0; t < NT; ++t) xr[t] = (device const block_q6_K*)w + (ulong)min(i01 + 8 * t + fm, n - 1) * (k / 256);
+    device const float* yp[RT][2];
+    for (short rt = 0; rt < RT; ++rt)
+        for (short e = 0; e < 2; ++e) yp[rt][e] = x + (ulong)min(i11 + 8 * rt + fn + e, m - 1) * k + 2 * fm;
+    float acc[RT][NT][2];
+    for (short rt = 0; rt < RT; ++rt)
+        for (short t = 0; t < NT; ++t) acc[rt][t][0] = acc[rt][t][1] = 0.0f;
+    const uint np = k / 64;
+    MvkQ6K an[NT];
+    float2 xn[RT][2][2][2];
+    const uint ip0 = min((uint)sg, np - 1);
+    mvk_load<NT>(xr, ip0, fn, an);
+    mvk6_load_x<RT>(yp, ip0, xn);
+    for (uint ip = sg; ip < np; ip += NSG) {
+        const short g2 = 2 * (ip % 2);
+        MvkQ6K ac[NT];
+        float2 xs[RT][2][2][2];
+        for (short t = 0; t < NT; ++t) ac[t] = an[t];
+        for (short rt = 0; rt < RT; ++rt)
+            for (short e = 0; e < 2; ++e)
+                for (short h = 0; h < 2; ++h) {
+                    xs[rt][e][h][0] = xn[rt][e][h][0];
+                    xs[rt][e][h][1] = xn[rt][e][h][1];
+                }
+        const uint ipn = min(ip + NSG, np - 1);
+        mvk_load<NT>(xr, ipn, fn, an);
+        mvk6_load_x<RT>(yp, ipn, xn);
+        for (short t = 0; t < NT; ++t) {
+            const float d = float(ac[t].d);
+            for (short h = 0; h < 2; ++h) {
+                const short hs = g2 + 4 * h;
+                const char2 sc = h ? ac[t].s1 : ac[t].s0;
+                for (short q = 0; q < 2; ++q) {
+                    const ushort2 ql = ac[t].l[q], qh = ac[t].h[q];
+                    // Even bytes (step 2q), odd bytes (step 2q + 1).
+                    half2 a[2];
+                    if (h == 0) {
+                        a[0] = mvm_1024_plus((ql & ushort2(0x000F)) | (((qh >> hs) & ushort2(3)) << 4)) - half2(1024.0h + 32.0h);
+                        a[1] = mvm_1024_plus(((ql >> 8) & ushort2(0x000F)) | (((qh >> (8 + hs)) & ushort2(3)) << 4)) - half2(1024.0h + 32.0h);
+                    } else {
+                        a[0] = mvm_1024_plus((ql & ushort2(0x00F0)) | (((qh >> hs) & ushort2(3)) << 8)) - half2(1024.0h + 512.0h);
+                        a[1] = mvm_1024_plus(((ql >> 8) & ushort2(0x00F0)) | (((qh >> (8 + hs)) & ushort2(3)) << 8)) - half2(1024.0h + 512.0h);
+                    }
+                    simdgroup_float8x8 mp[RT];
+                    for (short rt = 0; rt < RT; ++rt) mp[rt] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    for (short s = 0; s < 2; ++s) {
+                        simdgroup_half8x8 ma;
+                        ma.thread_elements()[0] = a[s].x;
+                        ma.thread_elements()[1] = a[s].y;
+                        for (short rt = 0; rt < RT; ++rt) {
+                            simdgroup_float8x8 mb;
+                            mb.thread_elements()[0] = s == 0 ? xs[rt][0][h][q].x : xs[rt][0][h][q].y;
+                            mb.thread_elements()[1] = s == 0 ? xs[rt][1][h][q].x : xs[rt][1][h][q].y;
+                            simdgroup_multiply_accumulate(mp[rt], ma, mb, mp[rt]);
+                        }
+                    }
+                    const float ds = d * float(q ? sc.y : sc.x) * (h == 0 ? 1.0f : 1.0f / 16);
+                    for (short rt = 0; rt < RT; ++rt) {
+                        acc[rt][t][0] = fma(ds, mp[rt].thread_elements()[0], acc[rt][t][0]);
+                        acc[rt][t][1] = fma(ds, mp[rt].thread_elements()[1], acc[rt][t][1]);
+                    }
+                }
+            }
+        }
+    }
+    mvm_store<NT, RT, NSG>(acc, red, y, n, m, accumulate, ldy, i01, i11, lane, sg);
+}
+// Two 8-row weight tiles and 8 simdgroups per threadgroup for both (swept on an M4 over
+// 1, 2 or 4 tiles and 4, 8 or 16 simdgroups: 2x8 and 2x4 tie, others 4-45% slower).
+// llama.cpp dequantizes Q4_K and Q6_K to F32 per lane here (`kernel_mul_mv_mma_gen`); a
+// port of that was 3-16% slower than these per Llama-3.2-1B layer. Rows need k % 256 == 0.
+typedef decltype(mvm_q4k<2, 1, 8>) mvm_q4k_t;
+typedef decltype(mvm_q6k<2, 1, 8>) mvm_q6k_t;
+template [[host_name("mvm_q4_k")]] kernel mvm_q4k_t mvm_q4k<2, 1, 8>;
+template [[host_name("mvm_q6_k")]] kernel mvm_q6k_t mvm_q6k<2, 1, 8>;
 
 // ── small-batch GEMM: up to 8*NT activation rows on simdgroup matrices ──
 // Each simdgroup owns 8 weight rows. Per 32-value block, its 32 lanes dequantize the

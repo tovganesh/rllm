@@ -291,8 +291,9 @@ fn check_split_context_decode(cfg: LlamaConfig) {
     }
 }
 
-/// Small batches use dedicated kernels: up to 4 rows (2 for K-quants, 8 for F32
-/// weights) the multi-row matrix-vector kernels (`mv2`/`mv4`/`mv8`), then up to 24 rows
+/// Small batches use dedicated kernels: at 2-8 rows the few-row MMA GEMM (`mvm`) for
+/// quantized weights and the multi-row matrix-vector kernels (`mv2`/`mv4`/`mv8`) for F16
+/// (up to 4 rows) and F32 weights (up to 8), then up to 24 rows
 /// the small-batch GEMMs (`mms`; `mmh` at 9-16 rows on matrices of 2048+ rows), then the
 /// tiled GEMM with fused SwiGLU. The models here have 2112-row (2048 for K-quants)
 /// gate/up matrices so `mmh` runs, and a 96-wide hidden size (3 blocks) so its
