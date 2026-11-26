@@ -492,22 +492,23 @@ impl Acts {
         }
     }
 
-    /// `out[i] = dot(w, activation row i)` for every activation row.
-    fn dot_all_rows(&self, fmt: QFormat, w: &[u8], nb: usize, out: &mut [f32]) {
+    /// `out[i] = dot(w, activation row first + i)` for `out.len()` activation rows.
+    fn dot_all_rows(&self, fmt: QFormat, w: &[u8], nb: usize, first: usize, out: &mut [f32]) {
         let mut i = 0;
         while out.len() - i >= MULTI_ROWS {
-            out[i..i + MULTI_ROWS].copy_from_slice(&self.dot_rows::<MULTI_ROWS>(fmt, w, i, nb));
+            out[i..i + MULTI_ROWS].copy_from_slice(&self.dot_rows::<MULTI_ROWS>(fmt, w, first + i, nb));
             i += MULTI_ROWS;
         }
+        let r = first + i;
         match out.len() - i {
             0 => {}
-            1 => out[i] = self.dot(fmt, w, i * nb, nb),
-            2 => out[i..].copy_from_slice(&self.dot_rows::<2>(fmt, w, i, nb)),
-            3 => out[i..].copy_from_slice(&self.dot_rows::<3>(fmt, w, i, nb)),
-            4 => out[i..].copy_from_slice(&self.dot_rows::<4>(fmt, w, i, nb)),
-            5 => out[i..].copy_from_slice(&self.dot_rows::<5>(fmt, w, i, nb)),
-            6 => out[i..].copy_from_slice(&self.dot_rows::<6>(fmt, w, i, nb)),
-            7 => out[i..].copy_from_slice(&self.dot_rows::<7>(fmt, w, i, nb)),
+            1 => out[i] = self.dot(fmt, w, r * nb, nb),
+            2 => out[i..].copy_from_slice(&self.dot_rows::<2>(fmt, w, r, nb)),
+            3 => out[i..].copy_from_slice(&self.dot_rows::<3>(fmt, w, r, nb)),
+            4 => out[i..].copy_from_slice(&self.dot_rows::<4>(fmt, w, r, nb)),
+            5 => out[i..].copy_from_slice(&self.dot_rows::<5>(fmt, w, r, nb)),
+            6 => out[i..].copy_from_slice(&self.dot_rows::<6>(fmt, w, r, nb)),
+            7 => out[i..].copy_from_slice(&self.dot_rows::<7>(fmt, w, r, nb)),
             _ => unreachable!(),
         }
     }
@@ -515,6 +516,9 @@ impl Acts {
 
 /// Activation rows handled per call of a multi-row kernel.
 const MULTI_ROWS: usize = 8;
+
+/// Batches of at least this many rows block [`linear_quantized`] over activation rows.
+const LARGE_BATCH_ROWS: usize = 32;
 
 /// `out[N] = W[N, K] · x[K]` for a quantized weight in format `fmt`.
 pub fn gemv_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32], n: usize, k: usize) {
@@ -566,12 +570,35 @@ pub fn linear_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32],
     let a = Acts::new(fmt, x); // m rows of nb blocks each, contiguous
 
     // Compute [N, M] so each task writes a contiguous slab, then transpose.
-    let rows_per_task = (super::gemv_rows_per_task(row_bytes) / m).max(1);
+    // Small batches: each task's weight rows stay hot while it walks all activation
+    // rows. Large batches (prompts without a vendor BLAS) would re-read every activation
+    // row (1 MB at 512 rows of 2048) from L2/L3 once per weight row, so each task takes
+    // a slab of ~64 KB of weight rows and walks the activations in ~128 KB blocks.
+    let (rows_per_task, act_block) = if m < LARGE_BATCH_ROWS {
+        ((super::gemv_rows_per_task(row_bytes) / m).max(1), m)
+    } else {
+        let tasks_min = 4 * crate::threads::decode_threads();
+        let rows = (64 * 1024 / row_bytes).clamp(1, n.div_ceil(tasks_min).max(1));
+        let act_row_bytes = k + 4 * nb;
+        (
+            rows,
+            (128 * 1024 / act_row_bytes).max(MULTI_ROWS) / MULTI_ROWS * MULTI_ROWS,
+        )
+    };
     let mut out_t = vec![0f32; n * m];
     crate::pool::for_each_chunk_mut(&mut out_t, rows_per_task * m, |t, slab| {
-        for (r, row) in slab.chunks_mut(m).enumerate() {
-            let j = t * rows_per_task + r;
-            a.dot_all_rows(fmt, &weight[j * row_bytes..(j + 1) * row_bytes], nb, row);
+        for i0 in (0..m).step_by(act_block) {
+            let i1 = (i0 + act_block).min(m);
+            for (r, row) in slab.chunks_mut(m).enumerate() {
+                let j = t * rows_per_task + r;
+                a.dot_all_rows(
+                    fmt,
+                    &weight[j * row_bytes..(j + 1) * row_bytes],
+                    nb,
+                    i0,
+                    &mut row[i0..i1],
+                );
+            }
         }
     });
     for j in 0..n {
@@ -721,7 +748,9 @@ mod tests {
             (QFormat::Q4K, quantize_f32_to_q4_k(&wf)),
             (QFormat::Q6K, quantize_f32_to_q6_k(&wf)),
         ] {
-            for m in 1..=11 {
+            // 40 and 300 rows take the blocked large-batch path (300 spans two blocks of
+            // activation rows at k = 512).
+            for m in (1..=11).chain([40, 300]) {
                 let x = data(m * k, 6 + m);
                 let mut batched = vec![0f32; m * n];
                 linear_quantized(fmt, &w, &x, &mut batched, m, n, k);
