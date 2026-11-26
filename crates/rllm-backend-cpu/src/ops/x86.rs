@@ -74,15 +74,30 @@ unsafe fn mul_sum_u8_i8(x: __m256i, y: __m256i) -> __m256i {
 pub unsafe fn dot_q8_0(w: &[u8], a: &Q8Activations, off: usize, nb: usize) -> f32 {
     assert!(w.len() >= nb * Q8_0_BYTES && a.qs.len() >= (off + nb) * QK && a.d.len() >= off + nb);
     let (wp, ap) = (w.as_ptr(), a.qs.as_ptr().add(off * QK));
-    let mut acc = _mm256_setzero_ps();
-    for b in 0..nb {
+    // Two blocks per step into separate accumulators (one chain was latency-bound).
+    let mut acc = [_mm256_setzero_ps(); 2];
+    let block = |b: usize| {
         let blk = wp.add(b * Q8_0_BYTES);
         let x = _mm256_loadu_si256(blk.add(2) as *const __m256i);
         let y = _mm256_loadu_si256(ap.add(b * QK) as *const __m256i);
-        let d = _mm256_set1_ps(f16_at(blk) * *a.d.get_unchecked(off + b));
-        acc = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(mul_sum_i8(x, y)), acc);
+        (
+            _mm256_set1_ps(f16_at(blk) * *a.d.get_unchecked(off + b)),
+            _mm256_cvtepi32_ps(mul_sum_i8(x, y)),
+        )
+    };
+    let mut b = 0;
+    while b + 2 <= nb {
+        let (d0, p0) = block(b);
+        let (d1, p1) = block(b + 1);
+        acc[0] = _mm256_fmadd_ps(d0, p0, acc[0]);
+        acc[1] = _mm256_fmadd_ps(d1, p1, acc[1]);
+        b += 2;
     }
-    hsum_ps(acc)
+    if b < nb {
+        let (d0, p0) = block(b);
+        acc[0] = _mm256_fmadd_ps(d0, p0, acc[0]);
+    }
+    hsum_ps(_mm256_add_ps(acc[0], acc[1]))
 }
 
 /// As [`dot_q8_0`] for `Q4_0` weights; `a` must carry its block sums.
@@ -91,17 +106,36 @@ pub unsafe fn dot_q4_0(w: &[u8], a: &Q8Activations, off: usize, nb: usize) -> f3
     assert!(w.len() >= nb * Q4_0_BYTES && a.qs.len() >= (off + nb) * QK && a.d.len() >= off + nb);
     assert!(a.sums.len() >= off + nb);
     let (wp, ap) = (w.as_ptr(), a.qs.as_ptr().add(off * QK));
-    let mut acc = _mm256_setzero_ps();
-    let mut offset = 0f32;
-    for b in 0..nb {
+    // Two blocks per step into separate accumulators (one chain was latency-bound).
+    let mut acc = [_mm256_setzero_ps(); 2];
+    let mut offset = [0f32; 2];
+    let block = |b: usize| {
         let blk = wp.add(b * Q4_0_BYTES);
         let x = q4_0_nibbles(blk.add(2));
         let y = _mm256_loadu_si256(ap.add(b * QK) as *const __m256i);
         let d = f16_at(blk) * *a.d.get_unchecked(off + b);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(mul_sum_u8_i8(x, y)), acc);
-        offset += d * *a.sums.get_unchecked(off + b) as f32;
+        (
+            d,
+            _mm256_cvtepi32_ps(mul_sum_u8_i8(x, y)),
+            *a.sums.get_unchecked(off + b) as f32,
+        )
+    };
+    let mut b = 0;
+    while b + 2 <= nb {
+        let (d0, p0, s0) = block(b);
+        let (d1, p1, s1) = block(b + 1);
+        acc[0] = _mm256_fmadd_ps(_mm256_set1_ps(d0), p0, acc[0]);
+        acc[1] = _mm256_fmadd_ps(_mm256_set1_ps(d1), p1, acc[1]);
+        offset[0] += d0 * s0;
+        offset[1] += d1 * s1;
+        b += 2;
     }
-    hsum_ps(acc) - 8.0 * offset
+    if b < nb {
+        let (d0, p0, s0) = block(b);
+        acc[0] = _mm256_fmadd_ps(_mm256_set1_ps(d0), p0, acc[0]);
+        offset[0] += d0 * s0;
+    }
+    hsum_ps(_mm256_add_ps(acc[0], acc[1])) - 8.0 * (offset[0] + offset[1])
 }
 
 /// One `Q8_0` weight row against `R` activation rows (blocks from `offs[r]`); each

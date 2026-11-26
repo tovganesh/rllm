@@ -527,7 +527,18 @@ pub fn gemv_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32], n
     let row_bytes = nb * bb;
     debug_assert_eq!(weight.len(), n * row_bytes);
     let a = Acts::new(fmt, x);
-    let rows_per_task = super::gemv_rows_per_task(row_bytes).next_multiple_of(4);
+    // ~128 KB of weights per task. On x86 at least two tasks per thread: SmolLM2's
+    // 576-row matrices otherwise split into 3 tasks for 4 threads (20% of a decode
+    // profile on a 4-vCPU runner was workers waiting). On an M4 this was neutral to
+    // 2% slower, so it keeps one task per 128 KB.
+    let min_tasks = if cfg!(target_arch = "x86_64") {
+        2 * crate::threads::decode_threads()
+    } else {
+        1
+    };
+    let rows_per_task = super::gemv_rows_per_task(row_bytes)
+        .min(n.div_ceil(min_tasks))
+        .next_multiple_of(4);
     let row = |j: usize| &weight[j * row_bytes..(j + 1) * row_bytes];
     // Decode path: run on the low-latency spinning pool (see `crate::pool`).
     crate::pool::for_each_chunk_mut(out, rows_per_task, |t, chunk| {
