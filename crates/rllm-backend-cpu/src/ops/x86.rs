@@ -51,15 +51,22 @@ unsafe fn mul_sum_i8(x: __m256i, y: __m256i) -> __m256i {
     _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1))
 }
 
-/// 32 signed values `q - 8` from the 16 nibble bytes of a `Q4_0` block: low nibbles
-/// (values 0..16) in the low lane, high nibbles (16..32) in the high lane.
+/// The 32 unsigned nibbles `q` (0..15) of a `Q4_0` block: low nibbles (values 0..16)
+/// in the low lane, high nibbles (16..32) in the high lane. The block's value is
+/// `q - 8`; the `-8` is applied through the activation block sums.
 #[inline(always)]
-unsafe fn q4_0_values(p: *const u8) -> __m256i {
+unsafe fn q4_0_nibbles(p: *const u8) -> __m256i {
     let t = _mm_loadu_si128(p as *const __m128i);
     let m4 = _mm_set1_epi8(0x0F);
     let lo = _mm_and_si128(t, m4);
     let hi = _mm_and_si128(_mm_srli_epi16::<4>(t), m4);
-    _mm256_sub_epi8(_mm256_set_m128i(hi, lo), _mm256_set1_epi8(8))
+    _mm256_set_m128i(hi, lo)
+}
+
+/// Eight 32-bit sums of products of unsigned bytes `x` (< 128) and signed bytes `y`.
+#[inline(always)]
+unsafe fn mul_sum_u8_i8(x: __m256i, y: __m256i) -> __m256i {
+    _mm256_madd_epi16(_mm256_maddubs_epi16(x, y), _mm256_set1_epi16(1))
 }
 
 /// One `Q8_0` or `Q4_0` weight row against activation blocks `off..off + nb`.
@@ -78,20 +85,23 @@ pub unsafe fn dot_q8_0(w: &[u8], a: &Q8Activations, off: usize, nb: usize) -> f3
     hsum_ps(acc)
 }
 
-/// As [`dot_q8_0`] for `Q4_0` weights.
+/// As [`dot_q8_0`] for `Q4_0` weights; `a` must carry its block sums.
 #[target_feature(enable = "avx2,fma,f16c")]
 pub unsafe fn dot_q4_0(w: &[u8], a: &Q8Activations, off: usize, nb: usize) -> f32 {
     assert!(w.len() >= nb * Q4_0_BYTES && a.qs.len() >= (off + nb) * QK && a.d.len() >= off + nb);
+    assert!(a.sums.len() >= off + nb);
     let (wp, ap) = (w.as_ptr(), a.qs.as_ptr().add(off * QK));
     let mut acc = _mm256_setzero_ps();
+    let mut offset = 0f32;
     for b in 0..nb {
         let blk = wp.add(b * Q4_0_BYTES);
-        let x = q4_0_values(blk.add(2));
+        let x = q4_0_nibbles(blk.add(2));
         let y = _mm256_loadu_si256(ap.add(b * QK) as *const __m256i);
-        let d = _mm256_set1_ps(f16_at(blk) * *a.d.get_unchecked(off + b));
-        acc = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(mul_sum_i8(x, y)), acc);
+        let d = f16_at(blk) * *a.d.get_unchecked(off + b);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(mul_sum_u8_i8(x, y)), acc);
+        offset += d * *a.sums.get_unchecked(off + b) as f32;
     }
-    hsum_ps(acc)
+    hsum_ps(acc) - 8.0 * offset
 }
 
 /// One `Q8_0` weight row against `R` activation rows (blocks from `offs[r]`); each
@@ -342,23 +352,26 @@ pub unsafe fn dot_q4_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [
     for &o in &offs {
         assert!(a.qs.len() >= (o + nb) * QK && a.d.len() >= o + nb);
     }
+    for &o in &offs {
+        assert!(a.sums.len() >= o + nb);
+    }
     let wp = w.as_ptr();
     let mut acc = [_mm256_setzero_ps(); R];
+    let mut offset = [0f32; R];
     for b in 0..nb {
         let blk = wp.add(b * Q4_0_BYTES);
-        let x = q4_0_values(blk.add(2));
-        let ax = _mm256_sign_epi8(x, x);
+        let x = q4_0_nibbles(blk.add(2));
         let dw = f16_at(blk);
         for r in 0..R {
             let y = _mm256_loadu_si256(a.qs.as_ptr().add((offs[r] + b) * QK) as *const __m256i);
-            let s = _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(y, x)), _mm256_set1_epi16(1));
-            let d = _mm256_set1_ps(dw * *a.d.get_unchecked(offs[r] + b));
-            acc[r] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(s), acc[r]);
+            let d = dw * *a.d.get_unchecked(offs[r] + b);
+            acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(mul_sum_u8_i8(x, y)), acc[r]);
+            offset[r] += d * *a.sums.get_unchecked(offs[r] + b) as f32;
         }
     }
     let mut out = [0f32; R];
     for r in 0..R {
-        out[r] = hsum_ps(acc[r]);
+        out[r] = hsum_ps(acc[r]) - 8.0 * offset[r];
     }
     out
 }
