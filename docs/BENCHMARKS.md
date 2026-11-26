@@ -61,7 +61,7 @@ Exact token parity across engines is only expected where both use the same arith
 | Llama-3.2-1B-Instruct-Q8_0 | metal | tg128 | 67 | 64 | 0.96x |
 | Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp128 | 1,546 | 1,327 | 0.86x |
 | Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | pp512 | 1,592 | 1,436 | 0.90x |
-| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | tg128 | 102 | 100 | 0.98x |
+| Llama-3.2-1B-Instruct-Q4_K_M.requant | metal | tg128 | 112 | 114 | 1.02x |
 | Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp128 | 1,629 | 1,386 | 0.85x |
 | Llama-3.2-1B-Instruct-Q4_0.requant | metal | pp512 | 1,672 | 1,489 | 0.89x |
 | Llama-3.2-1B-Instruct-Q4_0.requant | metal | tg128 | 108 | 112 | 1.04x |
@@ -70,7 +70,7 @@ Exact token parity across engines is only expected where both use the same arith
 | SmolLM2-135M-Instruct-Q8_0 | metal | tg128 | 270 | 331 | 1.23x |
 | SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp128 | 9,538 | 8,273 | 0.87x |
 | SmolLM2-135M-Instruct-Q4_K_M.requant | metal | pp512 | 10,273 | 9,732 | 0.95x |
-| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | tg128 | 263 | 341 | 1.30x |
+| SmolLM2-135M-Instruct-Q4_K_M.requant | metal | tg128 | 378 | 389 | 1.03x |
 | SmolLM2-135M-Instruct-Q4_0.requant | metal | pp128 | 10,249 | 7,294 | 0.71x |
 | SmolLM2-135M-Instruct-Q4_0.requant | metal | pp512 | 10,924 | 9,813 | 0.90x |
 | SmolLM2-135M-Instruct-Q4_0.requant | metal | tg128 | 349 | 411 | 1.18x |
@@ -195,12 +195,33 @@ Since PR #28 (few-row Metal GEMM, below), Metal one-pass batches of 2 / 4 / 8 to
 
 Before PR #28, 1B Q4_0 was at 0.79x with 4 sequences (247 tok/s): a 4-row step cost more than an 8-row one. Before PR #29, 1B Q4_K_M was at 0.84–0.93x with 2–8 sequences.
 
-**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.10–1.30x) and Llama-3.2-1B Q4_0 (1.04x); Metal batches of 2–8 tokens on 1B Q4_0 (1.10–1.15x) and 2–8 sequences decoding together (Q4_0/Q8_0 0.99–1.16x, Q4_K_M 0.97–1.06x).
+**Where rllm is ahead:** CPU prompt processing at 512 tokens in every format (1.3–3.3x), and at 128 tokens on SmolLM2 and K-quant files; CPU K-quant batches of 2–16 tokens (1.3–1.65x); CPU decode of Llama-3.2-1B Q4_K_M (1.04x) and of F16 files (1.87x); CPU everything at 4k context (1.4–3.2x); Metal decode on SmolLM2-135M (1.03–1.23x) and Llama-3.2-1B Q4_0 (1.04x); Metal batches of 2–8 tokens on 1B Q4_0 (1.10–1.15x) and 2–8 sequences decoding together (Q4_0/Q8_0 0.99–1.16x, Q4_K_M 0.97–1.06x).
 **At parity (within ~5%):** decode on Llama-3.2-1B in every format on both CPU (0.95–1.04x) and Metal (0.96–1.04x); Metal prompt processing on SmolLM2 Q4_K_M at 512 tokens (0.95x).
 **Behind:**
 - Metal prompt processing on Llama-3.2-1B, 0.94–0.96x (128–512 tokens); SmolLM2 F16 is at parity or ahead (0.99–1.07x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
-- Metal decode at 4k context: SmolLM2 F16 0.95x, 1B Q4_K_M 0.93x (Q8_0 and Q4_0 at parity). Decode attention reaches ~80 GB/s of the ~100 GB/s a plain streaming read gets; see "Metal decode attention" below.
+- Metal decode at 4k context: SmolLM2 F16 0.95x (1B Q4_K_M 0.99x since PR #30; Q8_0 and Q4_0 at parity). Decode attention reaches ~80 GB/s of the ~100 GB/s a plain streaming read gets; see "Metal decode attention" below.
+
+**Metal K-quant decode kernels (PR #30)**
+
+After PR #29, 1B Q4_K_M single-sequence decode was the remaining Metal decode gap (0.96x). Our `mv_q4_k` gave each simdgroup 4 weight rows and shifted every nibble out of its byte. llama.cpp's `kernel_mul_mv_q4_K_f32` gives each simdgroup 2 rows and masks nibbles in place as 16-bit words (q, 16q, 256q, 4096q), rescaling the four partial sums afterwards. Both `mv_q4_k` and `mv_q6_k` are now ports of llama.cpp's kernels (MIT), with 2 simdgroups x 2 rows per threadgroup. The row count matters most: the ported Q4_K kernel with 4 rows per simdgroup was only 4–6% faster than ours. Per 1B layer at one row (`tests/gemm_bench.rs`, µs, 2 runs):
+
+| kernel | rows per simdgroup | Q4_K | Q6_K |
+| --- | ---: | ---: | ---: |
+| previous | 4 | 366–381 | 496–510 |
+| llama.cpp port | 1 | 343–345 | 489–490 |
+| llama.cpp port (used) | 2 | 320–323 | 473–478 |
+| llama.cpp port | 4 | 347–358 | 479–485 |
+
+Q6_K reads at ~105 GB/s on the 16384-row matrix, close to memory speed, so it gains less. Decode tok/s, interleaved A/B (4 rounds; 2 at 4k context), with llama-bench on the same machine:
+
+| model | before | after | llama.cpp | rllm / llama.cpp |
+| --- | ---: | ---: | ---: | ---: |
+| 1B Q4_K_M, tg128 | 108 | 114 (+5%) | 112 | 1.02x |
+| 1B Q4_K_M, tg128 at 4k context | 92.5 | 96.3 (+4%) | 97.6 | 0.99x |
+| SmolLM2 Q4_K_M, tg128 | 382 | 389 (+2%) | 378 | 1.03x |
+
+Tests: the Metal-vs-CPU decode tests run Q4_K and Q6_K layers at one row. A wrong Q4_K minimum, a Q4_K or Q6_K row stride that skips the scales or high bits, or a wrong Q6_K bit mask each fail three of them.
 
 **Metal few-row GEMM for K-quants (PR #29)**
 

@@ -145,10 +145,15 @@ const DECODE_CHUNK_MIN: usize = 64;
 fn mv_max_rows(kind: WKind) -> usize {
     match kind {
         WKind::F32 => 8,
-        WKind::Q8 | WKind::Q4 => 1,
-        WKind::Q4K | WKind::Q6K => 2,
+        WKind::Q8 | WKind::Q4 | WKind::Q4K | WKind::Q6K => 1,
         WKind::F16 => 4,
     }
+}
+
+/// Weight rows per threadgroup of the matrix-vector kernels (2 simdgroups); matches the
+/// shaders (`MVK_ROWS` for the K-quant single-row kernels).
+fn mv_rows_per_group(kind: WKind, m: usize) -> u64 {
+    if m == 1 && matches!(kind, WKind::Q4K | WKind::Q6K) { 4 } else { 8 }
 }
 
 /// Rows handled by the few-row MMA GEMM (`mvm`) for quantized weights, which reads F32
@@ -615,7 +620,7 @@ impl MetalLlama {
                     _ => format!("mv8_{}", w.kind.suffix()),
                 };
                 let p = self.pipeline(&name);
-                e.groups(p, &args, ((w.rows as u64).div_ceil(8), 1, 1), 64);
+                e.groups(p, &args, ((w.rows as u64).div_ceil(mv_rows_per_group(w.kind, m)), 1, 1), 64);
             } else if w.kind != WKind::F32 && MMH_ROWS.contains(&m) && w.rows.div_ceil(64) >= MMH_MIN_GROUPS {
                 let two = (w.cols / 32).is_multiple_of(2);
                 let stage = if two { "mmh" } else { "mmh1" };
