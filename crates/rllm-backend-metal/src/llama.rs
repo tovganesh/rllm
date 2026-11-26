@@ -150,10 +150,24 @@ fn mv_max_rows(kind: WKind) -> usize {
     }
 }
 
-/// Weight rows per threadgroup of the matrix-vector kernels (2 simdgroups); matches the
-/// shaders (`MVK_ROWS` for the K-quant single-row kernels).
-fn mv_rows_per_group(kind: WKind, m: usize) -> u64 {
-    if m == 1 && matches!(kind, WKind::Q4K | WKind::Q6K) { 4 } else { 8 }
+/// Q8_0 rows of at least this many values use the split-K matrix-vector kernel
+/// (`mvs_q8_0`) for one activation row; shorter rows would leave most of its 8
+/// simdgroups idle.
+const MV_SPLIT_MIN_COLS: usize = 2048;
+
+/// (kernel name, weight rows, threads) per threadgroup of the matrix-vector kernels;
+/// matches the shaders (`MVK_ROWS` for the K-quant single-row kernels, `MV8_SG` for
+/// `mvs_q8_0`).
+fn mv_kernel(kind: WKind, m: usize, cols: usize) -> (String, u64, u64) {
+    let f = kind.suffix();
+    match (kind, m) {
+        (WKind::Q8, 1) if cols >= MV_SPLIT_MIN_COLS => (format!("mvs_{f}"), 1, 256),
+        (WKind::Q4K | WKind::Q6K, 1) => (format!("mv_{f}"), 4, 64),
+        (_, 1) => (format!("mv_{f}"), 8, 64),
+        (_, 2) => (format!("mv2_{f}"), 8, 64),
+        (_, 3 | 4) => (format!("mv4_{f}"), 8, 64),
+        _ => (format!("mv8_{f}"), 8, 64),
+    }
 }
 
 /// Rows handled by the few-row MMA GEMM (`mvm`) for quantized weights, which reads F32
@@ -259,7 +273,7 @@ impl MetalLlama {
             "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
             "mm_q4_k", "mm_q6_k", "mml_q8_0", "mml_q4_0", "mml_f16", "mml_q4_k", "mml_q6_k", "mml1_q8_0", "mml1_q4_0", "mml1_f16", "mml1_q4_k", "mml1_q6_k", "mmlg_q8_0", "mmlg_q4_0", "mmlg_f16", "mmlg_q4_k", "mmlg_q6_k", "mmlg1_q8_0", "mmlg1_q4_0", "mmlg1_f16", "mmlg1_q4_k", "mmlg1_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
             "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "swiglu_i", "swiglu_ih", "attn_reduce", "split_k_reduce",
-            "mvm_q8_0", "mvm_q4_0", "mvm_q4_k", "mvm_q6_k",
+            "mvm_q8_0", "mvm_q4_0", "mvm_q4_k", "mvm_q6_k", "mvs_q8_0",
         ];
         let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
             .iter()
@@ -613,14 +627,9 @@ impl MetalLlama {
             } else if m <= mv_max_rows(w.kind) {
                 // One activation row: the tuned decode kernels; 2..8 rows: kernels that
                 // decode each weight chunk once for all rows.
-                let name = match m {
-                    1 => format!("mv_{}", w.kind.suffix()),
-                    2 => format!("mv2_{}", w.kind.suffix()),
-                    3 | 4 => format!("mv4_{}", w.kind.suffix()),
-                    _ => format!("mv8_{}", w.kind.suffix()),
-                };
+                let (name, rows, threads) = mv_kernel(w.kind, m, w.cols);
                 let p = self.pipeline(&name);
-                e.groups(p, &args, ((w.rows as u64).div_ceil(mv_rows_per_group(w.kind, m)), 1, 1), 64);
+                e.groups(p, &args, ((w.rows as u64).div_ceil(rows), 1, 1), threads);
             } else if w.kind != WKind::F32 && MMH_ROWS.contains(&m) && w.rows.div_ceil(64) >= MMH_MIN_GROUPS {
                 let two = (w.cols / 32).is_multiple_of(2);
                 let stage = if two { "mmh" } else { "mmh1" };
