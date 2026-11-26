@@ -82,7 +82,9 @@ jobs:
       - name: Profile decode
         continue-on-error: true
         run: |
-          sudo apt-get install -y -qq "linux-tools-$(uname -r)" linux-tools-generic > /dev/null
+          sudo apt-get update -qq > /dev/null
+          sudo apt-get install -y -qq "linux-tools-$(uname -r)" > /dev/null || sudo apt-get install -y -qq linux-tools-azure linux-tools-generic > /dev/null
+          PATH="$PATH:$(ls -d /usr/lib/linux-tools/*/ | head -1)"
           sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
           for m in SmolLM2-135M-Instruct-Q8_0.gguf Llama-3.2-1B-Instruct-Q4_0.requant.gguf; do
             perf record -q -F 2000 -g -o perf.data -- target/release/rllm --threads "$(nproc)" bench \
