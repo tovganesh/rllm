@@ -90,16 +90,10 @@ fn q4_k_scales_mins(s: &[u8]) -> ([u8; 8], [u8; 8]) {
     (bytes(scales), bytes(mins))
 }
 
+#[cfg(target_arch = "aarch64")]
 fn has_dotprod() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        static DOTPROD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *DOTPROD.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
+    static DOTPROD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DOTPROD.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
 }
 
 /// Dot product of one `Q4_K` row (`nb` super-blocks) with activation super-blocks

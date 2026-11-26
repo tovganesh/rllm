@@ -64,16 +64,10 @@ fn f16_at(b: &[u8], off: usize) -> f32 {
     f16::from_le_bytes([b[off], b[off + 1]]).to_f32()
 }
 
+#[cfg(target_arch = "aarch64")]
 fn has_dotprod() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        static DOTPROD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *DOTPROD.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
+    static DOTPROD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DOTPROD.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
 }
 
 /// Dot product of one `Q8_0` weight row with quantized activations.

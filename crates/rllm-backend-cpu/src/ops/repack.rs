@@ -18,11 +18,14 @@
 
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
-use super::qdot::{quantize_activations, quantize_activations_impl, Q8Activations, QK};
+#[cfg(target_arch = "aarch64")]
+use super::qdot::quantize_activations_impl;
+use super::qdot::{quantize_activations, Q8Activations, QK};
 use half::f16;
 use rayon::prelude::*;
 
 const Q4_0_BYTES: usize = 18;
+#[cfg(target_arch = "aarch64")]
 const Q8_0_BYTES: usize = 34;
 /// Bytes of one interleaved 4-row block.
 pub const GROUP_BLOCK_BYTES: usize = 4 * Q4_0_BYTES;
@@ -135,16 +138,10 @@ pub fn scalar_dot_q4_0x4(grp: &[u8], a: &Q8Activations, off: usize, nb: usize) -
     out
 }
 
+#[cfg(target_arch = "aarch64")]
 fn has_dotprod() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *V.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
 }
 
 /// Whether the int8 matrix-multiply (`SMMLA`) path is available.
@@ -176,6 +173,7 @@ pub fn vec_dot_q4_0x4(grp: &[u8], a: &Q8Activations, off: usize, nb: usize) -> [
 }
 
 /// Batches below this many rows run on the low-latency decode pool.
+#[cfg(target_arch = "aarch64")]
 const SMALL_BATCH_ROWS: usize = 32;
 
 /// Raw pointer that tasks writing disjoint output elements may share.
@@ -310,11 +308,13 @@ pub fn gemm_q8_0_i8mm(weight: &[u8], x: &[f32], out: &mut [f32], m: usize, n: us
 /// Activations of rows `2p, 2p+1` interleaved in 8-byte chunks per block (the `SMMLA`
 /// left operand), with per-lane scales `[d0, d0, d1, d1] / 16`. An odd last row is
 /// paired with zeros.
+#[cfg(target_arch = "aarch64")]
 struct PackedPairs {
     qs: Vec<i8>,
     scales: Vec<f32>,
 }
 
+#[cfg(target_arch = "aarch64")]
 fn pack_pairs(a: &Q8Activations, m: usize, nb: usize) -> PackedPairs {
     let pairs = m.div_ceil(2);
     let mut qs = vec![0i8; pairs * nb * 64];

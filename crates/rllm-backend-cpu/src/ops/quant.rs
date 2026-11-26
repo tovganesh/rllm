@@ -488,7 +488,7 @@ pub fn convert_f16(src: &[u8], out: &mut [f32]) {
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
-    for (b, y) in src.chunks_exact(2).zip(out.iter_mut()) {
+    for (b, y) in src[..2 * n].chunks_exact(2).zip(out[..n].iter_mut()) {
         *y = f16::from_le_bytes([b[0], b[1]]).to_f32();
     }
 }
