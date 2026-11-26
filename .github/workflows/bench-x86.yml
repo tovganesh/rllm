@@ -28,8 +28,9 @@ jobs:
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)|Thread|Flags" | sed 's/Flags:.*\(avx[^ ]*\).*/AVX flags: &/' | cut -c1-200
           grep -o -w -E "avx2|fma|avx512f|avx512bw|avx512vl|avx512_vnni|avxvnni|f16c" /proc/cpuinfo | sort -u | tr '\n' ' '; echo
-          echo "key=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
-      # llama.cpp is built for the runner's CPU (GGML_NATIVE), so the cache is per CPU model.
+          # Same model name can come with different flags (AVX-512 hidden on some VMs).
+          echo "key=$( (grep -m1 'model name' /proc/cpuinfo; grep -m1 '^flags' /proc/cpuinfo) | md5sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+      # llama.cpp is built for the runner's CPU (GGML_NATIVE), so the cache is per CPU model and flags.
       - uses: actions/cache@v4
         id: llama
         with:
