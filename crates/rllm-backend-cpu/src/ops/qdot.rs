@@ -79,6 +79,11 @@ pub fn vec_dot_q8_0_q8(w: &[u8], a: &Q8Activations, a_block_offset: usize, nb: u
         // by the debug assertions in the callers and sized by `nb`.
         return unsafe { neon::dot_q8_0_q8(w, a, a_block_offset, nb) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q8_0(w, a, a_block_offset, nb) };
+    }
     scalar_dot_q8_0_q8(w, a, a_block_offset, nb)
 }
 
@@ -89,6 +94,11 @@ pub fn vec_dot_q4_0_q8(w: &[u8], a: &Q8Activations, a_block_offset: usize, nb: u
     if has_dotprod() {
         // SAFETY: as above.
         return unsafe { neon::dot_q4_0_q8(w, a, a_block_offset, nb) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q4_0(w, a, a_block_offset, nb) };
     }
     scalar_dot_q4_0_q8(w, a, a_block_offset, nb)
 }
@@ -136,7 +146,7 @@ pub fn vec_dot_x4(is_q8: bool, w: [&[u8]; 4], a: &Q8Activations, off: usize, nb:
             }
         };
     }
-    let dot = if is_q8 { scalar_dot_q8_0_q8 } else { scalar_dot_q4_0_q8 };
+    let dot = if is_q8 { vec_dot_q8_0_q8 } else { vec_dot_q4_0_q8 };
     [
         dot(w[0], a, off, nb),
         dot(w[1], a, off, nb),
@@ -153,6 +163,11 @@ pub fn dot_q8_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [usize; 
     if has_dotprod() {
         // SAFETY: dotprod detected at runtime; bounds are asserted inside.
         return unsafe { neon::dot_q8_0_rows(w, a, offs, nb) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q8_0_rows(w, a, offs, nb) };
     }
     std::array::from_fn(|r| scalar_dot_q8_0_q8(w, a, offs[r], nb))
 }

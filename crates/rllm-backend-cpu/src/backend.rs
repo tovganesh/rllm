@@ -208,7 +208,7 @@ impl Backend for CpuBackend {
         Ok(out)
     }
 
-    /// Repacks `Q4_0` matrices with a multiple of 4 rows into interleaved `Q4_0x4`, and
+    /// Repacks `Q4_0` matrices with a multiple of 4 rows into interleaved `Q4_0x4` (aarch64), and
     /// expands `Q5_0` losslessly to `Q8_0` (the SDOT Q8_0 kernel is ~1.75x faster than
     /// unpacking 5-bit values on an M4, at 34 instead of 22 bytes per block).
     fn pack_weight(&self, w: &Tensor) -> Result<Option<Tensor>> {
@@ -219,7 +219,11 @@ impl Backend for CpuBackend {
         let len = w.dtype().storage_bytes(w.numel());
         let bytes = || -> Result<&[u8]> { Ok(&w.storage().as_cpu()?.as_bytes()[w.offset()..w.offset() + len]) };
         let (dtype, packed) = match w.dtype() {
-            DType::Q4_0 if dims[0].is_multiple_of(4) => (DType::Q4_0x4, repack_q4_0(bytes()?, dims[0], dims[1])),
+            // The interleaved layout has SDOT/SMMLA kernels only; x86 keeps plain Q4_0 rows
+            // (AVX2 dot product).
+            DType::Q4_0 if cfg!(target_arch = "aarch64") && dims[0].is_multiple_of(4) => {
+                (DType::Q4_0x4, repack_q4_0(bytes()?, dims[0], dims[1]))
+            }
             DType::Q5_0 => (DType::Q8_0, q5_0_to_q8_0(bytes()?)),
             _ => return Ok(None),
         };

@@ -44,6 +44,11 @@ pub fn dot_f32_f16(q: &[f32], k: &[half::f16]) -> f32 {
         // SAFETY: NEON is always available on aarch64; lengths checked above.
         return unsafe { neon::dot_f32_f16(q, k) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_f16(k, q) };
+    }
     q.iter().zip(k).map(|(a, b)| a * b.to_f32()).sum()
 }
 
@@ -54,6 +59,11 @@ pub fn axpy_f16(out: &mut [f32], w: f32, v: &[half::f16]) {
     if out.len().is_multiple_of(8) {
         // SAFETY: as above.
         return unsafe { neon::axpy_f16(out, w, v) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::axpy_f16(out, w, v) };
     }
     for (o, x) in out.iter_mut().zip(v) {
         *o += w * x.to_f32();

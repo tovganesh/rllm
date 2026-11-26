@@ -30,6 +30,11 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         sum
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA detected at run time; the kernel bounds itself to the shorter slice.
+        return unsafe { super::x86::dot_f32(a, b) };
+    }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let mut sum = 0.0f32;
