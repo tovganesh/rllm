@@ -171,9 +171,7 @@ impl PassCosts {
         let passes = self.passes;
         let Some(e) = self.entries.get_mut(rows) else { return };
         let avg = match *e {
-            Some((old, at)) if passes - at <= Self::STALE_AFTER => {
-                (1.0 - Self::ALPHA) * old + Self::ALPHA * micros
-            }
+            Some((old, at)) if passes - at <= Self::STALE_AFTER => (1.0 - Self::ALPHA) * old + Self::ALPHA * micros,
             _ => micros,
         };
         *e = Some((avg, passes));
@@ -196,9 +194,7 @@ impl PassCosts {
         let lo = (1..rows.min(n)).rev().find_map(|r| self.known(r).map(|c| (r, c)));
         let hi = (rows + 1..n).find_map(|r| self.known(r).map(|c| (r, c)));
         match (lo, hi) {
-            (Some((r0, c0)), Some((r1, c1))) => {
-                Some(c0 + (c1 - c0) * (rows - r0) as f64 / (r1 - r0) as f64)
-            }
+            (Some((r0, c0)), Some((r1, c1))) => Some(c0 + (c1 - c0) * (rows - r0) as f64 / (r1 - r0) as f64),
             (Some((_, c0)), None) => Some(c0),
             (None, hi) => hi.map(|(_, c)| c),
         }

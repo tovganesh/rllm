@@ -32,9 +32,22 @@ fn engine(with_llm: bool) -> Option<RagEngine<CpuBackend>> {
     let backend = Arc::new(CpuBackend);
     let embedder = Arc::new(TextEmbedder::from_gguf(&emb_path, backend.clone()).unwrap());
     let generator = with_llm.then(|| {
-        let b = GgufBundle::load(&llm_path, backend, &LoadOptions { max_context: Some(2048), ..LoadOptions::default() }).unwrap();
+        let b = GgufBundle::load(
+            &llm_path,
+            backend,
+            &LoadOptions {
+                max_context: Some(2048),
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
         let scheduler = ContinuousBatchScheduler::new(
-            SchedulerConfig { max_batch_size: 4, block_size: 16, total_blocks: 256, ..SchedulerConfig::default() },
+            SchedulerConfig {
+                max_batch_size: 4,
+                block_size: 16,
+                total_blocks: 256,
+                ..SchedulerConfig::default()
+            },
             Arc::new(b.model),
         )
         .unwrap();
@@ -71,18 +84,42 @@ fn paraphrased_queries_retrieve_the_right_passage() {
 #[test]
 fn unrelated_queries_are_flagged() {
     let Some(e) = engine(false) else { return };
-    for query in ["Who won the 1998 football World Cup?", "What is a good recipe for chocolate cake?"] {
+    for query in [
+        "Who won the 1998 football World Cup?",
+        "What is a good recipe for chocolate cake?",
+    ] {
         let r = e.retrieve(query, 2, None).unwrap();
-        assert!(!r.is_relevant, "{query:?} should be flagged; got {:?}", r.citations.first().map(|c| (&c.doc_id, c.dense_similarity, c.relevance)));
+        assert!(
+            !r.is_relevant,
+            "{query:?} should be flagged; got {:?}",
+            r.citations
+                .first()
+                .map(|c| (&c.doc_id, c.dense_similarity, c.relevance))
+        );
     }
 }
 
 #[tokio::test]
 async fn llm_generates_a_grounded_answer() {
     let Some(e) = engine(true) else { return };
-    let sampling = SamplingParams { temperature: 0.0, max_tokens: 80, ..SamplingParams::default() };
-    let r = e.query("At what temperature does water boil at sea level?", 2, sampling).await.unwrap();
-    eprintln!("answer: {:?}\nwarning: {:?}\ncited: {:?}", r.answer, r.warning, r.citations.iter().map(|c| (&c.doc_id, c.cited_in_answer)).collect::<Vec<_>>());
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        max_tokens: 80,
+        ..SamplingParams::default()
+    };
+    let r = e
+        .query("At what temperature does water boil at sea level?", 2, sampling)
+        .await
+        .unwrap();
+    eprintln!(
+        "answer: {:?}\nwarning: {:?}\ncited: {:?}",
+        r.answer,
+        r.warning,
+        r.citations
+            .iter()
+            .map(|c| (&c.doc_id, c.cited_in_answer))
+            .collect::<Vec<_>>()
+    );
     assert!(r.is_relevant);
     assert_eq!(r.answer_source, "llm");
     assert!(r.generated_tokens > 0);
@@ -93,8 +130,18 @@ async fn llm_generates_a_grounded_answer() {
 #[test]
 fn calibrated_thresholds_hold_for_both_embedding_models() {
     let backend = Arc::new(CpuBackend);
-    let related = ["How do leaves make sugar?", "What powers plant growth?", "How tall is the tower in the French capital?", "Is Rust garbage collected?"];
-    let unrelated = ["Who won the 1998 World Cup?", "Best chocolate cake recipe", "How do I change a car tyre?", "What is the stock price of Apple?"];
+    let related = [
+        "How do leaves make sugar?",
+        "What powers plant growth?",
+        "How tall is the tower in the French capital?",
+        "Is Rust garbage collected?",
+    ];
+    let unrelated = [
+        "Who won the 1998 World Cup?",
+        "Best chocolate cake recipe",
+        "How do I change a car tyre?",
+        "What is the stock price of Apple?",
+    ];
     for file in ["bge-small-en-v1.5-q8_0.gguf", "all-MiniLM-L6-v2-Q8_0.gguf"] {
         let path = models_dir().join(file);
         if !path.exists() {
@@ -111,10 +158,16 @@ fn calibrated_thresholds_hold_for_both_embedding_models() {
             e.ingest_document(id, text, HashMap::new()).unwrap();
         }
         for q in related {
-            assert!(e.retrieve(q, 1, None).unwrap().is_relevant, "[{file}] {q:?} should be relevant");
+            assert!(
+                e.retrieve(q, 1, None).unwrap().is_relevant,
+                "[{file}] {q:?} should be relevant"
+            );
         }
         for q in unrelated {
-            assert!(!e.retrieve(q, 1, None).unwrap().is_relevant, "[{file}] {q:?} should be flagged");
+            assert!(
+                !e.retrieve(q, 1, None).unwrap().is_relevant,
+                "[{file}] {q:?} should be flagged"
+            );
         }
     }
 }

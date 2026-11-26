@@ -27,19 +27,11 @@ impl CrossEncoderReranker {
     ///
     /// Filters out English stop words so unrelated queries (e.g., "what is the weather on mars")
     /// cannot artificially score high from common grammatical tokens.
-    pub fn rerank(
-        query: &str,
-        candidates: Vec<DocumentChunk>,
-        top_k: usize,
-    ) -> Vec<RerankedMatch> {
+    pub fn rerank(query: &str, candidates: Vec<DocumentChunk>, top_k: usize) -> Vec<RerankedMatch> {
         let content_keywords = extract_content_keywords(query);
 
         if content_keywords.is_empty() {
-            let raw_tokens: Vec<String> = query
-                .to_lowercase()
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
+            let raw_tokens: Vec<String> = query.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
 
             if raw_tokens.is_empty() {
                 return candidates
@@ -77,7 +69,9 @@ impl CrossEncoderReranker {
                 for kw in &content_keywords {
                     let freq = doc_words
                         .iter()
-                        .filter(|&w| w == kw || (kw.len() >= 4 && w.len() >= 4 && (w.starts_with(kw) || kw.starts_with(w))))
+                        .filter(|&w| {
+                            w == kw || (kw.len() >= 4 && w.len() >= 4 && (w.starts_with(kw) || kw.starts_with(w)))
+                        })
                         .count();
                     if freq > 0 {
                         matched_keywords += 1;

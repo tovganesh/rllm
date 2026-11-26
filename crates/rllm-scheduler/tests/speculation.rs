@@ -83,9 +83,8 @@ impl LanguageModel for StubModel {
     fn forward_cached(&self, batch: &ForwardBatch<'_>) -> Result<Vec<f32>> {
         std::thread::sleep(std::time::Duration::from_micros(self.pass_us));
         let mut store = self.store.lock();
-        let slot = |table: &rllm_core::backend::BlockTable, pos: usize| {
-            table.block_ids[pos / BLOCK] * BLOCK + pos % BLOCK
-        };
+        let slot =
+            |table: &rllm_core::backend::BlockTable, pos: usize| table.block_ids[pos / BLOCK] * BLOCK + pos % BLOCK;
         for (r, &tok) in batch.tokens.iter().enumerate() {
             store[slot(&batch.block_tables[r], batch.positions[r])] = Some(tok);
         }
@@ -183,7 +182,10 @@ fn greedy_speculation_matches_plain_decoding() {
         assert_eq!(spec, plain, "draft {draft}");
         let m = &sched.metrics;
         let accepted = m.accepted_draft_tokens.load(Ordering::Relaxed);
-        assert!(accepted > 0 && accepted < m.draft_tokens.load(Ordering::Relaxed), "draft {draft}");
+        assert!(
+            accepted > 0 && accepted < m.draft_tokens.load(Ordering::Relaxed),
+            "draft {draft}"
+        );
         assert!(
             m.forward_passes.load(Ordering::Relaxed) < plain_sched.metrics.forward_passes.load(Ordering::Relaxed),
             "draft {draft}"
@@ -266,7 +268,10 @@ fn sampling_distribution_is_unchanged() {
                 ctx.push(t);
             }
         }
-        (hit as f64 / n as f64, sched.metrics.accepted_draft_tokens.load(Ordering::Relaxed))
+        (
+            hit as f64 / n as f64,
+            sched.metrics.accepted_draft_tokens.load(Ordering::Relaxed),
+        )
     };
     // 3200 samples: standard deviation 0.008.
     let (plain, _) = rate(0);

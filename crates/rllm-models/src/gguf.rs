@@ -318,9 +318,8 @@ impl MappedGguf {
     /// Memory-maps and parses a GGUF file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = std::fs::File::open(path).map_err(|e| {
-            RllmError::ModelError(format!("Cannot open model file {}: {e}", path.display()))
-        })?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| RllmError::ModelError(format!("Cannot open model file {}: {e}", path.display())))?;
         // SAFETY: the map is read-only. As with any mmap, the file must not be truncated
         // or modified while it is open.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
@@ -337,9 +336,9 @@ impl MappedGguf {
             ))
         })?;
         let start = self.header.data_offset as usize + info.offset as usize;
-        self.mmap.get(start..start + size).ok_or_else(|| {
-            RllmError::ModelError(format!("Tensor '{}' extends past end of file", info.name))
-        })
+        self.mmap
+            .get(start..start + size)
+            .ok_or_else(|| RllmError::ModelError(format!("Tensor '{}' extends past end of file", info.name)))
     }
 
     /// Descriptor of a named tensor.

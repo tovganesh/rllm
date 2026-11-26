@@ -51,7 +51,10 @@ impl DType {
 
     /// Returns true if this data type is a block-quantized representation.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, DType::Q4_0 | DType::Q4_K | DType::Q8_0 | DType::Q5_0 | DType::Q6_K | DType::Q4_0x4)
+        matches!(
+            self,
+            DType::Q4_0 | DType::Q4_K | DType::Q8_0 | DType::Q5_0 | DType::Q6_K | DType::Q4_0x4
+        )
     }
 
     /// Returns `(block_size, bytes_per_block)` for quantized types.

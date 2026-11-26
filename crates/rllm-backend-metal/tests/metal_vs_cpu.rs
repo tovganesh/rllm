@@ -6,7 +6,13 @@ use rllm_backend_cpu::{
     CpuBackend,
 };
 use rllm_backend_metal::MetalLlama;
-use rllm_core::{backend::BlockTable, device::Device, dtype::DType, storage::{CpuStorage, Storage}, tensor::Tensor};
+use rllm_core::{
+    backend::BlockTable,
+    device::Device,
+    dtype::DType,
+    storage::{CpuStorage, Storage},
+    tensor::Tensor,
+};
 use rllm_models::{ForwardBatch, LanguageModel, LlamaConfig, LlamaModel};
 use std::sync::Arc;
 
@@ -38,12 +44,21 @@ fn quantize(t: &Tensor, dtype: DType) -> Tensor {
         DType::Q6_K => bytes = quantize_f32_to_q6_k(&data),
         _ => unreachable!(),
     }
-    Tensor::new(t.shape().clone(), dtype, Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(bytes)))
+    Tensor::new(
+        t.shape().clone(),
+        dtype,
+        Device::Cpu,
+        Storage::Cpu(CpuStorage::from_bytes(bytes)),
+    )
 }
 
 /// 256-wide config for K-quants (whole 256-value super-blocks per row).
 fn config_k() -> LlamaConfig {
-    LlamaConfig { hidden_size: 256, intermediate_size: 512, ..config() }
+    LlamaConfig {
+        hidden_size: 256,
+        intermediate_size: 512,
+        ..config()
+    }
 }
 
 fn model(dtype: DType) -> LlamaModel<CpuBackend> {
@@ -60,7 +75,15 @@ fn model_with(cfg: LlamaConfig, cfg_k: LlamaConfig, dtype: DType) -> LlamaModel<
         m.embed_tokens = quantize(&m.embed_tokens, dtype);
         m.lm_head = quantize(&m.lm_head, dtype);
         for l in &mut m.layers {
-            for w in [&mut l.self_attn.q_proj, &mut l.self_attn.k_proj, &mut l.self_attn.v_proj, &mut l.self_attn.o_proj, &mut l.mlp.gate_proj, &mut l.mlp.up_proj, &mut l.mlp.down_proj] {
+            for w in [
+                &mut l.self_attn.q_proj,
+                &mut l.self_attn.k_proj,
+                &mut l.self_attn.v_proj,
+                &mut l.self_attn.o_proj,
+                &mut l.mlp.gate_proj,
+                &mut l.mlp.up_proj,
+                &mut l.mlp.down_proj,
+            ] {
                 *w = quantize(w, dtype);
             }
         }
@@ -77,7 +100,13 @@ fn model_k_mixed(cfg: LlamaConfig) -> LlamaModel<CpuBackend> {
     m.embed_tokens = quantize(&m.embed_tokens, DType::Q6_K);
     m.lm_head = quantize(&m.lm_head, DType::Q6_K);
     for l in &mut m.layers {
-        for w in [&mut l.self_attn.q_proj, &mut l.self_attn.k_proj, &mut l.self_attn.o_proj, &mut l.mlp.gate_proj, &mut l.mlp.up_proj] {
+        for w in [
+            &mut l.self_attn.q_proj,
+            &mut l.self_attn.k_proj,
+            &mut l.self_attn.o_proj,
+            &mut l.mlp.gate_proj,
+            &mut l.mlp.up_proj,
+        ] {
             *w = quantize(w, DType::Q4_K);
         }
         for w in [&mut l.self_attn.v_proj, &mut l.mlp.down_proj] {
@@ -122,8 +151,14 @@ fn check_kv(dtype: DType, kv: DType, tol: f32, prefill_tol: f32) {
     let block = 16;
     cpu.init_kv_cache(12, block).unwrap();
     gpu.init_kv_cache(12, block).unwrap();
-    let ta = BlockTable { block_size: block, block_ids: vec![7, 2, 9, 0] };
-    let tb = BlockTable { block_size: block, block_ids: vec![5, 11, 3] };
+    let ta = BlockTable {
+        block_size: block,
+        block_ids: vec![7, 2, 9, 0],
+    };
+    let tb = BlockTable {
+        block_size: block,
+        block_ids: vec![5, 11, 3],
+    };
 
     let (la, lb) = (33usize, 15usize);
     let mut tokens: Vec<u32> = (0..la as u32).map(|i| (i * 7 + 3) % 96).collect();
@@ -133,8 +168,16 @@ fn check_kv(dtype: DType, kv: DType, tol: f32, prefill_tol: f32) {
     let mut tables = vec![ta.clone(); la];
     tables.extend(vec![tb.clone(); lb]);
     let rows: Vec<usize> = (0..la + lb).collect();
-    let batch = ForwardBatch { tokens: &tokens, positions: &positions, block_tables: &tables, logits_rows: &rows };
-    let d = max_rel_diff(&gpu.forward_cached(&batch).unwrap(), &cpu.forward_cached(&batch).unwrap());
+    let batch = ForwardBatch {
+        tokens: &tokens,
+        positions: &positions,
+        block_tables: &tables,
+        logits_rows: &rows,
+    };
+    let d = max_rel_diff(
+        &gpu.forward_cached(&batch).unwrap(),
+        &cpu.forward_cached(&batch).unwrap(),
+    );
     assert!(d < prefill_tol, "{dtype:?} prefill: relative diff {d}");
 
     // Decode: compare Metal against a CPU *prefill* of the full sequence so that both
@@ -145,13 +188,23 @@ fn check_kv(dtype: DType, kv: DType, tol: f32, prefill_tol: f32) {
         seq_a.push(tok);
         let pos = seq_a.len() - 1;
         let g = gpu
-            .forward_cached(&ForwardBatch { tokens: &[tok], positions: &[pos], block_tables: std::slice::from_ref(&ta), logits_rows: &[0] })
+            .forward_cached(&ForwardBatch {
+                tokens: &[tok],
+                positions: &[pos],
+                block_tables: std::slice::from_ref(&ta),
+                logits_rows: &[0],
+            })
             .unwrap();
         let fresh = model(dtype);
         fresh.init_kv_cache(12, block).unwrap();
         let p: Vec<usize> = (0..seq_a.len()).collect();
         let all = fresh
-            .forward_cached(&ForwardBatch { tokens: &seq_a, positions: &p, block_tables: &vec![ta.clone(); seq_a.len()], logits_rows: &p })
+            .forward_cached(&ForwardBatch {
+                tokens: &seq_a,
+                positions: &p,
+                block_tables: &vec![ta.clone(); seq_a.len()],
+                logits_rows: &p,
+            })
             .unwrap();
         let vocab = cpu.config.vocab_size;
         let c = &all[pos * vocab..(pos + 1) * vocab];
@@ -195,11 +248,19 @@ fn metal_prefix_block_reuse_matches_full_prefill() {
     let block = 16;
     gpu.init_kv_cache(12, block).unwrap();
     let run = |tokens: &[u32], start: usize, ids: Vec<usize>| -> Vec<f32> {
-        let table = BlockTable { block_size: block, block_ids: ids };
+        let table = BlockTable {
+            block_size: block,
+            block_ids: ids,
+        };
         let positions: Vec<usize> = (start..start + tokens.len()).collect();
         let tables = vec![table; tokens.len()];
-        gpu.forward_cached(&ForwardBatch { tokens, positions: &positions, block_tables: &tables, logits_rows: &[tokens.len() - 1] })
-            .unwrap()
+        gpu.forward_cached(&ForwardBatch {
+            tokens,
+            positions: &positions,
+            block_tables: &tables,
+            logits_rows: &[tokens.len() - 1],
+        })
+        .unwrap()
     };
     let a: Vec<u32> = (0..40u32).map(|i| (i * 7 + 3) % 96).collect();
     let mut b: Vec<u32> = a[..32].to_vec();
@@ -257,12 +318,23 @@ fn check_split_context_decode(cfg: LlamaConfig) {
     gpu.init_kv_cache(64, block).unwrap();
     let long: Vec<u32> = (0..700u32).map(|i| (i * 31 + 7) % 96).collect();
     let short: Vec<u32> = (0..20u32).map(|i| (i * 13 + 1) % 96).collect();
-    let ta = BlockTable { block_size: block, block_ids: (0..45).collect() };
-    let tb = BlockTable { block_size: block, block_ids: (50..52).collect() };
+    let ta = BlockTable {
+        block_size: block,
+        block_ids: (0..45).collect(),
+    };
+    let tb = BlockTable {
+        block_size: block,
+        block_ids: (50..52).collect(),
+    };
     for (toks, t) in [(&long, &ta), (&short, &tb)] {
         let p: Vec<usize> = (0..toks.len()).collect();
-        gpu.forward_cached(&ForwardBatch { tokens: toks, positions: &p, block_tables: &vec![t.clone(); toks.len()], logits_rows: &[0] })
-            .unwrap();
+        gpu.forward_cached(&ForwardBatch {
+            tokens: toks,
+            positions: &p,
+            block_tables: &vec![t.clone(); toks.len()],
+            logits_rows: &[0],
+        })
+        .unwrap();
     }
     // One decode step for both sequences in the same batch.
     let (na, nb) = (5u32, 9u32);
@@ -281,13 +353,25 @@ fn check_split_context_decode(cfg: LlamaConfig) {
         let cpu = make();
         cpu.init_kv_cache(64, block).unwrap();
         let p: Vec<usize> = (0..all.len()).collect();
-        let t = BlockTable { block_size: block, block_ids: (0..all.len().div_ceil(block)).collect() };
+        let t = BlockTable {
+            block_size: block,
+            block_ids: (0..all.len().div_ceil(block)).collect(),
+        };
         let c = cpu
-            .forward_cached(&ForwardBatch { tokens: &all, positions: &p, block_tables: &vec![t; all.len()], logits_rows: &[all.len() - 1] })
+            .forward_cached(&ForwardBatch {
+                tokens: &all,
+                positions: &p,
+                block_tables: &vec![t; all.len()],
+                logits_rows: &[all.len() - 1],
+            })
             .unwrap();
         let d = max_rel_diff(&g[row * vocab..(row + 1) * vocab], &c);
         let (h, nq, nkv) = (cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads);
-        assert!(d < 2e-3, "hidden {h}, {nq}/{nkv} heads, row {row} (context {}): relative diff {d}", all.len());
+        assert!(
+            d < 2e-3,
+            "hidden {h}, {nq}/{nkv} heads, row {row} (context {}): relative diff {d}",
+            all.len()
+        );
     }
 }
 
@@ -305,8 +389,17 @@ fn check_split_context_decode(cfg: LlamaConfig) {
 /// gives differences of order 1.
 #[test]
 fn metal_small_batches_match_token_by_token() {
-    let wide = LlamaConfig { hidden_size: 96, num_attention_heads: 3, num_key_value_heads: 1, intermediate_size: 1056, ..config() };
-    let wide_k = LlamaConfig { intermediate_size: 1024, ..config_k() };
+    let wide = LlamaConfig {
+        hidden_size: 96,
+        num_attention_heads: 3,
+        num_key_value_heads: 1,
+        intermediate_size: 1056,
+        ..config()
+    };
+    let wide_k = LlamaConfig {
+        intermediate_size: 1024,
+        ..config_k()
+    };
     let ms: Vec<usize> = (2..=9).chain([12, 16, 20, 24, 28, 32]).collect();
     check_small_batches(wide, wide_k, &ms);
 }
@@ -324,7 +417,14 @@ fn metal_mmh_accumulating_projections_match_token_by_token() {
         num_hidden_layers: 1,
         ..config()
     };
-    let tall_k = LlamaConfig { hidden_size: 2048, num_attention_heads: 16, num_key_value_heads: 8, intermediate_size: 256, num_hidden_layers: 1, ..config() };
+    let tall_k = LlamaConfig {
+        hidden_size: 2048,
+        num_attention_heads: 16,
+        num_key_value_heads: 8,
+        intermediate_size: 256,
+        num_hidden_layers: 1,
+        ..config()
+    };
     check_small_batches(tall, tall_k, &[9, 12, 16]);
 }
 
@@ -338,13 +438,26 @@ fn check_small_batches(cfg: LlamaConfig, cfg_k: LlamaConfig, ms: &[usize]) {
     let f16_model = || {
         let mut m = LlamaModel::new_seeded(wide.clone(), Arc::new(CpuBackend), 11).unwrap();
         let round = |t: &mut Tensor| {
-            let v: Vec<f32> = t.to_vec::<f32>().unwrap().iter().map(|&x| half::f16::from_f32(x).to_f32()).collect();
+            let v: Vec<f32> = t
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .map(|&x| half::f16::from_f32(x).to_f32())
+                .collect();
             *t = Tensor::from_f32(&v, t.shape().clone(), Device::Cpu).unwrap();
         };
         round(&mut m.embed_tokens);
         round(&mut m.lm_head);
         for l in &mut m.layers {
-            for w in [&mut l.self_attn.q_proj, &mut l.self_attn.k_proj, &mut l.self_attn.v_proj, &mut l.self_attn.o_proj, &mut l.mlp.gate_proj, &mut l.mlp.up_proj, &mut l.mlp.down_proj] {
+            for w in [
+                &mut l.self_attn.q_proj,
+                &mut l.self_attn.k_proj,
+                &mut l.self_attn.v_proj,
+                &mut l.self_attn.o_proj,
+                &mut l.mlp.gate_proj,
+                &mut l.mlp.up_proj,
+                &mut l.mlp.down_proj,
+            ] {
                 round(w);
             }
         }
@@ -372,14 +485,28 @@ fn check_small_batches(cfg: LlamaConfig, cfg_k: LlamaConfig, ms: &[usize]) {
                 .forward_cached(&ForwardBatch {
                     tokens: &tokens,
                     positions: &rows,
-                    block_tables: &vec![BlockTable { block_size: block, block_ids: vec![0, 1] }; m],
+                    block_tables: &vec![
+                        BlockTable {
+                            block_size: block,
+                            block_ids: vec![0, 1]
+                        };
+                        m
+                    ],
                     logits_rows: &rows,
                 })
                 .unwrap();
-            let t1 = BlockTable { block_size: block, block_ids: vec![2, 3] };
+            let t1 = BlockTable {
+                block_size: block,
+                block_ids: vec![2, 3],
+            };
             for (i, &tok) in tokens.iter().enumerate() {
                 let single = gpu
-                    .forward_cached(&ForwardBatch { tokens: &[tok], positions: &[i], block_tables: std::slice::from_ref(&t1), logits_rows: &[0] })
+                    .forward_cached(&ForwardBatch {
+                        tokens: &[tok],
+                        positions: &[i],
+                        block_tables: std::slice::from_ref(&t1),
+                        logits_rows: &[0],
+                    })
                     .unwrap();
                 let d = max_rel_diff(&batched[i * vocab..(i + 1) * vocab], &single);
                 assert!(d < 1e-3, "{name} m={m} row {i}: relative diff {d}");

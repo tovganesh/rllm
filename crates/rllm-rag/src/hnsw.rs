@@ -221,13 +221,7 @@ impl HnswIndex {
         }
     }
 
-    fn search_layer(
-        &self,
-        query: &[f32],
-        enter_points: &[usize],
-        ef: usize,
-        level: usize,
-    ) -> Vec<Candidate> {
+    fn search_layer(&self, query: &[f32], enter_points: &[usize], ef: usize, level: usize) -> Vec<Candidate> {
         let mut visited = HashSet::new();
         let mut candidates = BinaryHeap::new(); // max-heap
         let mut nearest = BinaryHeap::new();

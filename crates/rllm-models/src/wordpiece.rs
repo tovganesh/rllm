@@ -55,14 +55,15 @@ impl WordPieceTokenizer {
             .and_then(GgufValue::as_array)
             .map(|a| a.iter().map(|v| v.as_u64().unwrap_or(1)).collect())
             .unwrap_or_else(|| vec![1; tokens.len()]);
-        let id = |k: &str, default: u32| {
-            g.get(k).and_then(GgufValue::as_u64).map_or(default, |v| v as u32)
-        };
+        let id = |k: &str, default: u32| g.get(k).and_then(GgufValue::as_u64).map_or(default, |v| v as u32);
         Ok(Self::build(
             tokens,
             &types,
             id("tokenizer.ggml.cls_token_id", id("tokenizer.ggml.bos_token_id", 101)),
-            id("tokenizer.ggml.seperator_token_id", id("tokenizer.ggml.eos_token_id", 102)),
+            id(
+                "tokenizer.ggml.seperator_token_id",
+                id("tokenizer.ggml.eos_token_id", 102),
+            ),
             id("tokenizer.ggml.unknown_token_id", 100),
         ))
     }
@@ -70,7 +71,9 @@ impl WordPieceTokenizer {
     fn build(tokens: Vec<String>, types: &[u64], cls: u32, sep: u32, unk: u32) -> Self {
         let token_to_id = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
         // GGUF token types: 3 = control, 4 = user-defined.
-        let is_special: Vec<bool> = (0..tokens.len()).map(|i| matches!(types.get(i), Some(3) | Some(4))).collect();
+        let is_special: Vec<bool> = (0..tokens.len())
+            .map(|i| matches!(types.get(i), Some(3) | Some(4)))
+            .collect();
         let mut specials: Vec<(String, u32)> = tokens
             .iter()
             .enumerate()
@@ -167,7 +170,9 @@ impl WordPieceTokenizer {
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
         let mut s = String::new();
         for &id in ids {
-            let Some(tok) = self.tokens.get(id as usize) else { continue };
+            let Some(tok) = self.tokens.get(id as usize) else {
+                continue;
+            };
             if self.is_special[id as usize] {
                 if !skip_special {
                     s.push_str(tok);
@@ -250,10 +255,12 @@ mod tests {
     use super::*;
 
     fn toy() -> WordPieceTokenizer {
-        let tokens: Vec<String> = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "▁hello", "▁,", "▁world", "▁!", "▁una", "ffa", "ble", "▁naive", "▁日"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let tokens: Vec<String> = [
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "▁hello", "▁,", "▁world", "▁!", "▁una", "ffa", "ble", "▁naive", "▁日",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let mut types = vec![1u64; tokens.len()];
         types[..4].fill(3);
         WordPieceTokenizer::build(tokens, &types, 2, 3, 1)

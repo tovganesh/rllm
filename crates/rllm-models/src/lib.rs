@@ -32,8 +32,8 @@ pub use lm::LanguageModel;
 pub use loader::{GgufBundle, LoadOptions};
 pub use perplexity::{perplexity, Perplexity};
 pub use tokenizer::{
-    Tokenizer, ASSISTANT_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, SYSTEM_TOKEN_ID,
-    UNK_TOKEN_ID, USER_TOKEN_ID,
+    Tokenizer, ASSISTANT_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, SYSTEM_TOKEN_ID, UNK_TOKEN_ID,
+    USER_TOKEN_ID,
 };
 pub use weights::Weights;
 pub use wordpiece::WordPieceTokenizer;
@@ -42,13 +42,7 @@ pub use wordpiece::WordPieceTokenizer;
 mod tests {
     use super::*;
     use rllm_backend_cpu::CpuBackend;
-    use rllm_core::{
-        backend::BlockTable,
-        device::Device,
-        dtype::DType,
-        shape::Shape,
-        tensor::Tensor,
-    };
+    use rllm_core::{backend::BlockTable, device::Device, dtype::DType, shape::Shape, tensor::Tensor};
     use std::sync::Arc;
 
     #[test]
@@ -99,13 +93,7 @@ mod tests {
         let context_lens = vec![1];
 
         let logits = model
-            .forward_decode(
-                &tokens,
-                &mut k_caches,
-                &mut v_caches,
-                &block_tables,
-                &context_lens,
-            )
+            .forward_decode(&tokens, &mut k_caches, &mut v_caches, &block_tables, &context_lens)
             .unwrap();
 
         assert_eq!(logits.dims(), &[1, config.vocab_size]);
@@ -131,7 +119,9 @@ mod tests {
         let config = BertConfig::tiny_test_config();
         let model = BertEmbeddingModel::new_random(config.clone(), backend).unwrap();
 
-        let long: Vec<u32> = (0..config.max_position_embeddings as u32 * 3).map(|i| i % 500).collect();
+        let long: Vec<u32> = (0..config.max_position_embeddings as u32 * 3)
+            .map(|i| i % 500)
+            .collect();
         let emb = model.embed(&long).unwrap();
         assert_eq!(emb.len(), config.hidden_size);
         assert!(emb.iter().all(|v| v.is_finite()));

@@ -115,7 +115,9 @@ impl<B: Backend> BertEmbeddingModel<B> {
     pub fn from_mapped(g: &MappedGguf, backend: Arc<B>) -> Result<Self> {
         let config = BertConfig::from_gguf(&g.header)?;
         if backend.device() != Device::Cpu {
-            return Err(RllmError::ModelError("GGUF loading currently targets the CPU backend only".to_string()));
+            return Err(RllmError::ModelError(
+                "GGUF loading currently targets the CPU backend only".to_string(),
+            ));
         }
         let (h, inter) = (config.hidden_size, config.intermediate_size);
         let vecf = |name: &str, n: usize| -> Result<Vec<f32>> { load_tensor(g, name, &[n], false)?.to_vec::<f32>() };
@@ -191,7 +193,9 @@ impl<B: Backend> BertEmbeddingModel<B> {
 
     fn embed_inner(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
         if token_ids.is_empty() {
-            return Err(RllmError::BackendError("embed: input must contain at least one token".to_string()));
+            return Err(RllmError::BackendError(
+                "embed: input must contain at least one token".to_string(),
+            ));
         }
         let max = self.config.max_position_embeddings;
         let ids: Vec<u32> = if token_ids.len() > max {
@@ -224,7 +228,11 @@ impl<B: Backend> BertEmbeddingModel<B> {
             let k = self.linear_bias(&xt, &layer.k_proj, &layer.k_bias)?;
             let v = self.linear_bias(&xt, &layer.v_proj, &layer.v_bias)?;
             let ctx = self.attention(&q, &k, &v, n);
-            let attn = self.linear_bias(&Tensor::from_f32(&ctx, Shape::new(vec![n, h]), dev)?, &layer.o_proj, &layer.o_bias)?;
+            let attn = self.linear_bias(
+                &Tensor::from_f32(&ctx, Shape::new(vec![n, h]), dev)?,
+                &layer.o_proj,
+                &layer.o_bias,
+            )?;
             for (a, b) in x.iter_mut().zip(&attn) {
                 *a += b;
             }
@@ -235,7 +243,11 @@ impl<B: Backend> BertEmbeddingModel<B> {
             let mut act = vec![0.0f32; up.len()];
             gelu_f32(&up, &mut act);
             let inter = self.config.intermediate_size;
-            let down = self.linear_bias(&Tensor::from_f32(&act, Shape::new(vec![n, inter]), dev)?, &layer.ffn_down, &layer.ffn_down_bias)?;
+            let down = self.linear_bias(
+                &Tensor::from_f32(&act, Shape::new(vec![n, inter]), dev)?,
+                &layer.ffn_down,
+                &layer.ffn_down_bias,
+            )?;
             for (a, b) in x.iter_mut().zip(&down) {
                 *a += b;
             }
@@ -285,8 +297,9 @@ impl<B: Backend> BertEmbeddingModel<B> {
             .map(|idx| {
                 let (head, i) = (idx / n, idx % n);
                 let qi = &q[i * h + head * d..i * h + (head + 1) * d];
-                let mut scores: Vec<f32> =
-                    (0..n).map(|j| dot_f32(qi, &k[j * h + head * d..j * h + (head + 1) * d]) * scale).collect();
+                let mut scores: Vec<f32> = (0..n)
+                    .map(|j| dot_f32(qi, &k[j * h + head * d..j * h + (head + 1) * d]) * scale)
+                    .collect();
                 let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0;
                 for s in scores.iter_mut() {
@@ -356,7 +369,11 @@ impl<B: Backend> TextEmbedder<B> {
             .get("general.name")
             .and_then(GgufValue::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
         info!("Loaded embedding model {} from {}", name, path.display());
         Ok(Self {
             model,

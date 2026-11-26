@@ -20,9 +20,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 fn model_path() -> Option<PathBuf> {
-    let p = std::env::var_os("RLLM_TEST_MODEL").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/SmolLM2-135M-Instruct-Q8_0.gguf")
-    });
+    let p = std::env::var_os("RLLM_TEST_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/SmolLM2-135M-Instruct-Q8_0.gguf")
+        });
     if p.exists() {
         Some(p)
     } else {
@@ -35,14 +37,19 @@ fn bundle() -> Option<&'static GgufBundle<CpuBackend>> {
     static B: OnceLock<Option<GgufBundle<CpuBackend>>> = OnceLock::new();
     B.get_or_init(|| {
         let path = model_path()?;
-        let opts = LoadOptions { max_context: Some(1024), ..LoadOptions::default() };
+        let opts = LoadOptions {
+            max_context: Some(1024),
+            ..LoadOptions::default()
+        };
         Some(GgufBundle::load(path, Arc::new(CpuBackend), &opts).expect("model loads"))
     })
     .as_ref()
 }
 
 fn fixture(name: &str) -> Value {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
@@ -52,10 +59,14 @@ fn greedy(model: &LlamaModel<CpuBackend>, prompt: &[u32], max_tokens: usize, sto
     let block = 16;
     let blocks = (prompt.len() + max_tokens).div_ceil(block);
     let shape = Shape::new(vec![blocks, c.num_key_value_heads, block, c.head_dim()]);
-    let mut k: Vec<Tensor> =
-        (0..c.num_hidden_layers).map(|_| Tensor::zeros(shape.clone(), DType::F32, Device::Cpu).unwrap()).collect();
+    let mut k: Vec<Tensor> = (0..c.num_hidden_layers)
+        .map(|_| Tensor::zeros(shape.clone(), DType::F32, Device::Cpu).unwrap())
+        .collect();
     let mut v = k.clone();
-    let table = BlockTable { block_size: block, block_ids: (0..blocks).collect() };
+    let table = BlockTable {
+        block_size: block,
+        block_ids: (0..blocks).collect(),
+    };
 
     let positions: Vec<usize> = (0..prompt.len()).collect();
     let mut logits = model
@@ -96,7 +107,12 @@ fn tokenizer_matches_llama_cpp() {
     let mut failures = Vec::new();
     for case in fx["cases"].as_array().unwrap() {
         let text = case["text"].as_str().unwrap();
-        let expected: Vec<u32> = case["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let expected: Vec<u32> = case["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
         let got = b.tokenizer.encode(text, true, true);
         if got != expected {
             failures.push(format!("{text:?}\n  expected {expected:?}\n  got      {got:?}"));
@@ -104,7 +120,12 @@ fn tokenizer_matches_llama_cpp() {
         // Lossless round trip when special tokens are kept.
         assert_eq!(b.tokenizer.decode(&got, false), text, "round trip of {text:?}");
     }
-    assert!(failures.is_empty(), "{} tokenizer mismatches:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} tokenizer mismatches:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 fn check_greedy(b: &GgufBundle<CpuBackend>, fixture_name: &str) {
@@ -151,16 +172,25 @@ fn check_teacher_forced(b: &GgufBundle<CpuBackend>, fixture_name: &str, tol: f32
         let block = 16;
         let blocks = n.div_ceil(block);
         let shape = Shape::new(vec![blocks, c.num_key_value_heads, block, c.head_dim()]);
-        let mut k: Vec<Tensor> =
-            (0..c.num_hidden_layers).map(|_| Tensor::zeros(shape.clone(), DType::F32, Device::Cpu).unwrap()).collect();
+        let mut k: Vec<Tensor> = (0..c.num_hidden_layers)
+            .map(|_| Tensor::zeros(shape.clone(), DType::F32, Device::Cpu).unwrap())
+            .collect();
         let mut v = k.clone();
-        let table = BlockTable { block_size: block, block_ids: (0..blocks).collect() };
+        let table = BlockTable {
+            block_size: block,
+            block_ids: (0..blocks).collect(),
+        };
         let positions: Vec<usize> = (0..n).collect();
         let rows: Vec<usize> = (prompt.len() - 1..n - 1).collect();
         let logits = b
             .model
             .forward(
-                &ForwardBatch { tokens: &all, positions: &positions, block_tables: &vec![table; n], logits_rows: &rows },
+                &ForwardBatch {
+                    tokens: &all,
+                    positions: &positions,
+                    block_tables: &vec![table; n],
+                    logits_rows: &rows,
+                },
                 &mut k,
                 &mut v,
             )
@@ -171,7 +201,11 @@ fn check_teacher_forced(b: &GgufBundle<CpuBackend>, fixture_name: &str, tol: f32
             let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let gap = max - row[completion[i] as usize];
             worst = worst.max(gap);
-            assert!(gap <= tol, "[{fixture_name}] position {i} of {:?}: llama.cpp token is {gap:.4} below rllm's argmax", case["prompt"]);
+            assert!(
+                gap <= tol,
+                "[{fixture_name}] position {i} of {:?}: llama.cpp token is {gap:.4} below rllm's argmax",
+                case["prompt"]
+            );
         }
     }
     worst
@@ -180,16 +214,32 @@ fn check_teacher_forced(b: &GgufBundle<CpuBackend>, fixture_name: &str, tol: f32
 #[test]
 fn llama_cpp_greedy_tokens_are_rllm_argmax_across_weight_formats() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models");
-    let mut variants = vec![("Q8_0", dir.join("SmolLM2-135M-Instruct-Q8_0.gguf"), "smollm2_greedy.json".to_string())];
+    let mut variants = vec![(
+        "Q8_0",
+        dir.join("SmolLM2-135M-Instruct-Q8_0.gguf"),
+        "smollm2_greedy.json".to_string(),
+    )];
     for q in ["Q4_0", "Q4_K_M", "Q5_K_M", "F16"] {
-        variants.push((q, dir.join(format!("SmolLM2-135M-Instruct-{q}.requant.gguf")), format!("smollm2_greedy_{q}.json")));
+        variants.push((
+            q,
+            dir.join(format!("SmolLM2-135M-Instruct-{q}.requant.gguf")),
+            format!("smollm2_greedy_{q}.json"),
+        ));
     }
     for (name, path, fx) in variants {
         if !path.exists() {
             eprintln!("skipping {name}: {} not found", path.display());
             continue;
         }
-        let b = GgufBundle::load(&path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(1024), ..LoadOptions::default() }).unwrap();
+        let b = GgufBundle::load(
+            &path,
+            Arc::new(CpuBackend),
+            &LoadOptions {
+                max_context: Some(1024),
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
         let tol = if matches!(name, "Q8_0" | "F16") { 0.25 } else { 0.5 };
         let worst = check_teacher_forced(&b, &fx, tol);
         eprintln!("[{name}] largest gap between llama.cpp's token and rllm's argmax: {worst:.4} logits");
@@ -201,14 +251,28 @@ fn chat_template_renders_model_format() {
     let Some(b) = bundle() else { return };
     let rendered = b
         .chat_template
-        .render(&[ChatMessage::new("user", "What is the boiling point of water at sea level?")], true)
+        .render(
+            &[ChatMessage::new(
+                "user",
+                "What is the boiling point of water at sea level?",
+            )],
+            true,
+        )
         .unwrap();
     // The SmolLM2 template injects its default system prompt when none is given; this
     // matches the prompt used for the chat case in the greedy fixture.
     let fx = fixture("smollm2_greedy.json");
-    let chat_case = fx["cases"].as_array().unwrap().iter().find(|c| c["prompt"].as_str().unwrap().starts_with("<|im_start|>")).unwrap();
+    let chat_case = fx["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["prompt"].as_str().unwrap().starts_with("<|im_start|>"))
+        .unwrap();
     assert_eq!(rendered, chat_case["prompt"].as_str().unwrap());
-    assert!(b.tokenizer.stop_token_ids.contains(&b.tokenizer.token_id("<|im_end|>").unwrap()));
+    assert!(b
+        .tokenizer
+        .stop_token_ids
+        .contains(&b.tokenizer.token_id("<|im_end|>").unwrap()));
 }
 
 /// Perplexity on a fixed text must be within 1% of llama.cpp (CPU, same chunking) for
@@ -230,14 +294,33 @@ fn perplexity_matches_llama_cpp_across_weight_formats() {
             eprintln!("skipping {name}: {} not found", path.display());
             continue;
         }
-        let b = GgufBundle::load(&path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(ctx), ..LoadOptions::default() }).unwrap();
+        let b = GgufBundle::load(
+            &path,
+            Arc::new(CpuBackend),
+            &LoadOptions {
+                max_context: Some(ctx),
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
         let tokens = b.tokenizer.encode(&text, true, false);
-        let bos = if b.tokenizer.add_bos { b.tokenizer.bos_token_id } else { None };
+        let bos = if b.tokenizer.add_bos {
+            b.tokenizer.bos_token_id
+        } else {
+            None
+        };
         let got = rllm_models::perplexity(&b.model, &tokens, ctx, bos).unwrap().ppl;
         let expected = expected.as_f64().unwrap();
         let rel = (got - expected) / expected;
-        eprintln!("[{name}] PPL rllm {got:.4} vs llama.cpp {expected:.4} ({:+.2}%)", rel * 100.0);
-        assert!(rel.abs() < 0.01, "[{name}] perplexity {got:.4} differs from llama.cpp {expected:.4} by {:.2}%", rel * 100.0);
+        eprintln!(
+            "[{name}] PPL rllm {got:.4} vs llama.cpp {expected:.4} ({:+.2}%)",
+            rel * 100.0
+        );
+        assert!(
+            rel.abs() < 0.01,
+            "[{name}] perplexity {got:.4} differs from llama.cpp {expected:.4} by {:.2}%",
+            rel * 100.0
+        );
     }
 }
 
@@ -258,11 +341,21 @@ fn llama32_tokenizer_matches_llama_cpp() {
     let mut failures = Vec::new();
     for case in fixture("llama32_tokenizer.json")["cases"].as_array().unwrap() {
         let text = case["text"].as_str().unwrap();
-        let expected: Vec<u32> = case["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let expected: Vec<u32> = case["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
         let got = tok.encode(text, true, true);
         if got != expected {
             failures.push(format!("{text:?}\n  expected {expected:?}\n  got      {got:?}"));
         }
     }
-    assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} mismatches:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

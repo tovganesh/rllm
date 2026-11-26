@@ -41,7 +41,12 @@ pub struct PrefixCache {
 impl PrefixCache {
     /// Constructs a new [`PrefixCache`] with the specified block size.
     pub fn new(block_size: usize) -> Self {
-        Self { block_size, root: Node::default(), clock: 0, num_blocks: 0 }
+        Self {
+            block_size,
+            root: Node::default(),
+            clock: 0,
+            num_blocks: 0,
+        }
     }
 
     /// Number of physical blocks currently recorded (and referenced) by the cache.
@@ -87,7 +92,11 @@ impl PrefixCache {
         for (chunk, &bid) in tokens.chunks_exact(self.block_size).zip(block_ids) {
             let child = curr.children.entry(chunk.into()).or_insert_with(|| {
                 newly_cached.push(bid);
-                Node { block_id: bid, last_access: now, children: HashMap::new() }
+                Node {
+                    block_id: bid,
+                    last_access: now,
+                    children: HashMap::new(),
+                }
             });
             child.last_access = now;
             curr = child;

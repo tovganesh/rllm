@@ -48,11 +48,9 @@ impl BlockAllocator {
     ///
     /// Returns [`RllmError::OutOfMemory`] when all blocks are currently in use.
     pub fn allocate_block(&mut self) -> Result<usize> {
-        let block_id = self.free_blocks.pop().ok_or_else(|| {
-            RllmError::OutOfMemory {
-                requested_bytes: self.block_size * 4,
-                device: "kv_cache".to_string(),
-            }
+        let block_id = self.free_blocks.pop().ok_or_else(|| RllmError::OutOfMemory {
+            requested_bytes: self.block_size * 4,
+            device: "kv_cache".to_string(),
         })?;
         self.ref_counts[block_id] = 1;
         Ok(block_id)
@@ -66,11 +64,7 @@ impl BlockAllocator {
     /// Panics if the block is currently free: sharing a free block would let the
     /// allocator hand it out again while it is still referenced.
     pub fn inc_ref(&mut self, block_id: usize) {
-        assert!(
-            self.ref_counts[block_id] > 0,
-            "inc_ref on free KV block {}",
-            block_id
-        );
+        assert!(self.ref_counts[block_id] > 0, "inc_ref on free KV block {}", block_id);
         self.ref_counts[block_id] += 1;
     }
 
@@ -106,11 +100,7 @@ impl BlockAllocator {
     /// # Errors
     ///
     /// Returns [`RllmError::OutOfMemory`] if insufficient free blocks remain to satisfy capacity.
-    pub fn ensure_capacity(
-        &mut self,
-        table: &mut BlockTable,
-        token_count: usize,
-    ) -> Result<()> {
+    pub fn ensure_capacity(&mut self, table: &mut BlockTable, token_count: usize) -> Result<()> {
         let needed_blocks = token_count.div_ceil(self.block_size);
         while table.block_ids.len() < needed_blocks {
             let block_id = self.allocate_block()?;

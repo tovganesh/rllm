@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn model(file: &str) -> Option<TextEmbedder<CpuBackend>> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(file);
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../models")
+        .join(file);
     if !p.exists() {
         eprintln!("skipping: {} not found", p.display());
         return None;
@@ -27,7 +29,9 @@ fn model(file: &str) -> Option<TextEmbedder<CpuBackend>> {
 }
 
 fn fixture(name: &str) -> Value {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
@@ -40,18 +44,32 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn wordpiece_tokenizer_matches_llama_cpp() {
-    let Some(e) = model("bge-small-en-v1.5-q8_0.gguf") else { return };
-    let EmbeddingTokenizer::WordPiece(tok) = &e.tokenizer else { panic!("expected WordPiece") };
+    let Some(e) = model("bge-small-en-v1.5-q8_0.gguf") else {
+        return;
+    };
+    let EmbeddingTokenizer::WordPiece(tok) = &e.tokenizer else {
+        panic!("expected WordPiece")
+    };
     let mut failures = Vec::new();
     for case in fixture("bge_small_tokenizer.json")["cases"].as_array().unwrap() {
         let text = case["text"].as_str().unwrap();
-        let expected: Vec<u32> = case["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let expected: Vec<u32> = case["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
         let got = tok.encode(text, true, true);
         if got != expected {
             failures.push(format!("{text:?}\n  expected {expected:?}\n  got      {got:?}"));
         }
     }
-    assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} mismatches:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 fn check_embeddings(file: &str, fixture_name: &str) {
@@ -59,7 +77,12 @@ fn check_embeddings(file: &str, fixture_name: &str) {
     let mut min_cos = 1.0f32;
     for case in fixture(fixture_name)["cases"].as_array().unwrap() {
         let text = case["text"].as_str().unwrap();
-        let expected: Vec<f32> = case["embedding"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        let expected: Vec<f32> = case["embedding"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
         let got = e.embed_text(text).unwrap();
         assert_eq!(got.len(), expected.len());
         let cos = cosine(&got, &expected);
@@ -81,9 +104,13 @@ fn minilm_mean_pooled_embeddings_match_llama_cpp() {
 
 #[test]
 fn semantically_related_texts_score_higher() {
-    let Some(e) = model("bge-small-en-v1.5-q8_0.gguf") else { return };
+    let Some(e) = model("bge-small-en-v1.5-q8_0.gguf") else {
+        return;
+    };
     let q = e.embed_text("How do plants make their food?").unwrap();
-    let related = e.embed_text("Photosynthesis converts sunlight, water and carbon dioxide into glucose and oxygen.").unwrap();
+    let related = e
+        .embed_text("Photosynthesis converts sunlight, water and carbon dioxide into glucose and oxygen.")
+        .unwrap();
     let unrelated = e.embed_text("The capital of France is Paris.").unwrap();
     assert!(cosine(&q, &related) > cosine(&q, &unrelated) + 0.1);
 }

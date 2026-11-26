@@ -184,7 +184,11 @@ fn uses_mvm(kind: WKind, m: usize) -> bool {
 /// (8-row weight tiles, simdgroups) per `mvm` threadgroup; matches the shader
 /// instantiations.
 fn mvm_shape(kind: WKind) -> (u64, u64) {
-    if kind == WKind::Q8 { (1, 16) } else { (2, 8) }
+    if kind == WKind::Q8 {
+        (1, 16)
+    } else {
+        (2, 8)
+    }
 }
 
 /// Whether a linear segment of this format reads its input as half precision (`xh`) for
@@ -222,7 +226,9 @@ const SPLIT_K_MIN_STAGES: usize = 8;
 
 /// Number of split-K parts for a GEMM of `groups` threadgroups over `stages` K steps.
 fn split_k(groups: usize, stages: usize) -> usize {
-    (SPLIT_K_GROUPS / groups.max(1)).clamp(1, SPLIT_K_MAX).min((stages / SPLIT_K_MIN_STAGES).max(1))
+    (SPLIT_K_GROUPS / groups.max(1))
+        .clamp(1, SPLIT_K_MAX)
+        .min((stages / SPLIT_K_MIN_STAGES).max(1))
 }
 /// Rows of `x` the small-batch kernels may read (whole 8-row fragments; rows past the
 /// batch only feed discarded outputs).
@@ -248,11 +254,15 @@ impl MetalLlama {
     /// Q6_K weights are uploaded as they are (F32 as F16 when exact); the CPU-only
     /// formats are converted: repacked `Q4_0x4` back to Q4_0, Q5_0 losslessly to Q8_0.
     pub fn from_cpu_model<B: Backend>(model: &LlamaModel<B>) -> Result<Self> {
-        let device = Device::system_default()
-            .ok_or_else(|| RllmError::BackendError("No Metal device available".to_string()))?;
+        let device =
+            Device::system_default().ok_or_else(|| RllmError::BackendError("No Metal device available".to_string()))?;
         let c = model.config.clone();
         let hd = c.head_dim();
-        if !hd.is_multiple_of(32) || hd > 128 || !c.hidden_size.is_multiple_of(32) || !c.intermediate_size.is_multiple_of(32) {
+        if !hd.is_multiple_of(32)
+            || hd > 128
+            || !c.hidden_size.is_multiple_of(32)
+            || !c.intermediate_size.is_multiple_of(32)
+        {
             return Err(RllmError::BackendError(format!(
                 "Metal executor needs head_dim % 32 == 0 (<= 128) and hidden/intermediate sizes divisible by 32; got head_dim {hd}, hidden {}, intermediate {}",
                 c.hidden_size, c.intermediate_size
@@ -263,41 +273,105 @@ impl MetalLlama {
         let kv_type = match model.kv_dtype {
             DType::F16 => "f16",
             DType::F32 => "f32",
-            other => return Err(RllmError::BackendError(format!("Metal KV cache cannot be {other} (use F16 or F32)"))),
+            other => {
+                return Err(RllmError::BackendError(format!(
+                    "Metal KV cache cannot be {other} (use F16 or F32)"
+                )))
+            }
         };
         let library = device
             .new_library_with_source(SHADERS_MSL, &CompileOptions::new())
             .map_err(|e| RllmError::BackendError(format!("Metal shader compilation failed: {e}")))?;
         let mut pipelines = HashMap::new();
         let names = [
-            "mv_f32", "mv_q8_0", "mv_q4_0", "mv_f16", "mv_q4_k", "mv_q6_k", "mm_f32", "mm_q8_0", "mm_q4_0", "mm_f16",
-            "mm_q4_k", "mm_q6_k", "mml_q8_0", "mml_q4_0", "mml_f16", "mml_q4_k", "mml_q6_k", "mml1_q8_0", "mml1_q4_0", "mml1_f16", "mml1_q4_k", "mml1_q6_k", "mmlg_q8_0", "mmlg_q4_0", "mmlg_f16", "mmlg_q4_k", "mmlg_q6_k", "mmlg1_q8_0", "mmlg1_q4_0", "mmlg1_f16", "mmlg1_q4_k", "mmlg1_q6_k", "to_half", "embed_f32", "embed_q8_0", "embed_q4_0", "embed_f16", "embed_q4_k", "embed_q6_k",
-            "rms_norm", "rms_norm_h", "rope", "swiglu", "swiglu_h", "swiglu_i", "swiglu_ih", "attn_reduce", "split_k_reduce",
-            "mvm_q8_0", "mvm_q4_0", "mvm_q4_k", "mvm_q6_k", "mvs_q8_0",
+            "mv_f32",
+            "mv_q8_0",
+            "mv_q4_0",
+            "mv_f16",
+            "mv_q4_k",
+            "mv_q6_k",
+            "mm_f32",
+            "mm_q8_0",
+            "mm_q4_0",
+            "mm_f16",
+            "mm_q4_k",
+            "mm_q6_k",
+            "mml_q8_0",
+            "mml_q4_0",
+            "mml_f16",
+            "mml_q4_k",
+            "mml_q6_k",
+            "mml1_q8_0",
+            "mml1_q4_0",
+            "mml1_f16",
+            "mml1_q4_k",
+            "mml1_q6_k",
+            "mmlg_q8_0",
+            "mmlg_q4_0",
+            "mmlg_f16",
+            "mmlg_q4_k",
+            "mmlg_q6_k",
+            "mmlg1_q8_0",
+            "mmlg1_q4_0",
+            "mmlg1_f16",
+            "mmlg1_q4_k",
+            "mmlg1_q6_k",
+            "to_half",
+            "embed_f32",
+            "embed_q8_0",
+            "embed_q4_0",
+            "embed_f16",
+            "embed_q4_k",
+            "embed_q6_k",
+            "rms_norm",
+            "rms_norm_h",
+            "rope",
+            "swiglu",
+            "swiglu_h",
+            "swiglu_i",
+            "swiglu_ih",
+            "attn_reduce",
+            "split_k_reduce",
+            "mvm_q8_0",
+            "mvm_q4_0",
+            "mvm_q4_k",
+            "mvm_q6_k",
+            "mvs_q8_0",
         ];
         let mv_names: Vec<String> = ["f32", "f16", "q8_0", "q4_0", "q4_k", "q6_k"]
             .iter()
             .flat_map(|f| [2, 4, 8].map(|r| format!("mv{r}_{f}")))
-            .chain(["f16", "q8_0", "q4_0", "q4_k", "q6_k"].iter().flat_map(|f| {
-                ["mms1", "mms2", "mms2r2", "mms3r2", "mmh", "mmh1"].map(|t| format!("{t}_{f}"))
-            }))
+            .chain(
+                ["f16", "q8_0", "q4_0", "q4_k", "q6_k"]
+                    .iter()
+                    .flat_map(|f| ["mms1", "mms2", "mms2r2", "mms3r2", "mmh", "mmh1"].map(|t| format!("{t}_{f}"))),
+            )
             .collect();
         let kv_names: Vec<String> = ["f32", "f16"]
             .iter()
             .flat_map(|t| {
-                std::iter::once(format!("kv_write_{t}")).chain([32, 64, 96, 128].iter().flat_map(move |hd| {
-                    [format!("attention_hd{hd}_{t}"), format!("attention_tile32_hd{hd}_{t}")]
-                }))
+                std::iter::once(format!("kv_write_{t}")).chain(
+                    [32, 64, 96, 128]
+                        .iter()
+                        .flat_map(move |hd| [format!("attention_hd{hd}_{t}"), format!("attention_tile32_hd{hd}_{t}")]),
+                )
             })
             .collect();
         // GQA decode attention for this model's group size, when instantiated.
         let group = c.num_attention_heads / c.num_key_value_heads;
         let gqa_names: Vec<String> = if GQA_GROUPS.contains(&group) {
-            ["f32", "f16"].iter().map(|t| format!("attention_gqa{group}_hd{hd}_{t}")).collect()
+            ["f32", "f16"]
+                .iter()
+                .map(|t| format!("attention_gqa{group}_hd{hd}_{t}"))
+                .collect()
         } else {
             Vec::new()
         };
-        for name in names.iter().copied().chain(kv_names.iter().chain(&mv_names).chain(&gqa_names).map(String::as_str)) {
+        for name in names
+            .iter()
+            .copied()
+            .chain(kv_names.iter().chain(&mv_names).chain(&gqa_names).map(String::as_str))
+        {
             let f = library
                 .get_function(name, None)
                 .map_err(|e| RllmError::BackendError(format!("Metal function {name}: {e}")))?;
@@ -325,7 +399,9 @@ impl MetalLlama {
                 DType::Q4_K => WKind::Q4K,
                 DType::Q6_K => WKind::Q6K,
                 other => {
-                    return Err(RllmError::BackendError(format!("Metal executor does not support {other} weights")))
+                    return Err(RllmError::BackendError(format!(
+                        "Metal executor does not support {other} weights"
+                    )))
                 }
             };
             // F32 weights that round-trip exactly through F16 (e.g. loaded from an F16
@@ -334,7 +410,12 @@ impl MetalLlama {
                 let vals = t.as_f32_slice()?;
                 let halves: Vec<half::f16> = vals.iter().map(|&v| half::f16::from_f32(v)).collect();
                 if halves.iter().zip(vals).all(|(h, &v)| h.to_f32() == v) {
-                    return Ok(Weight { buf: new_buffer_with(&device, as_bytes(&halves)), kind: WKind::F16, rows: dims[0], cols: dims[1] });
+                    return Ok(Weight {
+                        buf: new_buffer_with(&device, as_bytes(&halves)),
+                        kind: WKind::F16,
+                        rows: dims[0],
+                        cols: dims[1],
+                    });
                 }
             }
             let bytes = &t.storage().as_cpu()?.as_bytes()[t.offset()..];
@@ -352,12 +433,18 @@ impl MetalLlama {
         let upload_concat = |parts: &[&Tensor]| -> Result<Vec<Weight>> {
             let cols = parts[0].dims()[1];
             if parts.iter().any(|t| t.dims().len() != 2 || t.dims()[1] != cols) {
-                return Err(RllmError::BackendError("cannot fuse matrices with different widths".into()));
+                return Err(RllmError::BackendError(
+                    "cannot fuse matrices with different widths".into(),
+                ));
             }
             // Convert CPU-only formats first so that parts that end up in the same
             // Metal format are still concatenated.
             let converted: Vec<Option<Tensor>> = parts.iter().map(|t| to_metal_format(t)).collect::<Result<_>>()?;
-            let parts: Vec<&Tensor> = parts.iter().zip(&converted).map(|(t, c)| c.as_ref().unwrap_or(t)).collect();
+            let parts: Vec<&Tensor> = parts
+                .iter()
+                .zip(&converted)
+                .map(|(t, c)| c.as_ref().unwrap_or(t))
+                .collect();
             let mut segments = Vec::new();
             let mut i = 0;
             while i < parts.len() {
@@ -373,7 +460,12 @@ impl MetalLlama {
                 let rows: usize = parts[i..j].iter().map(|t| t.dims()[0]).sum();
                 let shape = rllm_core::shape::Shape::new(vec![rows, cols]);
                 let storage = rllm_core::storage::Storage::Cpu(rllm_core::storage::CpuStorage::from_bytes(bytes));
-                segments.push(upload(&Tensor::new(shape, dtype, rllm_core::device::Device::Cpu, storage))?);
+                segments.push(upload(&Tensor::new(
+                    shape,
+                    dtype,
+                    rllm_core::device::Device::Cpu,
+                    storage,
+                ))?);
                 i = j;
             }
             Ok(segments)
@@ -383,22 +475,38 @@ impl MetalLlama {
             let (gc, uc) = (to_metal_format(gate)?, to_metal_format(up)?);
             let (g, u) = (gc.as_ref().unwrap_or(gate), uc.as_ref().unwrap_or(up));
             let rows = g.dims()[0];
-            if g.dtype() != u.dtype() || g.dims() != u.dims() || g.dims().len() != 2 || !rows.is_multiple_of(GLU_CHUNK) {
+            if g.dtype() != u.dtype() || g.dims() != u.dims() || g.dims().len() != 2 || !rows.is_multiple_of(GLU_CHUNK)
+            {
                 return Ok((upload_concat(&[gate, up])?, false));
             }
             let len = g.dtype().storage_bytes(g.numel());
             let gb = &g.storage().as_cpu()?.as_bytes()[g.offset()..g.offset() + len];
             let ub = &u.storage().as_cpu()?.as_bytes()[u.offset()..u.offset() + len];
             let shape = rllm_core::shape::Shape::new(vec![2 * rows, g.dims()[1]]);
-            let storage = rllm_core::storage::Storage::Cpu(rllm_core::storage::CpuStorage::from_bytes(interleave_gate_up(gb, ub, rows)));
-            Ok((vec![upload(&Tensor::new(shape, g.dtype(), rllm_core::device::Device::Cpu, storage))?], true))
+            let storage = rllm_core::storage::Storage::Cpu(rllm_core::storage::CpuStorage::from_bytes(
+                interleave_gate_up(gb, ub, rows),
+            ));
+            Ok((
+                vec![upload(&Tensor::new(
+                    shape,
+                    g.dtype(),
+                    rllm_core::device::Device::Cpu,
+                    storage,
+                ))?],
+                true,
+            ))
         };
 
         let embed = upload(&model.embed_tokens)?;
         let tied = model.lm_head.storage().as_cpu()?.as_bytes().as_ptr()
             == model.embed_tokens.storage().as_cpu()?.as_bytes().as_ptr();
         let lm_head = if tied {
-            Weight { buf: embed.buf.clone(), kind: embed.kind, rows: embed.rows, cols: embed.cols }
+            Weight {
+                buf: embed.buf.clone(),
+                kind: embed.kind,
+                rows: embed.rows,
+                cols: embed.cols,
+            }
         } else {
             upload(&model.lm_head)?
         };
@@ -420,7 +528,10 @@ impl MetalLlama {
         let sin = vec_buf(&model.sin_table)?;
         info!("Metal executor ready on {} ({} layers)", device.name(), layers.len());
 
-        let split_part = device.new_buffer((SPLIT_K_GROUPS * 64 * 32 * 4) as u64, MTLResourceOptions::StorageModePrivate);
+        let split_part = device.new_buffer(
+            (SPLIT_K_GROUPS * 64 * 32 * 4) as u64,
+            MTLResourceOptions::StorageModePrivate,
+        );
         Ok(Self {
             config: c,
             queue: device.new_command_queue(),
@@ -434,7 +545,12 @@ impl MetalLlama {
             sin,
             kv_type,
             split_part,
-            state: Mutex::new(State { kv: Vec::new(), block_size: 0, num_blocks: 0, scratch: Scratch::default() }),
+            state: Mutex::new(State {
+                kv: Vec::new(),
+                block_size: 0,
+                num_blocks: 0,
+                scratch: Scratch::default(),
+            }),
         })
     }
 
@@ -455,13 +571,20 @@ impl MetalLlama {
         }
         for (i, (&pos, bt)) in batch.positions.iter().zip(batch.block_tables).enumerate() {
             if batch.tokens[i] as usize >= c.vocab_size {
-                return Err(RllmError::BackendError(format!("Token ID {} exceeds vocabulary size {}", batch.tokens[i], c.vocab_size)));
+                return Err(RllmError::BackendError(format!(
+                    "Token ID {} exceeds vocabulary size {}",
+                    batch.tokens[i], c.vocab_size
+                )));
             }
             if pos >= c.max_position_embeddings {
-                return Err(RllmError::BackendError(format!("position {pos} exceeds max_position_embeddings")));
+                return Err(RllmError::BackendError(format!(
+                    "position {pos} exceeds max_position_embeddings"
+                )));
             }
             if bt.block_size != block_size || pos / block_size >= bt.block_ids.len() {
-                return Err(RllmError::BackendError(format!("position {pos} not covered by the block table")));
+                return Err(RllmError::BackendError(format!(
+                    "position {pos} not covered by the block table"
+                )));
             }
             if bt.block_ids.iter().any(|&b| b >= num_blocks) {
                 return Err(RllmError::BackendError("block id outside the KV cache".to_string()));
@@ -500,7 +623,10 @@ fn to_metal_format(t: &Tensor) -> Result<Option<Tensor>> {
         quant::{q5_0_to_q8_0, quantize_f32_to_q8_0},
         repack::unpack_q4_0x4,
     };
-    use rllm_core::{shape::Shape, storage::{CpuStorage, Storage}};
+    use rllm_core::{
+        shape::Shape,
+        storage::{CpuStorage, Storage},
+    };
     let (dtype, bytes) = match t.dtype() {
         DType::Q4_0x4 => {
             let (n, k) = (t.dims()[0], t.dims()[1]);
@@ -519,7 +645,12 @@ fn to_metal_format(t: &Tensor) -> Result<Option<Tensor>> {
         }
         _ => return Ok(None),
     };
-    Ok(Some(Tensor::new(Shape::new(t.dims().to_vec()), dtype, rllm_core::device::Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(bytes)))))
+    Ok(Some(Tensor::new(
+        Shape::new(t.dims().to_vec()),
+        dtype,
+        rllm_core::device::Device::Cpu,
+        Storage::Cpu(CpuStorage::from_bytes(bytes)),
+    )))
 }
 
 fn as_bytes<T: Copy>(s: &[T]) -> &[u8] {
@@ -573,15 +704,19 @@ impl Enc<'_> {
 
     fn groups(&self, p: &ComputePipelineState, args: &[Arg<'_>], grid: (u64, u64, u64), tg: u64) {
         self.bind(p, args);
-        self.enc.dispatch_thread_groups(MTLSize::new(grid.0, grid.1, grid.2), MTLSize::new(tg, 1, 1));
+        self.enc
+            .dispatch_thread_groups(MTLSize::new(grid.0, grid.1, grid.2), MTLSize::new(tg, 1, 1));
     }
 
     fn threads(&self, p: &ComputePipelineState, args: &[Arg<'_>], grid: (u64, u64, u64)) {
         self.bind(p, args);
         let w = p.thread_execution_width().min(grid.0.max(1));
         let tg_x = w.max(1);
-        let tg_y = (p.max_total_threads_per_threadgroup() / tg_x).clamp(1, grid.1.max(1)).min(8);
-        self.enc.dispatch_threads(MTLSize::new(grid.0, grid.1, grid.2), MTLSize::new(tg_x, tg_y, 1));
+        let tg_y = (p.max_total_threads_per_threadgroup() / tg_x)
+            .clamp(1, grid.1.max(1))
+            .min(8);
+        self.enc
+            .dispatch_threads(MTLSize::new(grid.0, grid.1, grid.2), MTLSize::new(tg_x, tg_y, 1));
     }
 }
 
@@ -600,7 +735,17 @@ impl MetalLlama {
     /// With `half_ready`, `xh` already holds the input in half precision (written by the
     /// previous kernel; only valid when [`Self::reads_only_half`]) and `x` is not read.
     #[allow(clippy::too_many_arguments)]
-    fn linear_segments(&self, e: &Enc<'_>, segs: &[Weight], x: &Buffer, xh: &Buffer, y: &Buffer, m: usize, accumulate: bool, half_ready: bool) {
+    fn linear_segments(
+        &self,
+        e: &Enc<'_>,
+        segs: &[Weight],
+        x: &Buffer,
+        xh: &Buffer,
+        y: &Buffer,
+        m: usize,
+        accumulate: bool,
+        half_ready: bool,
+    ) {
         let ldy = segs.iter().map(|w| w.rows).sum::<usize>() as u32;
         if !half_ready && segs.iter().any(|w| reads_half(w.kind, m)) {
             let quads = (m * segs[0].cols / 4) as u64;
@@ -640,21 +785,44 @@ impl MetalLlama {
                 if splits > 1 {
                     self.split_args(&mut args, n);
                 }
-                e.groups(self.pipeline(&format!("{stage}_{}", w.kind.suffix())), &args, (groups as u64, splits as u64, 1), 128);
+                e.groups(
+                    self.pipeline(&format!("{stage}_{}", w.kind.suffix())),
+                    &args,
+                    (groups as u64, splits as u64, 1),
+                    128,
+                );
                 self.split_reduce(e, splits, y, col, n, m, accumulate, ldy);
             } else if w.kind != WKind::F32 && m <= MMS_MAX_ROWS {
                 // `mms`: m/8 token fragments; two row groups per simdgroup from 16 tokens,
                 // except for F16 weights at 16.
                 let nt = m.div_ceil(8);
-                let rg = if nt == 1 || (nt == 2 && w.kind == WKind::F16) { 1 } else { 2 };
-                let name = if rg == 1 { format!("mms{nt}_{}", w.kind.suffix()) } else { format!("mms{nt}r{rg}_{}", w.kind.suffix()) };
+                let rg = if nt == 1 || (nt == 2 && w.kind == WKind::F16) {
+                    1
+                } else {
+                    2
+                };
+                let name = if rg == 1 {
+                    format!("mms{nt}_{}", w.kind.suffix())
+                } else {
+                    format!("mms{nt}r{rg}_{}", w.kind.suffix())
+                };
                 let mut args = args;
                 args[1] = Arg::B(xh);
-                e.groups(self.pipeline(&name), &args, ((w.rows as u64).div_ceil(16 * rg as u64), 1, 1), 64);
+                e.groups(
+                    self.pipeline(&name),
+                    &args,
+                    ((w.rows as u64).div_ceil(16 * rg as u64), 1, 1),
+                    64,
+                );
             } else if w.kind == WKind::F32 {
                 // Full-precision weights keep the F32 tile kernel (the large-tile kernel stores
                 // weights as half precision, which is lossless only for F16/quantized weights).
-                e.groups(self.pipeline("mm_f32"), &args, ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1), 128);
+                e.groups(
+                    self.pipeline("mm_f32"),
+                    &args,
+                    ((w.rows as u64).div_ceil(32), (m as u64).div_ceil(32), 1),
+                    128,
+                );
             } else {
                 let mut args = args;
                 args[1] = Arg::B(xh);
@@ -673,7 +841,12 @@ impl MetalLlama {
                     self.split_reduce(e, splits, y, col, n, m, accumulate, ldy);
                 } else {
                     let p = self.pipeline(&format!("mm_{}", w.kind.suffix()));
-                    e.groups(p, &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1), 128);
+                    e.groups(
+                        p,
+                        &args,
+                        ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(64), 1),
+                        128,
+                    );
                 }
             }
             col += w.rows as u64;
@@ -691,7 +864,17 @@ impl MetalLlama {
     /// Sums `splits` split-K partials into columns `col..col + n` of `y` (row stride
     /// `ldy`), adding to it when `accumulate`. No-op for a single part.
     #[allow(clippy::too_many_arguments)]
-    fn split_reduce(&self, e: &Enc<'_>, splits: usize, y: &Buffer, col: u64, n: u32, m: usize, accumulate: bool, ldy: u32) {
+    fn split_reduce(
+        &self,
+        e: &Enc<'_>,
+        splits: usize,
+        y: &Buffer,
+        col: u64,
+        n: u32,
+        m: usize,
+        accumulate: bool,
+        ldy: u32,
+    ) {
         if splits <= 1 {
             return;
         }
@@ -724,9 +907,17 @@ impl MetalLlama {
     #[allow(clippy::too_many_arguments)]
     fn gate_up_glu(&self, e: &Enc<'_>, w: &Weight, x: &Buffer, xh: &Buffer, out: &Buffer, m: usize, half_ready: bool) {
         if !half_ready {
-            e.threads(self.pipeline("to_half"), &[Arg::B(x), Arg::B(xh)], ((m * w.cols / 4) as u64, 1, 1));
+            e.threads(
+                self.pipeline("to_half"),
+                &[Arg::B(x), Arg::B(xh)],
+                ((m * w.cols / 4) as u64, 1, 1),
+            );
         }
-        let stage = if (w.cols / 32).is_multiple_of(2) { "mmlg" } else { "mmlg1" };
+        let stage = if (w.cols / 32).is_multiple_of(2) {
+            "mmlg"
+        } else {
+            "mmlg1"
+        };
         let args = [
             Arg::B(&w.buf),
             Arg::B(xh),
@@ -737,7 +928,12 @@ impl MetalLlama {
             Arg::U(0),
             Arg::U((w.rows / 2) as u32),
         ];
-        e.groups(self.pipeline(&format!("{stage}_{}", w.kind.suffix())), &args, ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(32), 1), 128);
+        e.groups(
+            self.pipeline(&format!("{stage}_{}", w.kind.suffix())),
+            &args,
+            ((w.rows as u64).div_ceil(64), (m as u64).div_ceil(32), 1),
+            128,
+        );
     }
 
     /// Whether every segment of a linear layer reads only the half-precision input (`xh`)
@@ -749,7 +945,16 @@ impl MetalLlama {
     /// RMSNorm into `y` (F32), or into `xh` as half precision when the next linear
     /// layer reads only that; returns whether it wrote `xh`.
     #[allow(clippy::too_many_arguments)]
-    fn rms_for(&self, e: &Enc<'_>, x: &Buffer, w: &Buffer, y: &Buffer, xh: &Buffer, rows: usize, next: &[Weight]) -> bool {
+    fn rms_for(
+        &self,
+        e: &Enc<'_>,
+        x: &Buffer,
+        w: &Buffer,
+        y: &Buffer,
+        xh: &Buffer,
+        rows: usize,
+        next: &[Weight],
+    ) -> bool {
         let half = Self::reads_only_half(next, rows);
         let c = &self.config;
         let args = [
@@ -761,7 +966,12 @@ impl MetalLlama {
             Arg::F(c.rms_norm_eps),
             Arg::U(0),
         ];
-        e.groups(self.pipeline(if half { "rms_norm_h" } else { "rms_norm" }), &args, (rows as u64, 1, 1), 256);
+        e.groups(
+            self.pipeline(if half { "rms_norm_h" } else { "rms_norm" }),
+            &args,
+            (rows as u64, 1, 1),
+            256,
+        );
         half
     }
 
@@ -791,12 +1001,17 @@ impl LanguageModel for MetalLlama {
 
     fn init_kv_cache(&self, num_blocks: usize, block_size: usize) -> Result<()> {
         if !block_size.is_multiple_of(8) {
-            return Err(RllmError::BackendError("Metal executor needs a KV block size divisible by 8".into()));
+            return Err(RllmError::BackendError(
+                "Metal executor needs a KV block size divisible by 8".into(),
+            ));
         }
         let c = &self.config;
         let elem = if self.kv_type == "f16" { 2 } else { 4 };
         let bytes = (num_blocks * c.num_key_value_heads * block_size * c.head_dim() * elem) as u64;
-        let mut st = self.state.lock().map_err(|_| RllmError::BackendError("Metal state poisoned".into()))?;
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| RllmError::BackendError("Metal state poisoned".into()))?;
         st.kv = (0..c.num_hidden_layers)
             .map(|_| {
                 (
@@ -824,10 +1039,15 @@ impl LanguageModel for MetalLlama {
     }
 
     fn forward_cached(&self, batch: &ForwardBatch<'_>) -> Result<Vec<f32>> {
-        let mut guard = self.state.lock().map_err(|_| RllmError::BackendError("Metal state poisoned".into()))?;
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| RllmError::BackendError("Metal state poisoned".into()))?;
         let st = &mut *guard;
         if st.kv.is_empty() {
-            return Err(RllmError::BackendError("KV cache not initialised; call init_kv_cache".into()));
+            return Err(RllmError::BackendError(
+                "KV cache not initialised; call init_kv_cache".into(),
+            ));
         }
         self.validate(batch, st.block_size, st.num_blocks)?;
 
@@ -883,7 +1103,10 @@ impl LanguageModel for MetalLlama {
             let rows = n.max(sc.rows);
             let lrows = r.max(sc.logit_rows);
             let tlen = tables.len().max(sc.table_len).max(1);
-            let f = |len: usize| self.device.new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let f = |len: usize| {
+                self.device
+                    .new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared)
+            };
             sc.bufs.clear();
             for (name, len) in [
                 ("tokens", rows),
@@ -914,16 +1137,34 @@ impl LanguageModel for MetalLlama {
         }
         // Decode attention splits each row's context into chunks of DECODE_CHUNK keys
         // (one threadgroup each); partials need a buffer sized by the longest context.
-        let max_single_ctx = singles.iter().map(|&r| batch.positions[r as usize] + 1).max().unwrap_or(0);
-        let attn_heads = if GQA_GROUPS.contains(&(nq / nkv)) && std::env::var_os("RLLM_NO_GQA_ATTN").is_none() { nkv } else { nq };
+        let max_single_ctx = singles
+            .iter()
+            .map(|&r| batch.positions[r as usize] + 1)
+            .max()
+            .unwrap_or(0);
+        let attn_heads = if GQA_GROUPS.contains(&(nq / nkv)) && std::env::var_os("RLLM_NO_GQA_ATTN").is_none() {
+            nkv
+        } else {
+            nq
+        };
         let mut decode_chunk = DECODE_CHUNK;
-        while decode_chunk > DECODE_CHUNK_MIN && attn_heads * singles.len() * max_single_ctx.div_ceil(decode_chunk) < DECODE_MIN_GROUPS {
+        while decode_chunk > DECODE_CHUNK_MIN
+            && attn_heads * singles.len() * max_single_ctx.div_ceil(decode_chunk) < DECODE_MIN_GROUPS
+        {
             decode_chunk /= 2;
         }
         let nsplit = max_single_ctx.div_ceil(decode_chunk).max(1);
         let part_len = (singles.len() * nq * nsplit * (hd + 2)).max(1) * 4;
-        if sc.bufs.get("attn_part").is_none_or(|buf| (buf.length() as usize) < part_len) {
-            sc.bufs.insert("attn_part", self.device.new_buffer(part_len as u64, MTLResourceOptions::StorageModePrivate));
+        if sc
+            .bufs
+            .get("attn_part")
+            .is_none_or(|buf| (buf.length() as usize) < part_len)
+        {
+            sc.bufs.insert(
+                "attn_part",
+                self.device
+                    .new_buffer(part_len as u64, MTLResourceOptions::StorageModePrivate),
+            );
         }
         let b = |name: &str| &sc.bufs[name];
         write_buffer(b("tokens"), batch.tokens);
@@ -943,7 +1184,12 @@ impl LanguageModel for MetalLlama {
             // Embedding lookup.
             e.threads(
                 self.pipeline(&format!("embed_{}", self.embed.kind.suffix())),
-                &[Arg::B(&self.embed.buf), Arg::B(b("tokens")), Arg::B(b("hidden")), Arg::U(h as u32)],
+                &[
+                    Arg::B(&self.embed.buf),
+                    Arg::B(b("tokens")),
+                    Arg::B(b("hidden")),
+                    Arg::U(h as u32),
+                ],
                 ((h / 8) as u64, n as u64, 1),
             );
 
@@ -1009,17 +1255,31 @@ impl LanguageModel for MetalLlama {
                     // for the 4 x 8 x hd float output at the end.
                     let tg_bytes = (2 * ATTN_KB * hd * 2).max(4 * 8 * hd * 4) as u64;
                     e.enc.set_threadgroup_memory_length(0, tg_bytes);
-                    e.groups(self.pipeline(&format!("attention_tile32_hd{hd}_{}", self.kv_type)), &attn_args(b("tiles")), (nq as u64, tiles.len() as u64, 1), 128);
+                    e.groups(
+                        self.pipeline(&format!("attention_tile32_hd{hd}_{}", self.kv_type)),
+                        &attn_args(b("tiles")),
+                        (nq as u64, tiles.len() as u64, 1),
+                        128,
+                    );
                 }
                 if !singles.is_empty() {
                     let mut args = attn_args(b("singles"));
-                    args.extend([Arg::B(b("attn_part")), Arg::U(decode_chunk as u32), Arg::U(nsplit as u32)]);
+                    args.extend([
+                        Arg::B(b("attn_part")),
+                        Arg::U(decode_chunk as u32),
+                        Arg::U(nsplit as u32),
+                    ]);
                     let name = if attn_heads == nkv && nkv != nq {
                         format!("attention_gqa{}_hd{hd}_{}", nq / nkv, self.kv_type)
                     } else {
                         format!("attention_hd{hd}_{}", self.kv_type)
                     };
-                    e.groups(self.pipeline(&name), &args, (attn_heads as u64, singles.len() as u64, nsplit as u64), 128);
+                    e.groups(
+                        self.pipeline(&name),
+                        &args,
+                        (attn_heads as u64, singles.len() as u64, nsplit as u64),
+                        128,
+                    );
                     if nsplit > 1 {
                         e.groups(
                             self.pipeline("attn_reduce"),
@@ -1040,7 +1300,15 @@ impl LanguageModel for MetalLlama {
 
                 // MLP block: norm -> fused gate/up -> SwiGLU -> down projection accumulated
                 // into the residual stream.
-                let ready = self.rms_for(&e, b("hidden"), &layer.ffn_norm, b("normed"), b("xh"), n, &layer.gate_up);
+                let ready = self.rms_for(
+                    &e,
+                    b("hidden"),
+                    &layer.ffn_norm,
+                    b("normed"),
+                    b("xh"),
+                    n,
+                    &layer.gate_up,
+                );
                 let down = std::slice::from_ref(&layer.down);
                 let down_half = Self::reads_only_half(down, n);
                 if layer.gu_interleaved && down_half && Self::glu_fused(&layer.gate_up[0], n) {
@@ -1058,7 +1326,11 @@ impl LanguageModel for MetalLlama {
                     };
                     e.threads(
                         self.pipeline(name),
-                        &[Arg::B(b("gu")), Arg::B(if down_half { b("xh") } else { b("act") }), Arg::U(inter as u32)],
+                        &[
+                            Arg::B(b("gu")),
+                            Arg::B(if down_half { b("xh") } else { b("act") }),
+                            Arg::U(inter as u32),
+                        ],
                         ((n * inter) as u64, 1, 1),
                     );
                     self.linear_segments(&e, down, b("act"), b("xh"), b("hidden"), n, true, down_half);

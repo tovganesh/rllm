@@ -47,14 +47,29 @@ fn perplexity_matches_llama_cpp_metal() {
     let text = std::fs::read_to_string(root().join(fx["text"].as_str().unwrap())).unwrap();
     for (name, expected) in fx["ppl"].as_object().unwrap() {
         let Some(path) = model_file(name) else { continue };
-        let b = GgufBundle::load(&path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(ctx), ..LoadOptions::default() }).unwrap();
+        let b = GgufBundle::load(
+            &path,
+            Arc::new(CpuBackend),
+            &LoadOptions {
+                max_context: Some(ctx),
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
         let gpu = MetalLlama::from_cpu_model(&b.model).unwrap();
         let tokens = b.tokenizer.encode(&text, true, false);
-        let bos = if b.tokenizer.add_bos { b.tokenizer.bos_token_id } else { None };
+        let bos = if b.tokenizer.add_bos {
+            b.tokenizer.bos_token_id
+        } else {
+            None
+        };
         let got = rllm_models::perplexity(&gpu, &tokens, ctx, bos).unwrap().ppl;
         let expected = expected.as_f64().unwrap();
         let rel = (got - expected) / expected;
-        eprintln!("[{name}] Metal PPL rllm {got:.4} vs llama.cpp {expected:.4} ({:+.2}%)", rel * 100.0);
+        eprintln!(
+            "[{name}] Metal PPL rllm {got:.4} vs llama.cpp {expected:.4} ({:+.2}%)",
+            rel * 100.0
+        );
         assert!(rel.abs() < 0.01, "[{name}] {got:.4} vs {expected:.4}");
     }
 }
@@ -73,11 +88,22 @@ fn greedy_generation_matches_llama_cpp_metal() {
 }
 
 fn check_greedy(path: &std::path::Path, fixture_name: &str) {
-    let b = GgufBundle::load(path, Arc::new(CpuBackend), &LoadOptions { max_context: Some(1024), ..LoadOptions::default() }).unwrap();
+    let b = GgufBundle::load(
+        path,
+        Arc::new(CpuBackend),
+        &LoadOptions {
+            max_context: Some(1024),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
     let gpu = MetalLlama::from_cpu_model(&b.model).unwrap();
     let block = 16;
     let blocks = 1024 / block;
-    let table = BlockTable { block_size: block, block_ids: (0..blocks).collect() };
+    let table = BlockTable {
+        block_size: block,
+        block_ids: (0..blocks).collect(),
+    };
     for case in fixture(fixture_name)["cases"].as_array().unwrap() {
         gpu.init_kv_cache(blocks, block).unwrap();
         let prompt = b.tokenizer.encode(case["prompt"].as_str().unwrap(), true, true);
@@ -103,9 +129,19 @@ fn check_greedy(path: &std::path::Path, fixture_name: &str) {
             }
             let pos = prompt.len() + out.len() - 1;
             logits = gpu
-                .forward_cached(&ForwardBatch { tokens: &[next], positions: &[pos], block_tables: std::slice::from_ref(&table), logits_rows: &[0] })
+                .forward_cached(&ForwardBatch {
+                    tokens: &[next],
+                    positions: &[pos],
+                    block_tables: std::slice::from_ref(&table),
+                    logits_rows: &[0],
+                })
                 .unwrap();
         }
-        assert_eq!(b.tokenizer.decode(&out, true), case["completion"].as_str().unwrap(), "[{fixture_name}] prompt {:?}", case["prompt"]);
+        assert_eq!(
+            b.tokenizer.decode(&out, true),
+            case["completion"].as_str().unwrap(),
+            "[{fixture_name}] prompt {:?}",
+            case["prompt"]
+        );
     }
 }

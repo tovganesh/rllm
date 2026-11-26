@@ -75,10 +75,7 @@ impl Bm25Index {
         }
 
         for (term, count) in term_counts {
-            self.inverted_index
-                .entry(term)
-                .or_default()
-                .push((doc_idx, count));
+            self.inverted_index.entry(term).or_default().push((doc_idx, count));
         }
 
         self.doc_lengths.push(len);

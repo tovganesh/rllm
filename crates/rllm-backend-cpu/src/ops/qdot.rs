@@ -135,11 +135,20 @@ pub fn vec_dot_x4(is_q8: bool, w: [&[u8]; 4], a: &Q8Activations, off: usize, nb:
     if has_dotprod() {
         // SAFETY: dotprod detected at runtime; each row holds `nb` blocks (caller).
         return unsafe {
-            if is_q8 { neon::dot_q8_0_q8_x4(w, a, off, nb) } else { neon::dot_q4_0_q8_x4(w, a, off, nb) }
+            if is_q8 {
+                neon::dot_q8_0_q8_x4(w, a, off, nb)
+            } else {
+                neon::dot_q4_0_q8_x4(w, a, off, nb)
+            }
         };
     }
     let dot = if is_q8 { scalar_dot_q8_0_q8 } else { scalar_dot_q4_0_q8 };
-    [dot(w[0], a, off, nb), dot(w[1], a, off, nb), dot(w[2], a, off, nb), dot(w[3], a, off, nb)]
+    [
+        dot(w[0], a, off, nb),
+        dot(w[1], a, off, nb),
+        dot(w[2], a, off, nb),
+        dot(w[3], a, off, nb),
+    ]
 }
 
 /// Dot products of one `Q8_0` weight row with `R` activation rows whose blocks start
@@ -272,7 +281,12 @@ mod neon {
                 acc[r] = vmlaq_n_f32(acc[r], vcvtq_f32_s32(i), f16_at(w[r], b * Q8_0_BYTES) * da);
             }
         }
-        [vaddvq_f32(acc[0]), vaddvq_f32(acc[1]), vaddvq_f32(acc[2]), vaddvq_f32(acc[3])]
+        [
+            vaddvq_f32(acc[0]),
+            vaddvq_f32(acc[1]),
+            vaddvq_f32(acc[2]),
+            vaddvq_f32(acc[3]),
+        ]
     }
 
     /// Four Q4_0 weight rows against the same activations. Nibbles are used unsigned and
@@ -297,7 +311,12 @@ mod neon {
                 acc[r] = vmlaq_n_f32(acc[r], vcvtq_f32_s32(i), f16_at(w[r], b * Q4_0_BYTES) * da);
             }
         }
-        [vaddvq_f32(acc[0]), vaddvq_f32(acc[1]), vaddvq_f32(acc[2]), vaddvq_f32(acc[3])]
+        [
+            vaddvq_f32(acc[0]),
+            vaddvq_f32(acc[1]),
+            vaddvq_f32(acc[2]),
+            vaddvq_f32(acc[3]),
+        ]
     }
 
     /// Q5_0: the fifth bit of value `j` is bit `j` of the 32-bit `qh`; it is expanded to
@@ -330,7 +349,11 @@ mod neon {
         while b + 1 < nb {
             let (i0, i1) = (block(b), block(b + 1));
             sum0 = vmlaq_n_f32(sum0, vcvtq_f32_s32(i0), f16_at(w, b * Q5_0_BYTES) * a.d[off + b]);
-            sum1 = vmlaq_n_f32(sum1, vcvtq_f32_s32(i1), f16_at(w, (b + 1) * Q5_0_BYTES) * a.d[off + b + 1]);
+            sum1 = vmlaq_n_f32(
+                sum1,
+                vcvtq_f32_s32(i1),
+                f16_at(w, (b + 1) * Q5_0_BYTES) * a.d[off + b + 1],
+            );
             b += 2;
         }
         if b < nb {
@@ -360,7 +383,6 @@ mod neon {
         vaddvq_f32(sum)
     }
 }
-
 
 /// Weight formats with integer dot-product kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,7 +510,13 @@ pub fn gemv_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32], n
         if let (QFormat::Q4_0, Acts::Q8(a)) = (fmt, &a) {
             while r + 4 <= chunk.len() {
                 let j = j0 + r;
-                chunk[r..r + 4].copy_from_slice(&vec_dot_x4(false, [row(j), row(j + 1), row(j + 2), row(j + 3)], a, 0, nb));
+                chunk[r..r + 4].copy_from_slice(&vec_dot_x4(
+                    false,
+                    [row(j), row(j + 1), row(j + 2), row(j + 3)],
+                    a,
+                    0,
+                    nb,
+                ));
                 r += 4;
             }
         }
@@ -548,7 +576,9 @@ mod tests {
     }
 
     fn data(n: usize, seed: usize) -> Vec<f32> {
-        (0..n).map(|i| (((i * 7919 + seed * 104729) % 2001) as f32 - 1000.0) / 400.0).collect()
+        (0..n)
+            .map(|i| (((i * 7919 + seed * 104729) % 2001) as f32 - 1000.0) / 400.0)
+            .collect()
     }
 
     #[test]
@@ -561,19 +591,31 @@ mod tests {
 
             let w8 = q8_0_weights(&wf);
             let (fast, slow) = (vec_dot_q8_0_q8(&w8, &a, 0, nb), scalar_dot_q8_0_q8(&w8, &a, 0, nb));
-            assert!((fast - slow).abs() <= 1e-3 * slow.abs().max(1.0), "q8 nb={nb}: {fast} vs {slow}");
+            assert!(
+                (fast - slow).abs() <= 1e-3 * slow.abs().max(1.0),
+                "q8 nb={nb}: {fast} vs {slow}"
+            );
             let mut wd = vec![0f32; k];
             dequantize_q8_0(&w8, &mut wd);
             let dense: f32 = wd.iter().zip(&x).map(|(p, q)| p * q).sum();
-            assert!((fast - dense).abs() <= 0.02 * dense.abs().max(1.0), "q8 vs dense nb={nb}: {fast} vs {dense}");
+            assert!(
+                (fast - dense).abs() <= 0.02 * dense.abs().max(1.0),
+                "q8 vs dense nb={nb}: {fast} vs {dense}"
+            );
 
             let mut w4 = vec![0u8; nb * Q4_0_BYTES];
             quantize_f32_to_q4_0(&wf, &mut w4);
             let (fast, slow) = (vec_dot_q4_0_q8(&w4, &a, 0, nb), scalar_dot_q4_0_q8(&w4, &a, 0, nb));
-            assert!((fast - slow).abs() <= 1e-3 * slow.abs().max(1.0), "q4 nb={nb}: {fast} vs {slow}");
+            assert!(
+                (fast - slow).abs() <= 1e-3 * slow.abs().max(1.0),
+                "q4 nb={nb}: {fast} vs {slow}"
+            );
             dequantize_q4_0(&w4, &mut wd);
             let dense: f32 = wd.iter().zip(&x).map(|(p, q)| p * q).sum();
-            assert!((fast - dense).abs() <= 0.02 * dense.abs().max(1.0), "q4 vs dense nb={nb}: {fast} vs {dense}");
+            assert!(
+                (fast - dense).abs() <= 0.02 * dense.abs().max(1.0),
+                "q4 vs dense nb={nb}: {fast} vs {dense}"
+            );
         }
     }
 
@@ -590,7 +632,8 @@ mod tests {
                 })
                 .collect();
             for b in 0..nb {
-                w[b * Q5_0_BYTES..b * Q5_0_BYTES + 2].copy_from_slice(&f16::from_f32(0.02 + 0.01 * b as f32).to_le_bytes());
+                w[b * Q5_0_BYTES..b * Q5_0_BYTES + 2]
+                    .copy_from_slice(&f16::from_f32(0.02 + 0.01 * b as f32).to_le_bytes());
             }
             let a = quantize_activations(&data(k, 4));
             let xq: Vec<f32> = (0..k).map(|j| a.qs[j] as f32 * a.d[j / QK]).collect();
@@ -598,8 +641,14 @@ mod tests {
             dequantize_q5_0(&w, &mut wd);
             let dense: f32 = wd.iter().zip(&xq).map(|(p, q)| p * q).sum();
             let (fast, slow) = (vec_dot_q5_0_q8(&w, &a, 0, nb), scalar_dot_q5_0_q8(&w, &a, 0, nb));
-            assert!((fast - slow).abs() <= 1e-4 * slow.abs().max(1.0), "nb={nb}: {fast} vs {slow}");
-            assert!((slow - dense).abs() <= 1e-4 * dense.abs().max(1.0), "nb={nb}: {slow} vs {dense}");
+            assert!(
+                (fast - slow).abs() <= 1e-4 * slow.abs().max(1.0),
+                "nb={nb}: {fast} vs {slow}"
+            );
+            assert!(
+                (slow - dense).abs() <= 1e-4 * dense.abs().max(1.0),
+                "nb={nb}: {slow} vs {dense}"
+            );
         }
     }
 
@@ -653,7 +702,10 @@ mod tests {
                     let mut row = vec![0f32; n];
                     gemv_quantized(fmt, &w, &x[i * k..(i + 1) * k], &mut row, n, k);
                     for (j, (b, g)) in batched[i * n..(i + 1) * n].iter().zip(&row).enumerate() {
-                        assert!((b - g).abs() <= 1e-4 * g.abs().max(1.0), "{fmt:?} m={m} [{i},{j}]: {b} vs {g}");
+                        assert!(
+                            (b - g).abs() <= 1e-4 * g.abs().max(1.0),
+                            "{fmt:?} m={m} [{i},{j}]: {b} vs {g}"
+                        );
                     }
                 }
             }

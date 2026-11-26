@@ -48,7 +48,12 @@ fn gemm_bench() {
         .split(',')
         .map(|s| {
             let p: Vec<&str> = s.split(':').collect();
-            (p[0].to_string(), p[1].parse().unwrap(), p[2].parse().unwrap(), p[3].parse().unwrap())
+            (
+                p[0].to_string(),
+                p[1].parse().unwrap(),
+                p[2].parse().unwrap(),
+                p[3].parse().unwrap(),
+            )
         })
         .collect();
     let m: usize = std::env::var("GEMM_M").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
@@ -57,7 +62,9 @@ fn gemm_bench() {
     let mut totals = vec![0f64; kernels.len()];
     for (n, k) in shapes {
         let mut w = if fmt == "f16" {
-            (0..n * k).flat_map(|i| half::f16::from_f32(((i * 7919 % 2001) as f32 - 1000.0) / 4000.0).to_le_bytes()).collect()
+            (0..n * k)
+                .flat_map(|i| half::f16::from_f32(((i * 7919 % 2001) as f32 - 1000.0) / 4000.0).to_le_bytes())
+                .collect()
         } else {
             rnd_bytes(n * k / bvals * bbytes, 1)
         };
@@ -67,19 +74,41 @@ fn gemm_bench() {
             }
         }
         let x: Vec<f32> = (0..m * k).map(|i| ((i * 31 % 997) as f32 - 498.0) / 500.0).collect();
-        let wb = device.new_buffer_with_data(w.as_ptr() as *const _, w.len() as u64, MTLResourceOptions::StorageModeShared);
-        let xb = device.new_buffer_with_data(x.as_ptr() as *const _, (x.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let wb = device.new_buffer_with_data(
+            w.as_ptr() as *const _,
+            w.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let xb = device.new_buffer_with_data(
+            x.as_ptr() as *const _,
+            (x.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         let xh: Vec<half::f16> = x.iter().map(|&v| half::f16::from_f32(v)).collect();
-        let xhb = device.new_buffer_with_data(xh.as_ptr() as *const _, (xh.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let xhb = device.new_buffer_with_data(
+            xh.as_ptr() as *const _,
+            (xh.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         let mut reference: Option<Vec<f32>> = None;
         let mut line = format!("{n:5}x{k:5} m={m}:");
         for (ki, (name, tn, tm, threads)) in kernels.iter().enumerate() {
             let f = lib.get_function(name, None).unwrap();
             let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
             // GEMM_SPLIT=s: split-K over grid y (`mmh`) or z (`mml`); outputs are partials.
-            let split: u64 = std::env::var("GEMM_SPLIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-            let (sy, sz) = if name.starts_with("mmh") { (split, 1) } else { (1, split) };
-            let yb = device.new_buffer((split as usize * m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let split: u64 = std::env::var("GEMM_SPLIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let (sy, sz) = if name.starts_with("mmh") {
+                (split, 1)
+            } else {
+                (1, split)
+            };
+            let yb = device.new_buffer(
+                (split as usize * m * n * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
             let run = |reps: usize| {
                 let cb = q.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
@@ -87,7 +116,11 @@ fn gemm_bench() {
                 e.set_buffer(0, Some(&wb), 0);
                 // The quantized/F16 tiled kernels take half-precision activations
                 // (`GEMM_FLOAT_X=name1,name2` lists experimental kernels that take F32).
-                let float_x = name == "mm_f32" || std::env::var("GEMM_FLOAT_X").unwrap_or_default().split(',').any(|k| k == name);
+                let float_x = name == "mm_f32"
+                    || std::env::var("GEMM_FLOAT_X")
+                        .unwrap_or_default()
+                        .split(',')
+                        .any(|k| k == name);
                 e.set_buffer(1, Some(if float_x { &xb } else { &xhb }), 0);
                 e.set_buffer(2, Some(&yb), 0);
                 let acc = std::env::var("GEMM_ACC").is_ok() as u32;
@@ -105,14 +138,16 @@ fn gemm_bench() {
                 cb.commit();
                 cb.wait_until_completed();
             };
-            let reps: usize = std::env::var("GEMM_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+            let reps: usize = std::env::var("GEMM_REPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
             run(reps.min(20));
             let t = Instant::now();
             run(reps);
             let dt = t.elapsed().as_secs_f64() / reps as f64;
             totals[ki] += dt;
-            let out: Vec<f32> =
-                unsafe { std::slice::from_raw_parts(yb.contents() as *const f32, m * n) }.to_vec();
+            let out: Vec<f32> = unsafe { std::slice::from_raw_parts(yb.contents() as *const f32, m * n) }.to_vec();
             let diff = match &reference {
                 None => {
                     reference = Some(out);
@@ -123,9 +158,21 @@ fn gemm_bench() {
                     r.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / scale
                 }
             };
-            line += &format!("  {name} {:.0}us {:.2}TF (diff {diff:.1e})", dt * 1e6, 2.0 * (m * n * k) as f64 / dt / 1e12);
+            line += &format!(
+                "  {name} {:.0}us {:.2}TF (diff {diff:.1e})",
+                dt * 1e6,
+                2.0 * (m * n * k) as f64 / dt / 1e12
+            );
         }
         println!("{line}");
     }
-    println!("total per layer: {}", kernels.iter().zip(&totals).map(|(k, t)| format!("{} {:.0}us", k.0, t * 1e6)).collect::<Vec<_>>().join("  "));
+    println!(
+        "total per layer: {}",
+        kernels
+            .iter()
+            .zip(&totals)
+            .map(|(k, t)| format!("{} {:.0}us", k.0, t * 1e6))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
 }

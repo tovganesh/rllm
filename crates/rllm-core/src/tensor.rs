@@ -227,9 +227,8 @@ impl Tensor {
         }
         let all: &[f32] = self.storage.as_cpu()?.as_slice();
         let offset = self.offset / 4;
-        all.get(offset..offset + self.numel()).ok_or_else(|| {
-            RllmError::BackendError("Tensor slice bounds out of range for storage".to_string())
-        })
+        all.get(offset..offset + self.numel())
+            .ok_or_else(|| RllmError::BackendError("Tensor slice bounds out of range for storage".to_string()))
     }
 
     /// Returns a direct read-only slice reference to the contiguous F32 data.
@@ -260,9 +259,8 @@ impl Tensor {
         let numel = self.numel();
         let cpu = self.storage.as_cpu_mut()?;
         let all: &mut [f32] = cpu.as_mut_slice();
-        all.get_mut(offset..offset + numel).ok_or_else(|| {
-            RllmError::BackendError("Tensor slice bounds out of range for storage".to_string())
-        })
+        all.get_mut(offset..offset + numel)
+            .ok_or_else(|| RllmError::BackendError("Tensor slice bounds out of range for storage".to_string()))
     }
 
     fn ensure_contiguous(&self) -> Result<()> {

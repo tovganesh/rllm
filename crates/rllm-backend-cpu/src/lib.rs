@@ -28,18 +28,8 @@ mod tests {
     #[test]
     fn test_cpu_matmul() {
         let backend = CpuBackend;
-        let a = Tensor::from_f32(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            Shape::new(vec![2, 3]),
-            Device::Cpu,
-        )
-        .unwrap();
-        let b = Tensor::from_f32(
-            &[7.0, 8.0, 9.0, 1.0, 2.0, 3.0],
-            Shape::new(vec![3, 2]),
-            Device::Cpu,
-        )
-        .unwrap();
+        let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Shape::new(vec![2, 3]), Device::Cpu).unwrap();
+        let b = Tensor::from_f32(&[7.0, 8.0, 9.0, 1.0, 2.0, 3.0], Shape::new(vec![3, 2]), Device::Cpu).unwrap();
 
         let c = backend.matmul(&a, &b).unwrap();
         assert_eq!(c.dims(), &[2, 2]);
@@ -50,18 +40,8 @@ mod tests {
     #[test]
     fn test_cpu_rmsnorm() {
         let backend = CpuBackend;
-        let x = Tensor::from_f32(
-            &[2.0, -2.0, 2.0, -2.0],
-            Shape::new(vec![1, 4]),
-            Device::Cpu,
-        )
-        .unwrap();
-        let weight = Tensor::from_f32(
-            &[1.0, 1.0, 1.0, 1.0],
-            Shape::new(vec![4]),
-            Device::Cpu,
-        )
-        .unwrap();
+        let x = Tensor::from_f32(&[2.0, -2.0, 2.0, -2.0], Shape::new(vec![1, 4]), Device::Cpu).unwrap();
+        let weight = Tensor::from_f32(&[1.0, 1.0, 1.0, 1.0], Shape::new(vec![4]), Device::Cpu).unwrap();
 
         let y = backend.rms_norm(&x, &weight, 1e-6).unwrap();
         let data: Vec<f32> = y.to_vec().unwrap();
@@ -169,7 +149,11 @@ mod tests {
         let w = Tensor::from_f32(&wv, Shape::new(vec![n, k]), Device::Cpu).unwrap();
         let wt = w.transpose(0, 1).unwrap();
         let fast = backend.matmul(&a, &wt).unwrap().to_vec::<f32>().unwrap();
-        let slow = backend.matmul(&a, &wt.contiguous().unwrap()).unwrap().to_vec::<f32>().unwrap();
+        let slow = backend
+            .matmul(&a, &wt.contiguous().unwrap())
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
         for (f, s) in fast.iter().zip(&slow) {
             assert!((f - s).abs() < 1e-4);
         }
@@ -179,9 +163,15 @@ mod tests {
     fn test_non_contiguous_views_are_materialised_or_rejected() {
         let t = Tensor::from_f32(&[1., 2., 3., 4., 5., 6.], Shape::new(vec![2, 3]), Device::Cpu).unwrap();
         let tt = t.transpose(0, 1).unwrap();
-        assert!(tt.as_f32_slice().is_err(), "strided view must not be read as contiguous");
+        assert!(
+            tt.as_f32_slice().is_err(),
+            "strided view must not be read as contiguous"
+        );
         assert_eq!(tt.to_vec::<f32>().unwrap(), vec![1., 4., 2., 5., 3., 6.]);
-        assert_eq!(tt.contiguous().unwrap().as_f32_slice().unwrap(), &[1., 4., 2., 5., 3., 6.]);
+        assert_eq!(
+            tt.contiguous().unwrap().as_f32_slice().unwrap(),
+            &[1., 4., 2., 5., 3., 6.]
+        );
     }
 
     #[test]
@@ -191,9 +181,17 @@ mod tests {
         let wf: Vec<f32> = (0..n * k).map(|i| ((i * 31 % 113) as f32 - 56.0) / 40.0).collect();
         let mut q4 = vec![0u8; n * (k / 32) * 18];
         for r in 0..n {
-            quantize_f32_to_q4_0(&wf[r * k..(r + 1) * k], &mut q4[r * (k / 32) * 18..(r + 1) * (k / 32) * 18]);
+            quantize_f32_to_q4_0(
+                &wf[r * k..(r + 1) * k],
+                &mut q4[r * (k / 32) * 18..(r + 1) * (k / 32) * 18],
+            );
         }
-        let w = Tensor::new(Shape::new(vec![n, k]), DType::Q4_0, Device::Cpu, Storage::Cpu(CpuStorage::from_bytes(q4)));
+        let w = Tensor::new(
+            Shape::new(vec![n, k]),
+            DType::Q4_0,
+            Device::Cpu,
+            Storage::Cpu(CpuStorage::from_bytes(q4)),
+        );
         let xs: Vec<f32> = (0..m * k).map(|i| ((i * 17 % 37) as f32 - 18.0) / 9.0).collect();
         let batched = backend
             .linear(&Tensor::from_f32(&xs, Shape::new(vec![m, k]), Device::Cpu).unwrap(), &w)

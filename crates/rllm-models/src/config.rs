@@ -220,19 +220,21 @@ impl BertConfig {
             )));
         }
         if g.get("bert.attention.causal").and_then(crate::gguf::GgufValue::as_bool) == Some(true) {
-            return Err(RllmError::ModelError("Causal BERT models are not supported".to_string()));
+            return Err(RllmError::ModelError(
+                "Causal BERT models are not supported".to_string(),
+            ));
         }
         let pooling = match g.get("bert.pooling_type").and_then(crate::gguf::GgufValue::as_u64) {
             None | Some(1) => BertPooling::Mean,
             Some(2) => BertPooling::Cls,
-            Some(other) => {
-                return Err(RllmError::ModelError(format!("Unsupported bert.pooling_type {other}")))
-            }
+            Some(other) => return Err(RllmError::ModelError(format!("Unsupported bert.pooling_type {other}"))),
         };
         let hidden_size = g.get_u64("bert.embedding_length")? as usize;
         let num_attention_heads = g.get_u64("bert.attention.head_count")? as usize;
         if num_attention_heads == 0 || !hidden_size.is_multiple_of(num_attention_heads) {
-            return Err(RllmError::ModelError("hidden size not divisible by head count".to_string()));
+            return Err(RllmError::ModelError(
+                "hidden size not divisible by head count".to_string(),
+            ));
         }
         let vocab_size = g
             .get("tokenizer.ggml.tokens")

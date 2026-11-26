@@ -25,8 +25,7 @@ pub use hnsw::{HnswIndex, VectorMatch};
 pub use hybrid::{HybridIndex, HybridMatch};
 pub use pipeline::{
     extractive_answer, grounded_messages, unrelated_response, verify_citations, Citation, LlmGenerator, RagEngine,
-    RagResponse, Retrieval, DEFAULT_MIN_DENSE_SIMILARITY, DEFAULT_MIN_RELEVANCE_THRESHOLD,
-    GROUNDING_INSTRUCTIONS,
+    RagResponse, Retrieval, DEFAULT_MIN_DENSE_SIMILARITY, DEFAULT_MIN_RELEVANCE_THRESHOLD, GROUNDING_INSTRUCTIONS,
 };
 pub use reranker::{CrossEncoderReranker, RerankedMatch};
 
@@ -111,7 +110,9 @@ mod tests {
         let grounded = extract_grounded_quote(query, passage);
 
         // Must pinpoint the exact second sentence
-        assert!(grounded.quote.contains("PagedAttention to eliminate memory fragmentation"));
+        assert!(grounded
+            .quote
+            .contains("PagedAttention to eliminate memory fragmentation"));
         assert!(grounded.matched_keywords.contains(&"eliminate".to_string()));
         assert!(grounded.matched_keywords.contains(&"memory".to_string()));
         assert!(grounded.matched_keywords.contains(&"fragmentation".to_string()));
@@ -136,7 +137,11 @@ mod tests {
         assert!(num_chunks > 0);
 
         let response = rag_engine
-            .query("Which batching does the rllm inference engine implement?", 2, rllm_scheduler::SamplingParams::default())
+            .query(
+                "Which batching does the rllm inference engine implement?",
+                2,
+                rllm_scheduler::SamplingParams::default(),
+            )
             .await
             .unwrap();
 
@@ -147,7 +152,10 @@ mod tests {
         assert!(response.citations[0].cited_in_answer);
         assert!(response.answer.contains("[1]"));
         assert!(response.warning.is_none());
-        assert!(response.max_dense_similarity.is_none(), "synthetic embedder must not gate on dense scores");
+        assert!(
+            response.max_dense_similarity.is_none(),
+            "synthetic embedder must not gate on dense scores"
+        );
     }
 
     #[tokio::test]

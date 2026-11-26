@@ -7,9 +7,7 @@
 use rllm_backend_cpu::CpuBackend;
 use rllm_core::{backend::BlockTable, device::Device, dtype::DType, shape::Shape, tensor::Tensor};
 use rllm_models::{ForwardBatch, LlamaConfig, LlamaModel};
-use rllm_scheduler::{
-    ContinuousBatchScheduler, SamplingParams, SchedulerConfig, Sequence,
-};
+use rllm_scheduler::{ContinuousBatchScheduler, SamplingParams, SchedulerConfig, Sequence};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -86,7 +84,10 @@ fn reference_greedy(m: &LlamaModel<CpuBackend>, prompt: &[u32], max_tokens: usiz
             .map(|_| Tensor::zeros(shape.clone(), DType::F32, Device::Cpu).unwrap())
             .collect();
         let mut v = k.clone();
-        let table = BlockTable { block_size: BLOCK, block_ids: (0..blocks).collect() };
+        let table = BlockTable {
+            block_size: BLOCK,
+            block_ids: (0..blocks).collect(),
+        };
         let positions: Vec<usize> = (0..n).collect();
         let logits = m
             .forward(
@@ -101,12 +102,7 @@ fn reference_greedy(m: &LlamaModel<CpuBackend>, prompt: &[u32], max_tokens: usiz
             )
             .unwrap();
         let row: Vec<f32> = logits.to_vec().unwrap();
-        let next = row
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap()
-            .0 as u32;
+        let next = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
         out.push(next);
         tokens.push(next);
     }
@@ -250,9 +246,15 @@ fn submit_rejects_invalid_sequences() {
     assert!(s.submit_sequence(seq(1, &[], 4)).is_err(), "empty prompt");
     assert!(s.submit_sequence(seq(2, &[64], 4)).is_err(), "token outside vocabulary");
     let too_long: Vec<u32> = vec![1; 128];
-    assert!(s.submit_sequence(seq(3, &too_long, 4)).is_err(), "prompt >= context window");
+    assert!(
+        s.submit_sequence(seq(3, &too_long, 4)).is_err(),
+        "prompt >= context window"
+    );
     let too_big_for_pool: Vec<u32> = vec![1; 16]; // needs 5 blocks of 4, pool has 4
-    assert!(s.submit_sequence(seq(4, &too_big_for_pool, 4)).is_err(), "prompt > KV pool");
+    assert!(
+        s.submit_sequence(seq(4, &too_big_for_pool, 4)).is_err(),
+        "prompt > KV pool"
+    );
     assert_eq!(s.num_waiting(), 0);
 }
 
@@ -262,7 +264,11 @@ fn generation_stops_at_context_window() {
     let prompt: Vec<u32> = (0..120).map(|t| (t % 64) as u32).collect();
     s.submit_sequence(seq(1, &prompt, 50)).unwrap();
     let out = run_to_completion(&s);
-    assert_eq!(out[&1].len(), 128 - 120, "stops when the sequence fills max_position_embeddings");
+    assert_eq!(
+        out[&1].len(),
+        128 - 120,
+        "stops when the sequence fills max_position_embeddings"
+    );
 }
 
 #[test]
@@ -296,7 +302,9 @@ fn collect(stream: &mut rllm_scheduler::GenerationStream) -> (Vec<u32>, Sequence
 fn engine_serves_concurrent_requests_from_many_threads() {
     let m = model();
     let engine = EngineHandle::start(Arc::new(scheduler(128, 8)), EngineConfig::default());
-    let prompts: Vec<Vec<u32>> = (0..6u32).map(|i| (0..(3 + i as usize * 2)).map(|t| (t as u32 * 7 + i * 5) % 64).collect()).collect();
+    let prompts: Vec<Vec<u32>> = (0..6u32)
+        .map(|i| (0..(3 + i as usize * 2)).map(|t| (t as u32 * 7 + i * 5) % 64).collect())
+        .collect();
     let handles: Vec<_> = prompts
         .iter()
         .cloned()
@@ -335,7 +343,10 @@ fn dropping_the_stream_cancels_and_frees_blocks() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(sched.num_running(), 0, "cancelled sequence must be retired");
-    assert_eq!(sched.metrics.finished_abort.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        sched.metrics.finished_abort.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
     assert_eq!(sched.num_free_blocks() + sched.num_cached_blocks(), total);
     engine.shutdown();
 }
@@ -343,13 +354,19 @@ fn dropping_the_stream_cancels_and_frees_blocks() {
 #[test]
 fn engine_rejects_invalid_and_overload() {
     let engine = EngineHandle::start(Arc::new(scheduler(64, 1)), EngineConfig { max_waiting: 0 });
-    assert!(matches!(engine.submit(vec![1, 2], greedy(4)), Err(SubmitError::Overloaded { .. })));
+    assert!(matches!(
+        engine.submit(vec![1, 2], greedy(4)),
+        Err(SubmitError::Overloaded { .. })
+    ));
     engine.shutdown();
     assert_eq!(engine.submit(vec![1], greedy(1)).err(), Some(SubmitError::ShutDown));
 
     let engine = EngineHandle::start(Arc::new(scheduler(64, 1)), EngineConfig::default());
     assert!(matches!(engine.submit(vec![], greedy(4)), Err(SubmitError::Invalid(_))));
-    assert!(matches!(engine.submit(vec![1], greedy(0)), Err(SubmitError::Invalid(_))));
+    assert!(matches!(
+        engine.submit(vec![1], greedy(0)),
+        Err(SubmitError::Invalid(_))
+    ));
     engine.shutdown();
 }
 
@@ -371,7 +388,12 @@ fn f16_kv_cache_tracks_f32_and_keeps_greedy_output() {
     let mut m = LlamaModel::new_seeded(config(), Arc::new(CpuBackend), 7).unwrap();
     m.kv_dtype = DType::F16;
     let s = ContinuousBatchScheduler::new(
-        SchedulerConfig { max_batch_size: 4, block_size: BLOCK, total_blocks: 64, ..SchedulerConfig::default() },
+        SchedulerConfig {
+            max_batch_size: 4,
+            block_size: BLOCK,
+            total_blocks: 64,
+            ..SchedulerConfig::default()
+        },
         Arc::new(m),
     )
     .unwrap();

@@ -38,7 +38,11 @@ pub fn quantize_q8_k(x: &[f32]) -> Q8KActivations {
     let mut d = Vec::with_capacity(nb);
     let mut qs = vec![0i8; x.len()];
     let mut bsums = vec![0i16; nb * 16];
-    for ((block, out), sums) in x.chunks_exact(QK_K).zip(qs.chunks_exact_mut(QK_K)).zip(bsums.chunks_exact_mut(16)) {
+    for ((block, out), sums) in x
+        .chunks_exact(QK_K)
+        .zip(qs.chunks_exact_mut(QK_K))
+        .zip(bsums.chunks_exact_mut(16))
+    {
         let (mut amax, mut max) = (0f32, 0f32);
         for &v in block {
             if v.abs() > amax {
@@ -157,11 +161,16 @@ pub fn scalar_dot_q4_k_q8_k(w: &[u8], a: &Q8KActivations, off: usize, nb: usize)
         for j in 0..4 {
             let q = &qs[j * 32..j * 32 + 32];
             let (lo, hi): (i32, i32) = (0..32).fold((0, 0), |(l, h), t| {
-                (l + (q[t] & 0x0F) as i32 * aq[j * 64 + t] as i32, h + (q[t] >> 4) as i32 * aq[j * 64 + 32 + t] as i32)
+                (
+                    l + (q[t] & 0x0F) as i32 * aq[j * 64 + t] as i32,
+                    h + (q[t] >> 4) as i32 * aq[j * 64 + 32 + t] as i32,
+                )
             });
             isum += lo * scales[2 * j] as i32 + hi * scales[2 * j + 1] as i32;
         }
-        let msum: i32 = (0..8).map(|j| mins[j] as i32 * (bs[2 * j] as i32 + bs[2 * j + 1] as i32)).sum();
+        let msum: i32 = (0..8)
+            .map(|j| mins[j] as i32 * (bs[2 * j] as i32 + bs[2 * j + 1] as i32))
+            .sum();
         let da = a.d[off + i];
         sum += da * f16_at(blk, 0) * isum as f32 - da * f16_at(blk, 2) * msum as f32;
     }
@@ -248,7 +257,11 @@ mod neon {
                     vld1q_s8(q8.add(16)),
                 );
                 let hi = sdot(
-                    sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8::<4>(b0)), vld1q_s8(q8.add(32))),
+                    sdot(
+                        vdupq_n_s32(0),
+                        vreinterpretq_s8_u8(vshrq_n_u8::<4>(b0)),
+                        vld1q_s8(q8.add(32)),
+                    ),
                     vreinterpretq_s8_u8(vshrq_n_u8::<4>(b1)),
                     vld1q_s8(q8.add(48)),
                 );
@@ -280,8 +293,14 @@ mod neon {
             let (s_lo, s_hi) = (vmovl_s8(vget_low_s8(scales)), vmovl_s8(vget_high_s8(scales)));
             let (b_lo, b_hi) = (vld1q_s16(bs), vld1q_s16(bs.add(8)));
             let prod = vaddq_s32(
-                vaddq_s32(vmull_s16(vget_low_s16(b_lo), vget_low_s16(s_lo)), vmull_s16(vget_high_s16(b_lo), vget_high_s16(s_lo))),
-                vaddq_s32(vmull_s16(vget_low_s16(b_hi), vget_low_s16(s_hi)), vmull_s16(vget_high_s16(b_hi), vget_high_s16(s_hi))),
+                vaddq_s32(
+                    vmull_s16(vget_low_s16(b_lo), vget_low_s16(s_lo)),
+                    vmull_s16(vget_high_s16(b_lo), vget_high_s16(s_lo)),
+                ),
+                vaddq_s32(
+                    vmull_s16(vget_low_s16(b_hi), vget_low_s16(s_hi)),
+                    vmull_s16(vget_high_s16(b_hi), vget_high_s16(s_hi)),
+                ),
             );
             let isum_mins = vaddvq_s32(prod);
 
@@ -291,7 +310,12 @@ mod neon {
                 let h0 = vld1q_u8(qh);
                 let h1 = vld1q_u8(qh.add(16));
                 qh = qh.add(32);
-                let l = [vld1q_u8(ql), vld1q_u8(ql.add(16)), vld1q_u8(ql.add(32)), vld1q_u8(ql.add(48))];
+                let l = [
+                    vld1q_u8(ql),
+                    vld1q_u8(ql.add(16)),
+                    vld1q_u8(ql.add(32)),
+                    vld1q_u8(ql.add(48)),
+                ];
                 ql = ql.add(64);
 
                 let hb = [
@@ -302,7 +326,11 @@ mod neon {
                 ];
                 for k in 0..4 {
                     let q = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(l[k], m4), hb[k]));
-                    isum = vmlaq_n_s32(isum, sdot(vdupq_n_s32(0), q, vld1q_s8(q8.add(16 * k))), *sc.add(s + k) as i32);
+                    isum = vmlaq_n_s32(
+                        isum,
+                        sdot(vdupq_n_s32(0), q, vld1q_s8(q8.add(16 * k))),
+                        *sc.add(s + k) as i32,
+                    );
                 }
                 q8 = q8.add(64);
                 s += 4;
@@ -315,7 +343,11 @@ mod neon {
                 ];
                 for k in 0..4 {
                     let q = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(l[k]), hb[k]));
-                    isum = vmlaq_n_s32(isum, sdot(vdupq_n_s32(0), q, vld1q_s8(q8.add(16 * k))), *sc.add(s + k) as i32);
+                    isum = vmlaq_n_s32(
+                        isum,
+                        sdot(vdupq_n_s32(0), q, vld1q_s8(q8.add(16 * k))),
+                        *sc.add(s + k) as i32,
+                    );
                 }
                 q8 = q8.add(64);
                 s += 4;
@@ -393,8 +425,14 @@ mod neon {
                 let bs = a.bsums.as_ptr().add((offs[r] + i) * 16);
                 let (b_lo, b_hi) = (vld1q_s16(bs), vld1q_s16(bs.add(8)));
                 let prod = vaddq_s32(
-                    vaddq_s32(vmull_s16(vget_low_s16(b_lo), vget_low_s16(s_lo)), vmull_s16(vget_high_s16(b_lo), vget_high_s16(s_lo))),
-                    vaddq_s32(vmull_s16(vget_low_s16(b_hi), vget_low_s16(s_hi)), vmull_s16(vget_high_s16(b_hi), vget_high_s16(s_hi))),
+                    vaddq_s32(
+                        vmull_s16(vget_low_s16(b_lo), vget_low_s16(s_lo)),
+                        vmull_s16(vget_high_s16(b_lo), vget_high_s16(s_lo)),
+                    ),
+                    vaddq_s32(
+                        vmull_s16(vget_low_s16(b_hi), vget_low_s16(s_hi)),
+                        vmull_s16(vget_high_s16(b_hi), vget_high_s16(s_hi)),
+                    ),
                 );
                 mins[r] = vaddvq_s32(prod);
             }
@@ -403,7 +441,12 @@ mod neon {
                 let ql = blk.add(64 * half);
                 let h0 = vld1q_u8(qh);
                 let h1 = vld1q_u8(qh.add(16));
-                let l = [vld1q_u8(ql), vld1q_u8(ql.add(16)), vld1q_u8(ql.add(32)), vld1q_u8(ql.add(48))];
+                let l = [
+                    vld1q_u8(ql),
+                    vld1q_u8(ql.add(16)),
+                    vld1q_u8(ql.add(32)),
+                    vld1q_u8(ql.add(48)),
+                ];
                 for part in 0..2 {
                     let q: [int8x16_t; 4] = if part == 0 {
                         let hb = [
@@ -449,7 +492,9 @@ mod tests {
     use crate::ops::quant::{dequantize_q4_k, dequantize_q6_k};
 
     fn data(n: usize, seed: usize) -> Vec<f32> {
-        (0..n).map(|i| (((i * 7919 + seed * 104729) % 2001) as f32 - 1000.0) / 400.0).collect()
+        (0..n)
+            .map(|i| (((i * 7919 + seed * 104729) % 2001) as f32 - 1000.0) / 400.0)
+            .collect()
     }
 
     /// Random-looking but deterministic super-blocks with small f16 scales.
@@ -473,8 +518,14 @@ mod tests {
     /// `dense` uses the dequantized weights and dequantized activations, so the integer
     /// kernels must reproduce it up to float rounding.
     fn check(name: &str, fast: f32, slow: f32, dense: f32) {
-        assert!((fast - slow).abs() <= 1e-4 * slow.abs().max(1.0), "{name}: simd {fast} vs scalar {slow}");
-        assert!((slow - dense).abs() <= 1e-4 * dense.abs().max(1.0), "{name}: int {slow} vs dense {dense}");
+        assert!(
+            (fast - slow).abs() <= 1e-4 * slow.abs().max(1.0),
+            "{name}: simd {fast} vs scalar {slow}"
+        );
+        assert!(
+            (slow - dense).abs() <= 1e-4 * dense.abs().max(1.0),
+            "{name}: int {slow} vs dense {dense}"
+        );
     }
 
     #[test]
@@ -487,7 +538,10 @@ mod tests {
                 assert!((r - v).abs() <= a.d[b].abs() * 0.51, "{v} vs {r}");
             }
             for s in 0..16 {
-                let want: i16 = a.qs[b * QK_K + 16 * s..b * QK_K + 16 * s + 16].iter().map(|&q| q as i16).sum();
+                let want: i16 = a.qs[b * QK_K + 16 * s..b * QK_K + 16 * s + 16]
+                    .iter()
+                    .map(|&q| q as i16)
+                    .sum();
                 assert_eq!(a.bsums[b * 16 + s], want);
             }
         }
@@ -505,12 +559,22 @@ mod tests {
             let w4 = random_blocks(nb, Q4_K_BYTES, &[0, 2], 11 + nb as u64);
             dequantize_q4_k(&w4, &mut wd);
             let dense: f32 = wd.iter().zip(&x).map(|(p, q)| p * q).sum();
-            check("q4_k", vec_dot_q4_k_q8_k(&w4, &a, 0, nb), scalar_dot_q4_k_q8_k(&w4, &a, 0, nb), dense);
+            check(
+                "q4_k",
+                vec_dot_q4_k_q8_k(&w4, &a, 0, nb),
+                scalar_dot_q4_k_q8_k(&w4, &a, 0, nb),
+                dense,
+            );
 
             let w6 = random_blocks(nb, Q6_K_BYTES, &[208], 23 + nb as u64);
             dequantize_q6_k(&w6, &mut wd);
             let dense: f32 = wd.iter().zip(&x).map(|(p, q)| p * q).sum();
-            check("q6_k", vec_dot_q6_k_q8_k(&w6, &a, 0, nb), scalar_dot_q6_k_q8_k(&w6, &a, 0, nb), dense);
+            check(
+                "q6_k",
+                vec_dot_q6_k_q8_k(&w6, &a, 0, nb),
+                scalar_dot_q6_k_q8_k(&w6, &a, 0, nb),
+                dense,
+            );
         }
     }
 }

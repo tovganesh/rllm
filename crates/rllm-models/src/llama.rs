@@ -1,8 +1,8 @@
 //! LLaMA 3.x / Mistral / Qwen architecture with Grouped-Query Attention (GQA) and PagedAttention decoding.
 
 use crate::config::LlamaConfig;
-use rllm_backend_cpu::ops::rope::precompute_rope_freqs;
 use crate::init::SyntheticInit;
+use rllm_backend_cpu::ops::rope::precompute_rope_freqs;
 use rllm_core::{
     backend::{Backend, BlockTable},
     dtype::DType,
@@ -101,11 +101,7 @@ impl<B: Backend> LlamaModel<B> {
         let norm = init.norm_weight(h, dev)?;
         let lm_head = init.linear(config.vocab_size, h, dev)?;
 
-        let (cos_raw, sin_raw) = precompute_rope_freqs(
-            head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
-        );
+        let (cos_raw, sin_raw) = precompute_rope_freqs(head_dim, config.max_position_embeddings, config.rope_theta);
         let table_shape = Shape::new(vec![config.max_position_embeddings, head_dim / 2]);
         let cos_table = Tensor::from_f32(&cos_raw, table_shape.clone(), dev)?;
         let sin_table = Tensor::from_f32(&sin_raw, table_shape, dev)?;
@@ -146,7 +142,15 @@ impl<B: Backend> LlamaModel<B> {
         };
         for layer in &mut self.layers {
             let (a, m) = (&mut layer.self_attn, &mut layer.mlp);
-            for w in [&mut a.q_proj, &mut a.k_proj, &mut a.v_proj, &mut a.o_proj, &mut m.gate_proj, &mut m.up_proj, &mut m.down_proj] {
+            for w in [
+                &mut a.q_proj,
+                &mut a.k_proj,
+                &mut a.v_proj,
+                &mut a.o_proj,
+                &mut m.gate_proj,
+                &mut m.up_proj,
+                &mut m.down_proj,
+            ] {
                 pack(w)?;
             }
         }
@@ -313,9 +317,9 @@ impl<B: Backend> LlamaModel<B> {
 
         // 2. Decoder layers
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let normed =
-                self.backend
-                    .rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+            let normed = self
+                .backend
+                .rms_norm(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             // Fused projections pay off for decode-sized batches (one activation
             // quantization, fewer parallel regions); for prefill-sized batches the separate
@@ -349,27 +353,18 @@ impl<B: Backend> LlamaModel<B> {
             write_kv(v_cache, v.as_f32_slice()?, batch, num_kv_heads, head_dim)?;
 
             // Causal paged attention: row i sees positions 0..=positions[i].
-            let attn_out = self.backend.paged_attention(
-                &q,
-                k_cache,
-                v_cache,
-                batch.block_tables,
-                &context_lens,
-                scale,
-            )?;
+            let attn_out =
+                self.backend
+                    .paged_attention(&q, k_cache, v_cache, batch.block_tables, &context_lens, scale)?;
 
             let attn_flat = attn_out.reshape(Shape::new(vec![num_rows, h]))?;
-            let attn_proj = self
-                .backend
-                .linear(&attn_flat, &layer.self_attn.o_proj)?;
+            let attn_proj = self.backend.linear(&attn_flat, &layer.self_attn.o_proj)?;
             add_inplace(&mut hidden, &attn_proj)?;
 
             // Post-attention RMSNorm + SwiGLU MLP
-            let ffn_normed = self.backend.rms_norm(
-                &hidden,
-                &layer.post_attention_layernorm,
-                self.config.rms_norm_eps,
-            )?;
+            let ffn_normed =
+                self.backend
+                    .rms_norm(&hidden, &layer.post_attention_layernorm, self.config.rms_norm_eps)?;
             let act = match layer.mlp.gate_up_proj.as_ref().filter(|_| use_fused) {
                 Some(gu) => {
                     let fused = self.backend.linear(&ffn_normed, gu)?;
@@ -381,34 +376,28 @@ impl<B: Backend> LlamaModel<B> {
                     self.backend.swiglu(&gate, &up)?
                 }
             };
-            let ffn_out = self
-                .backend
-                .linear(&act, &layer.mlp.down_proj)?;
+            let ffn_out = self.backend.linear(&act, &layer.mlp.down_proj)?;
             add_inplace(&mut hidden, &ffn_out)?;
         }
 
         // 3. Final norm + LM head, only for the requested rows.
-        let selected = if batch.logits_rows.len() == num_rows
-            && batch.logits_rows.iter().enumerate().all(|(i, &r)| i == r)
-        {
-            hidden
-        } else {
-            let src = hidden.as_f32_slice()?;
-            let mut rows = Vec::with_capacity(batch.logits_rows.len() * h);
-            for &r in batch.logits_rows {
-                rows.extend_from_slice(&src[r * h..(r + 1) * h]);
-            }
-            Tensor::from_f32(
-                &rows,
-                Shape::new(vec![batch.logits_rows.len(), h]),
-                self.backend.device(),
-            )?
-        };
-        let final_normed = self
-            .backend
-            .rms_norm(&selected, &self.norm, self.config.rms_norm_eps)?;
-        self.backend
-            .linear(&final_normed, &self.lm_head)
+        let selected =
+            if batch.logits_rows.len() == num_rows && batch.logits_rows.iter().enumerate().all(|(i, &r)| i == r) {
+                hidden
+            } else {
+                let src = hidden.as_f32_slice()?;
+                let mut rows = Vec::with_capacity(batch.logits_rows.len() * h);
+                for &r in batch.logits_rows {
+                    rows.extend_from_slice(&src[r * h..(r + 1) * h]);
+                }
+                Tensor::from_f32(
+                    &rows,
+                    Shape::new(vec![batch.logits_rows.len(), h]),
+                    self.backend.device(),
+                )?
+            };
+        let final_normed = self.backend.rms_norm(&selected, &self.norm, self.config.rms_norm_eps)?;
+        self.backend.linear(&final_normed, &self.lm_head)
     }
 }
 
@@ -432,7 +421,13 @@ const FUSED_MAX_ROWS: usize = 32;
 /// Returns `None` when they differ (the layer then stays unfused).
 /// Copies each row's `[num_kv_heads, head_dim]` keys or values into its paged cache
 /// slot, converting to the cache's storage type (F32 or F16).
-fn write_kv(cache: &mut Tensor, src: &[f32], batch: &ForwardBatch<'_>, num_kv_heads: usize, head_dim: usize) -> Result<()> {
+fn write_kv(
+    cache: &mut Tensor,
+    src: &[f32],
+    batch: &ForwardBatch<'_>,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
     use half::slice::HalfFloatSliceExt;
     let dtype = cache.dtype();
     let storage = cache.storage_mut().as_cpu_mut()?;
@@ -447,7 +442,9 @@ fn write_kv(cache: &mut Tensor, src: &[f32], batch: &ForwardBatch<'_>, num_kv_he
                 DType::F32 => storage.as_mut_slice::<f32>()[d..d + head_dim].copy_from_slice(src),
                 DType::F16 => storage.as_mut_slice::<half::f16>()[d..d + head_dim].convert_from_f32_slice(src),
                 other => {
-                    return Err(RllmError::BackendError(format!("KV cache dtype {other} is not supported (use F32 or F16)")))
+                    return Err(RllmError::BackendError(format!(
+                        "KV cache dtype {other} is not supported (use F32 or F16)"
+                    )))
                 }
             }
         }
@@ -458,7 +455,10 @@ fn write_kv(cache: &mut Tensor, src: &[f32], batch: &ForwardBatch<'_>, num_kv_he
 fn concat_rows(parts: &[&Tensor]) -> Result<Option<Tensor>> {
     let cols = parts[0].dims()[1];
     let dtype = parts[0].dtype();
-    if parts.iter().any(|t| t.dims().len() != 2 || t.dims()[1] != cols || t.dtype() != dtype) {
+    if parts
+        .iter()
+        .any(|t| t.dims().len() != 2 || t.dims()[1] != cols || t.dtype() != dtype)
+    {
         return Ok(None);
     }
     let rows: usize = parts.iter().map(|t| t.dims()[0]).sum();
@@ -492,7 +492,11 @@ fn split_columns(x: &Tensor, widths: &[usize; 3], dev: rllm_core::device::Device
         }
     }
     let t = |v: &Vec<f32>, w: usize| Tensor::from_f32(v, Shape::new(vec![rows, w]), dev);
-    Ok((t(&parts[0], widths[0])?, t(&parts[1], widths[1])?, t(&parts[2], widths[2])?))
+    Ok((
+        t(&parts[0], widths[0])?,
+        t(&parts[1], widths[1])?,
+        t(&parts[2], widths[2])?,
+    ))
 }
 
 /// SwiGLU over a fused `[rows, 2 * inter]` gate/up output: `silu(gate) * up`.

@@ -34,12 +34,19 @@ pub fn perplexity(model: &dyn LanguageModel, tokens: &[u32], ctx: usize, bos: Op
     }
     let chunks = tokens.len() / ctx;
     if chunks == 0 {
-        return Err(RllmError::ModelError(format!("{} tokens is fewer than ctx {}", tokens.len(), ctx)));
+        return Err(RllmError::ModelError(format!(
+            "{} tokens is fewer than ctx {}",
+            tokens.len(),
+            ctx
+        )));
     }
     let block = 16;
     let blocks = ctx.div_ceil(block);
     model.init_kv_cache(blocks, block)?;
-    let table = BlockTable { block_size: block, block_ids: (0..blocks).collect() };
+    let table = BlockTable {
+        block_size: block,
+        block_ids: (0..blocks).collect(),
+    };
     let tables = vec![table; ctx];
     let positions: Vec<usize> = (0..ctx).collect();
     let first = ctx / 2;
@@ -64,5 +71,9 @@ pub fn perplexity(model: &dyn LanguageModel, tokens: &[u32], ctx: usize, bos: Op
             count += 1;
         }
     }
-    Ok(Perplexity { ppl: (nll / count as f64).exp(), scored_tokens: count, chunks })
+    Ok(Perplexity {
+        ppl: (nll / count as f64).exp(),
+        scored_tokens: count,
+        chunks,
+    })
 }

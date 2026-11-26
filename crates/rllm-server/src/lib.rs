@@ -103,24 +103,26 @@ mod tests {
 
     fn setup_state_with(mode: ServiceMode, max_waiting: usize) -> Arc<AppState> {
         let backend = Arc::new(CpuBackend);
-        let embedder =
-            Arc::new(TextEmbedder::synthetic(BertConfig::tiny_test_config(), backend.clone()).unwrap());
+        let embedder = Arc::new(TextEmbedder::synthetic(BertConfig::tiny_test_config(), backend.clone()).unwrap());
 
         let llama_config = LlamaConfig::tiny_test_config();
         let llama_model = Arc::new(LlamaModel::new_random(llama_config, backend).unwrap());
 
-        let engine = EngineHandle::start(Arc::new(
-            ContinuousBatchScheduler::new(
-                SchedulerConfig {
-                    max_batch_size: 4,
-                    block_size: 4,
-                    total_blocks: 512,
-                    ..SchedulerConfig::default()
-                },
-                llama_model,
-            )
-            .unwrap(),
-        ), EngineConfig { max_waiting });
+        let engine = EngineHandle::start(
+            Arc::new(
+                ContinuousBatchScheduler::new(
+                    SchedulerConfig {
+                        max_batch_size: 4,
+                        block_size: 4,
+                        total_blocks: 512,
+                        ..SchedulerConfig::default()
+                    },
+                    llama_model,
+                )
+                .unwrap(),
+            ),
+            EngineConfig { max_waiting },
+        );
 
         let rag_engine = Arc::new(RagEngine::new(embedder.clone(), None));
 
@@ -144,12 +146,7 @@ mod tests {
         let app = create_router(state);
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -223,14 +220,22 @@ mod tests {
                 .unwrap()
         };
 
-        let resp = app.clone().oneshot(post("/v1/embeddings", r#"{"input":["hello world","second"]}"#)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/embeddings", r#"{"input":["hello world","second"]}"#))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value =
             serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(body["data"].as_array().unwrap().len(), 2);
         assert_eq!(body["data"][0]["embedding"].as_array().unwrap().len(), 64);
 
-        let resp = app.clone().oneshot(post("/v1/rag/query", r#"{"query":"   "}"#)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/rag/query", r#"{"query":"   "}"#))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value =
             serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
@@ -247,7 +252,13 @@ mod tests {
     }
 
     async fn body_string(resp: axum::response::Response) -> String {
-        String::from_utf8(axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
+        String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -257,7 +268,10 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(post_json("/v1/chat/completions", serde_json::json!({"messages": msgs, "temperature": 0, "max_tokens": 6})))
+            .oneshot(post_json(
+                "/v1/chat/completions",
+                serde_json::json!({"messages": msgs, "temperature": 0, "max_tokens": 6}),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -274,18 +288,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/event-stream"));
+        assert!(resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
         let body = body_string(resp).await;
         let events: Vec<&str> = body.lines().filter_map(|l| l.strip_prefix("data: ")).collect();
         assert_eq!(*events.last().unwrap(), "[DONE]");
-        let chunks: Vec<serde_json::Value> = events[..events.len() - 1].iter().map(|e| serde_json::from_str(e).unwrap()).collect();
+        let chunks: Vec<serde_json::Value> = events[..events.len() - 1]
+            .iter()
+            .map(|e| serde_json::from_str(e).unwrap())
+            .collect();
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
         let streamed: String = chunks
             .iter()
             .filter_map(|c| c["choices"].get(0).and_then(|ch| ch["delta"]["content"].as_str()))
             .collect();
-        assert_eq!(streamed.trim(), full_text, "streamed text must equal the non-streamed text");
-        let finish = chunks.iter().find_map(|c| c["choices"].get(0).and_then(|ch| ch["finish_reason"].as_str())).unwrap();
+        assert_eq!(
+            streamed.trim(),
+            full_text,
+            "streamed text must equal the non-streamed text"
+        );
+        let finish = chunks
+            .iter()
+            .find_map(|c| c["choices"].get(0).and_then(|ch| ch["finish_reason"].as_str()))
+            .unwrap();
         assert_eq!(finish, "length");
         let usage = &chunks.last().unwrap()["usage"];
         assert_eq!(usage["completion_tokens"], 6);
@@ -302,7 +329,11 @@ mod tests {
             serde_json::json!({"messages": msgs, "temperature": 5.0}),
             serde_json::json!({"messages": []}),
         ] {
-            let resp = app.clone().oneshot(post_json("/v1/chat/completions", body.clone())).await.unwrap();
+            let resp = app
+                .clone()
+                .oneshot(post_json("/v1/chat/completions", body.clone()))
+                .await
+                .unwrap();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
         }
 
@@ -321,18 +352,30 @@ mod tests {
         let app = create_router(state);
         let resp = app
             .clone()
-            .oneshot(post_json("/v1/chat/completions", serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3})))
+            .oneshot(post_json(
+                "/v1/chat/completions",
+                serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let _ = body_string(resp).await;
 
-        let resp = app.oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let text = body_string(resp).await;
-        assert!(text.contains("rllm_http_requests_total{route=\"/v1/chat/completions\",status=\"200\"} 1"), "{text}");
+        assert!(
+            text.contains("rllm_http_requests_total{route=\"/v1/chat/completions\",status=\"200\"} 1"),
+            "{text}"
+        );
         assert!(text.contains("rllm_generated_tokens_total 3"), "{text}");
-        assert!(text.contains("rllm_sequences_finished_total{reason=\"length\"} 1"), "{text}");
+        assert!(
+            text.contains("rllm_sequences_finished_total{reason=\"length\"} 1"),
+            "{text}"
+        );
         assert!(text.contains("rllm_time_to_first_token_seconds_count 1"), "{text}");
         assert!(text.contains("rllm_kv_blocks_free"));
         assert!(text.contains("rllm_draft_tokens_total 0"), "{text}");
