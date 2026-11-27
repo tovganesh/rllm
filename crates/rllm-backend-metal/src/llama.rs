@@ -599,7 +599,7 @@ impl MetalLlama {
 
 /// Dense F32 copy of a matrix in any CPU weight format.
 fn dequantize_to_f32(t: &Tensor) -> Result<Vec<f32>> {
-    use rllm_backend_cpu::ops::{quant::dequantize_into, repack::dequantize_q4_0x4_row};
+    use rllm_backend_cpu::ops::{quant::dequantize_into, repack::dequantize_q4_0x4_row, tiles};
     let mut out = vec![0f32; t.numel()];
     let bytes = &t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + t.dtype().storage_bytes(t.numel())];
     match t.dtype() {
@@ -610,12 +610,19 @@ fn dequantize_to_f32(t: &Tensor) -> Result<Vec<f32>> {
                 dequantize_q4_0x4_row(bytes, k, r, row);
             }
         }
+        dtype @ (DType::Q8_0x8 | DType::Q4_0x8 | DType::Q4_Kx8 | DType::Q6_Kx8) => {
+            let k = t.dims()[1];
+            for (r, row) in out.chunks_exact_mut(k).enumerate() {
+                tiles::dequantize_row(dtype, bytes, k, r, row);
+            }
+        }
         other => dequantize_into(other, bytes, &mut out)?,
     }
     Ok(out)
 }
 
 /// Converts a CPU weight whose format has no Metal kernel: `Q4_0x4` back to `Q4_0`,
+/// the x86 tile layouts (Intel Macs) back to their source formats,
 /// `Q5_0` losslessly to `Q8_0`, and K-quants whose rows are not whole super-blocks to
 /// `Q8_0`. Returns `None` for formats Metal handles.
 fn to_metal_format(t: &Tensor) -> Result<Option<Tensor>> {
@@ -636,6 +643,11 @@ fn to_metal_format(t: &Tensor) -> Result<Option<Tensor>> {
         DType::Q5_0 => {
             let src = &t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + t.dtype().storage_bytes(t.numel())];
             (DType::Q8_0, q5_0_to_q8_0(src))
+        }
+        dtype @ (DType::Q8_0x8 | DType::Q4_0x8 | DType::Q4_Kx8 | DType::Q6_Kx8) => {
+            let (n, k) = (t.dims()[0], t.dims()[1]);
+            let src = &t.storage().as_cpu()?.as_bytes()[t.offset()..t.offset() + t.dtype().storage_bytes(t.numel())];
+            rllm_backend_cpu::ops::tiles::unpack(dtype, src, n, k)
         }
         DType::Q4_K | DType::Q6_K if !t.dims()[1].is_multiple_of(256) => {
             let dense = dequantize_to_f32(t)?;

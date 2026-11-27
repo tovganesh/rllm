@@ -10,6 +10,7 @@ pub mod quant;
 pub mod repack;
 pub mod rope;
 pub mod softmax;
+pub mod tiles;
 #[cfg(target_arch = "x86_64")]
 pub mod x86;
 

@@ -31,6 +31,22 @@ pub enum DType {
     /// 4-bit values). Same size as `Q4_0`; a row count that is a multiple of 4 is required,
     /// and row views must start on a 4-row boundary.
     Q4_0x4,
+    /// CPU-internal (x86) repacked `Q8_0`: groups of eight rows; per 32-value block, the
+    /// eight f16 scales, then eight 32-byte chunks each holding four consecutive values
+    /// of every row. Same size as `Q8_0`; rows a multiple of 8, row views on 8-row
+    /// boundaries.
+    Q8_0x8,
+    /// CPU-internal (x86) repacked `Q4_0`: as [`DType::Q8_0x8`] with four 32-byte chunks
+    /// of nibble bytes (byte `i` of a row's block holds values `i` and `16 + i`). Same
+    /// size as `Q4_0`.
+    Q4_0x8,
+    /// CPU-internal (x86) repacked `Q4_K`: groups of eight rows; per 256-value
+    /// super-block the rows' scales, unpacked 6-bit sub-block scales and mins, then 4-byte
+    /// chunks of all eight rows' nibbles. 148 bytes per row and super-block (`Q4_K`: 144).
+    Q4_Kx8,
+    /// CPU-internal (x86) repacked `Q6_K`: as [`DType::Q4_Kx8`] with the rows' scales,
+    /// sub-block scales, then 4-byte chunks of `ql` and of `qh`. Same size as `Q6_K`.
+    Q6_Kx8,
 }
 
 impl DType {
@@ -45,7 +61,14 @@ impl DType {
             DType::I8 => 1,
             DType::Q4_0 => 0,
             DType::Q4_K => 0,
-            DType::Q8_0 | DType::Q5_0 | DType::Q6_K | DType::Q4_0x4 => 0,
+            DType::Q8_0
+            | DType::Q5_0
+            | DType::Q6_K
+            | DType::Q4_0x4
+            | DType::Q8_0x8
+            | DType::Q4_0x8
+            | DType::Q4_Kx8
+            | DType::Q6_Kx8 => 0,
         }
     }
 
@@ -53,18 +76,28 @@ impl DType {
     pub fn is_quantized(&self) -> bool {
         matches!(
             self,
-            DType::Q4_0 | DType::Q4_K | DType::Q8_0 | DType::Q5_0 | DType::Q6_K | DType::Q4_0x4
+            DType::Q4_0
+                | DType::Q4_K
+                | DType::Q8_0
+                | DType::Q5_0
+                | DType::Q6_K
+                | DType::Q4_0x4
+                | DType::Q8_0x8
+                | DType::Q4_0x8
+                | DType::Q4_Kx8
+                | DType::Q6_Kx8
         )
     }
 
     /// Returns `(block_size, bytes_per_block)` for quantized types.
     pub fn block_info(&self) -> Option<(usize, usize)> {
         match self {
-            DType::Q4_0 | DType::Q4_0x4 => Some((32, 18)),
+            DType::Q4_0 | DType::Q4_0x4 | DType::Q4_0x8 => Some((32, 18)),
             DType::Q5_0 => Some((32, 22)),
-            DType::Q6_K => Some((256, 210)),
+            DType::Q6_K | DType::Q6_Kx8 => Some((256, 210)),
+            DType::Q4_Kx8 => Some((256, 148)),
             DType::Q4_K => Some((256, 144)),
-            DType::Q8_0 => Some((32, 34)),
+            DType::Q8_0 | DType::Q8_0x8 => Some((32, 34)),
             _ => None,
         }
     }
@@ -94,6 +127,10 @@ impl std::fmt::Display for DType {
             DType::Q5_0 => write!(f, "q5_0"),
             DType::Q6_K => write!(f, "q6_k"),
             DType::Q4_0x4 => write!(f, "q4_0x4"),
+            DType::Q8_0x8 => write!(f, "q8_0x8"),
+            DType::Q4_0x8 => write!(f, "q4_0x8"),
+            DType::Q4_Kx8 => write!(f, "q4_kx8"),
+            DType::Q6_Kx8 => write!(f, "q6_kx8"),
         }
     }
 }

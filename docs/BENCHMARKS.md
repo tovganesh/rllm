@@ -82,24 +82,24 @@ SmolLM2-135M pp128 on Metal is noisy in this script (single runs of the same bui
 
 #### x86_64 (GitHub-hosted runner, Linux)
 
-`.github/workflows/bench-x86.yml` builds llama.cpp (tag `b12359`, `GGML_NATIVE`) on an `ubuntu-latest` runner and runs `scripts/bench_vs_llamacpp.py --device cpu --threads 4` on the same VM (also the real-model parity tests and a `perf` profile of decode). Runners are shared 4-vCPU VMs on varying CPUs (AMD EPYC 7763 / 9V74, Intel Xeon 6973P / 6975P), so compare ratios within one run. On the Intel Xeon 6900-series runners llama.cpp uses AMX tiles for Q8_0 / Q4_0 prompts (not for Q4_K), which is why its Q8_0 / Q4_0 prompt numbers there are 3x its Q4_K_M ones. Latest run (PR #33, Intel Xeon 6975P-C, AVX-512 + AMX):
+`.github/workflows/bench-x86.yml` builds llama.cpp (tag `b12359`, `GGML_NATIVE`) on an `ubuntu-latest` runner and runs `scripts/bench_vs_llamacpp.py --device cpu --threads 4` on the same VM (also the real-model parity tests and a `perf` profile of decode). Runners are shared 4-vCPU VMs on varying CPUs (AMD EPYC 7763 / 9V74, Intel Xeon 6973P / 6975P), so compare ratios within one run. On the Intel Xeon 6900-series runners llama.cpp uses AMX tiles for Q8_0 / Q4_0 prompts (not for Q4_K), so on those its Q8_0 / Q4_0 prompt numbers are about 3x its Q4_K_M ones. Latest run (PR #34, AMD EPYC 7763, AVX2 only, no AMX):
 
 | model | test | llama.cpp t/s | rllm t/s | rllm / llama.cpp |
 | --- | --- | ---: | ---: | ---: |
-| SmolLM2-135M Q8_0 | pp512 | 2,063 | 321 | 0.16x |
-| SmolLM2-135M Q8_0 | tg128 | 236 | 118 | 0.50x |
-| SmolLM2-135M Q4_K_M | pp512 | 797 | 309 | 0.39x |
-| SmolLM2-135M Q4_K_M | tg128 | 166 | 134 | 0.81x |
-| SmolLM2-135M Q4_0 | pp512 | 2,100 | 305 | 0.15x |
-| SmolLM2-135M Q4_0 | tg128 | 382 | 164 | 0.43x |
-| Llama-3.2-1B Q8_0 | pp512 | 362 | 56 | 0.15x |
-| Llama-3.2-1B Q8_0 | tg128 | 23 | 17 | 0.74x |
-| Llama-3.2-1B Q4_K_M | pp512 | 349 | 61 | 0.17x |
-| Llama-3.2-1B Q4_K_M | tg128 | 25 | 25 | 0.98x |
-| Llama-3.2-1B Q4_0 | pp512 | 325 | 52 | 0.16x |
-| Llama-3.2-1B Q4_0 | tg128 | 34 | 14 | 0.41x |
+| SmolLM2-135M Q8_0 | pp128 / pp512 | 542 / 568 | 511 / 429 | 0.94x / 0.75x |
+| SmolLM2-135M Q8_0 | tg128 | 213 | 191 | 0.90x |
+| SmolLM2-135M Q4_K_M | pp128 / pp512 | 498 / 462 | 446 / 386 | 0.90x / 0.84x |
+| SmolLM2-135M Q4_K_M | tg128 | 188 | 189 | 1.00x |
+| SmolLM2-135M Q4_0 | pp128 / pp512 | 706 / 649 | 575 / 477 | 0.81x / 0.73x |
+| SmolLM2-135M Q4_0 | tg128 | 260 | 271 | 1.04x |
+| Llama-3.2-1B Q8_0 | pp128 / pp512 | 78 / 73 | 97 / 85 | **1.25x / 1.16x** |
+| Llama-3.2-1B Q8_0 | tg128 | 27 | 27 | 0.99x |
+| Llama-3.2-1B Q4_K_M | pp128 / pp512 | 101 / 100 | 101 / 92 | 1.00x / 0.92x |
+| Llama-3.2-1B Q4_K_M | tg128 | 36 | 32 | 0.88x |
+| Llama-3.2-1B Q4_0 | pp128 / pp512 | 84 / 91 | 121 / 107 | **1.45x / 1.18x** |
+| Llama-3.2-1B Q4_0 | tg128 | 38 | 37 | 0.99x |
 
-On an AMD EPYC 9V74 (Zen 4, no AMX) runner one commit earlier, 1B prompts were 0.33–0.51x and decode 0.57–0.96x. Before PR #33 x86 ran scalar fallbacks: prompts 0.01–0.02x, decode 0.06–0.15x. See "x86_64 AVX2 kernels (PR #33)" below for what remains.
+On the same runner model after PR #33 (one row at a time), 1B prompts were 0.21–0.31x and decode 0.58–0.87x. Before PR #33 x86 ran scalar fallbacks: prompts 0.01–0.02x, decode 0.06–0.15x. See "x86_64 8-row tiles (PR #34)" and "x86_64 AVX2 kernels (PR #33)" below.
 
 #### Long context (2,048 and 8,192 tokens of context)
 
@@ -227,6 +227,26 @@ Before PR #28, 1B Q4_0 was at 0.79x with 4 sequences (247 tok/s): a 4-row step c
 **Behind:**
 - Metal prompt processing on Llama-3.2-1B, 0.94–0.97x (128–512 tokens); SmolLM2 is ahead in every format (1.01–1.10x). The GEMMs run at 3.2–3.5 TFLOPS (~85% of the 3.9 TFLOPS half-precision `simdgroup_matrix` peak) and take ~94% of the time; llama.cpp's classic GEMM, rebuilt in our benchmark, measures the same. See "Metal prefill GEMM and fused SwiGLU" below.
 - CPU prompt processing on 1B Q8_0 at 128 tokens, 0.85x (Accelerate GEMM efficiency at small M; Q4_0 uses i8mm there, 0.93x).
+
+**x86_64 8-row tiles (PR #34)**
+
+After PR #33 the x86 decode profile was dominated by the single-row dot kernels (65–78%). Prompts were 0.15–0.45x of llama.cpp, which repacks weights for x86. Now `pack_weight` repacks `Q8_0`, `Q4_0` (and `Q5_0` via `Q8_0`), `Q4_K` and `Q6_K` matrices with a multiple of 8 rows into interleaved 8-row layouts on x86_64 with AVX2 (`DType::Q8_0x8`, `Q4_0x8`, `Q4_Kx8`, `Q6_Kx8`; `ops/tiles.rs`).
+
+- **Layout.** The quantized values are stored in 32-byte chunks of four bytes from each of the eight rows. One load therefore holds the same four values of all eight rows, and a broadcast 4-byte activation chunk gives eight row partial sums per `maddubs`, where the single-row kernels needed a horizontal reduction per row. This is the idea behind llama.cpp's `q4_0_8x8` / `q4_K_8x8` repacking.
+- **Kernels** (`tile_*` in `ops/x86.rs`) compute 8 weight rows × up to 4 activation rows, for decode and prompts alike, with the same cache blocking as `linear_quantized`. Offsets are folded into the integer sums: Q4_0's `-8`, Q4_K's mins and Q6_K's `-32`.
+- **Sizes.** `Q4_Kx8` stores the 6-bit sub-block scales and mins unpacked per row (148 instead of 144 bytes per row and super-block). The other layouts keep their source size.
+- **Other uses.** Embedding lookups and Metal's conversion of CPU weights (on Intel Macs) unpack rows.
+
+The table above shows the result: on an AVX2 runner, 1B prompts went from 0.21–0.31x to 0.92–1.45x and decode from 0.58–0.87x to 0.88–0.99x. Tests (also run as x86_64 under Rosetta, see below):
+- packing round-trips for all four formats, and packed rows dequantize exactly;
+- the tile kernels match the row-major integer kernels for 1–300 activation rows.
+
+Each of these planted bugs fails them: a Q4_0 offset, a wrong activation row in the Q8_0 tile, a wrong chunk when packing, the Q4_K min sign, the Q4_K scale index, the Q6_K offset and Q4_K mins packed as scales.
+
+Remaining on x86:
+- 1B Q4_K_M decode is at 0.88x.
+- SmolLM2 prompts are at 0.73–0.94x. Its 576-row matrices give each thread little work, and 25% of SmolLM2 decode is workers waiting.
+- No AVX-512 / VNNI kernels yet. On the Intel AMX runners llama.cpp's Q8_0 / Q4_0 prompts stay well ahead.
 
 **x86_64 AVX2 kernels (PR #33)**
 

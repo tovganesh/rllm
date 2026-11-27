@@ -523,3 +523,267 @@ unsafe fn hsum_i32(v: __m256i) -> i32 {
         _mm256_extracti128_si256::<1>(v),
     ))
 }
+
+/// One 8-row `Q8_0x8` group (see [`super::tiles`]) against activation rows `rows`
+/// (`nb` blocks each): `out[r][j]` = dot of weight row `j` of the group with activation
+/// row `rows[r]`. Each 32-byte chunk holds four values of all eight rows, so a
+/// broadcast 4-byte activation chunk gives eight row partial sums per instruction.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn tile_q8_0x8<const R: usize>(
+    grp: &[u8],
+    a: &Q8Activations,
+    rows: [usize; R],
+    nb: usize,
+    out: &mut [[f32; 8]; R],
+) {
+    assert!(grp.len() >= nb * 8 * Q8_0_BYTES);
+    for &r in &rows {
+        assert!(a.qs.len() >= (r + 1) * nb * QK && a.d.len() >= (r + 1) * nb);
+    }
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = [_mm256_setzero_ps(); R];
+    for b in 0..nb {
+        let blk = grp.as_ptr().add(b * 8 * Q8_0_BYTES);
+        let dw = _mm256_cvtph_ps(_mm_loadu_si128(blk as *const __m128i));
+        let mut isum = [_mm256_setzero_si256(); R];
+        for c in 0..8 {
+            let w = _mm256_loadu_si256(blk.add(16 + 32 * c) as *const __m256i);
+            let aw = _mm256_sign_epi8(w, w);
+            for r in 0..R {
+                let ap = a.qs.as_ptr().add((rows[r] * nb + b) * QK + 4 * c) as *const i32;
+                let y = _mm256_set1_epi32(ap.read_unaligned());
+                let p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(y, w)), ones);
+                isum[r] = _mm256_add_epi32(isum[r], p);
+            }
+        }
+        for r in 0..R {
+            let d = _mm256_mul_ps(dw, _mm256_set1_ps(*a.d.get_unchecked(rows[r] * nb + b)));
+            acc[r] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(isum[r]), acc[r]);
+        }
+    }
+    for r in 0..R {
+        _mm256_storeu_ps(out[r].as_mut_ptr(), acc[r]);
+    }
+}
+
+/// As [`tile_q8_0x8`] for `Q4_0x8` (four chunks of nibble bytes per block). Nibbles are
+/// used unsigned; `a` must carry per-block sums, and `-8 · Σy` is folded into each
+/// block's integer sum. Eight `maddubs` results (at most 2·15·127 each) fit in 16 bits,
+/// so a block is summed in 16-bit lanes and widened once.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn tile_q4_0x8<const R: usize>(
+    grp: &[u8],
+    a: &Q8Activations,
+    rows: [usize; R],
+    nb: usize,
+    out: &mut [[f32; 8]; R],
+) {
+    assert!(grp.len() >= nb * 8 * Q4_0_BYTES);
+    for &r in &rows {
+        assert!(a.qs.len() >= (r + 1) * nb * QK && a.d.len() >= (r + 1) * nb && a.sums.len() >= (r + 1) * nb);
+    }
+    let ones = _mm256_set1_epi16(1);
+    let m4 = _mm256_set1_epi8(0x0F);
+    let mut acc = [_mm256_setzero_ps(); R];
+    for b in 0..nb {
+        let blk = grp.as_ptr().add(b * 8 * Q4_0_BYTES);
+        let dw = _mm256_cvtph_ps(_mm_loadu_si128(blk as *const __m128i));
+        let mut isum = [_mm256_setzero_si256(); R];
+        for c in 0..4 {
+            let w = _mm256_loadu_si256(blk.add(16 + 32 * c) as *const __m256i);
+            let lo = _mm256_and_si256(w, m4);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(w), m4);
+            for r in 0..R {
+                let ap = a.qs.as_ptr().add((rows[r] * nb + b) * QK + 4 * c);
+                let ylo = _mm256_set1_epi32((ap as *const i32).read_unaligned());
+                let yhi = _mm256_set1_epi32((ap.add(16) as *const i32).read_unaligned());
+                let p = _mm256_add_epi16(_mm256_maddubs_epi16(lo, ylo), _mm256_maddubs_epi16(hi, yhi));
+                isum[r] = _mm256_add_epi16(isum[r], p);
+            }
+        }
+        for r in 0..R {
+            let blk_idx = rows[r] * nb + b;
+            let s = _mm256_sub_epi32(
+                _mm256_madd_epi16(isum[r], ones),
+                _mm256_set1_epi32(8 * *a.sums.get_unchecked(blk_idx)),
+            );
+            let d = _mm256_mul_ps(dw, _mm256_set1_ps(*a.d.get_unchecked(blk_idx)));
+            acc[r] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(s), acc[r]);
+        }
+    }
+    for r in 0..R {
+        _mm256_storeu_ps(out[r].as_mut_ptr(), acc[r]);
+    }
+}
+
+/// 16-bit lanes `[v_r0, v_r0, v_r1, v_r1, ..]` from eight per-row bytes at `p` (the
+/// 16-bit pair sums of row `r` sit in 32-bit lane `r`), unsigned or signed.
+#[inline(always)]
+unsafe fn row_pairs_u8(p: *const u8) -> __m256i {
+    let b = _mm_loadl_epi64(p as *const __m128i);
+    _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(b, b))
+}
+#[inline(always)]
+unsafe fn row_pairs_i8(p: *const u8) -> __m256i {
+    let b = _mm_loadl_epi64(p as *const __m128i);
+    _mm256_cvtepi8_epi16(_mm_unpacklo_epi8(b, b))
+}
+
+/// Broadcast of the four activation bytes at `p`.
+#[inline(always)]
+unsafe fn bcast4(p: *const i8) -> __m256i {
+    _mm256_set1_epi32((p as *const i32).read_unaligned())
+}
+
+/// One 8-row `Q4_Kx8` group (see [`super::tiles`]) against `Q8_K` activation rows
+/// `rows` (`nb` super-blocks each); see [`tile_q8_0x8`]. Per sub-block, eight `maddubs`
+/// of nibbles (at most 2·15·127 each) are summed in 16-bit lanes, then multiplied by the
+/// rows' sub-block scales with `madd`; the mins use the activation sums.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn tile_q4_kx8<const R: usize>(
+    grp: &[u8],
+    a: &Q8KActivations,
+    rows: [usize; R],
+    nb: usize,
+    out: &mut [[f32; 8]; R],
+) {
+    const SB: usize = 8 * 148;
+    assert!(grp.len() >= nb * SB);
+    for &r in &rows {
+        assert!(a.qs.len() >= (r + 1) * nb * QK_K && a.d.len() >= (r + 1) * nb && a.bsums.len() >= (r + 1) * nb * 16);
+    }
+    let m4 = _mm256_set1_epi8(0x0F);
+    let mut acc = [_mm256_setzero_ps(); R];
+    for b in 0..nb {
+        let blk = grp.as_ptr().add(b * SB);
+        let dw = _mm256_cvtph_ps(_mm_loadu_si128(blk as *const __m128i));
+        let dmw = _mm256_cvtph_ps(_mm_loadu_si128(blk.add(16) as *const __m128i));
+        let mut isum = [_mm256_setzero_si256(); R];
+        for sb in 0..8 {
+            // Sub-block 2j (low nibbles of chunks 8j..8j + 8) or 2j + 1 (high nibbles).
+            let (j, high) = (sb / 2, sb % 2 == 1);
+            let mut p16 = [_mm256_setzero_si256(); R];
+            for t in 0..8 {
+                let w = _mm256_loadu_si256(blk.add(160 + 32 * (8 * j + t)) as *const __m256i);
+                let v = if high {
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(w), m4)
+                } else {
+                    _mm256_and_si256(w, m4)
+                };
+                for r in 0..R {
+                    let y = bcast4(a.qs.as_ptr().add((rows[r] * nb + b) * QK_K + 32 * sb + 4 * t));
+                    p16[r] = _mm256_add_epi16(p16[r], _mm256_maddubs_epi16(v, y));
+                }
+            }
+            let sc = row_pairs_u8(blk.add(32 + 8 * sb));
+            for r in 0..R {
+                isum[r] = _mm256_add_epi32(isum[r], _mm256_madd_epi16(p16[r], sc));
+            }
+        }
+        // Σ_sb min[sb][row] · (sum of the sub-block's activations), two sub-blocks per madd.
+        let mut mn = [_mm256_setzero_si256(); 4];
+        for (p, v) in mn.iter_mut().enumerate() {
+            let lo = _mm_loadl_epi64(blk.add(96 + 16 * p) as *const __m128i);
+            let hi = _mm_loadl_epi64(blk.add(104 + 16 * p) as *const __m128i);
+            *v = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(lo, hi));
+        }
+        for r in 0..R {
+            let bs = a.bsums.as_ptr().add((rows[r] * nb + b) * 16);
+            let mut msum = _mm256_setzero_si256();
+            for (p, &v) in mn.iter().enumerate() {
+                let s0 = *bs.add(4 * p) as i32 + *bs.add(4 * p + 1) as i32;
+                let s1 = *bs.add(4 * p + 2) as i32 + *bs.add(4 * p + 3) as i32;
+                let pair = _mm256_set1_epi32((s0 & 0xFFFF) | (s1 << 16));
+                msum = _mm256_add_epi32(msum, _mm256_madd_epi16(v, pair));
+            }
+            let da = _mm256_set1_ps(*a.d.get_unchecked(rows[r] * nb + b));
+            acc[r] = _mm256_fmadd_ps(_mm256_mul_ps(dw, da), _mm256_cvtepi32_ps(isum[r]), acc[r]);
+            acc[r] = _mm256_fnmadd_ps(_mm256_mul_ps(dmw, da), _mm256_cvtepi32_ps(msum), acc[r]);
+        }
+    }
+    for r in 0..R {
+        _mm256_storeu_ps(out[r].as_mut_ptr(), acc[r]);
+    }
+}
+
+/// One 8-row `Q6_Kx8` group (see [`super::tiles`]) against `Q8_K` activation rows
+/// `rows`; see [`tile_q8_0x8`]. Values are used unsigned (0..63) and `-32 · Σ sc·Σy` is
+/// subtracted using the activation sums (per 16 values, one per sub-block).
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn tile_q6_kx8<const R: usize>(
+    grp: &[u8],
+    a: &Q8KActivations,
+    rows: [usize; R],
+    nb: usize,
+    out: &mut [[f32; 8]; R],
+) {
+    const SB: usize = 8 * Q6_K_BYTES;
+    assert!(grp.len() >= nb * SB);
+    for &r in &rows {
+        assert!(a.qs.len() >= (r + 1) * nb * QK_K && a.d.len() >= (r + 1) * nb && a.bsums.len() >= (r + 1) * nb * 16);
+    }
+    let m4 = _mm256_set1_epi8(0x0F);
+    let m2 = _mm256_set1_epi8(3);
+    let mut acc = [_mm256_setzero_ps(); R];
+    for b in 0..nb {
+        let blk = grp.as_ptr().add(b * SB);
+        let dw = _mm256_cvtph_ps(_mm_loadu_si128(blk as *const __m128i));
+        let mut isum = [_mm256_setzero_si256(); R];
+        for h in 0..2 {
+            for q in 0..2 {
+                // Values 16q..16q + 16 of each 32-value group: chunks t = 4q..4q + 4.
+                let sc: [__m256i; 4] = std::array::from_fn(|g| row_pairs_i8(blk.add(16 + 8 * (8 * h + q + 2 * g))));
+                for t in 4 * q..4 * q + 4 {
+                    let qla = _mm256_loadu_si256(blk.add(144 + 32 * (16 * h + t)) as *const __m256i);
+                    let qlb = _mm256_loadu_si256(blk.add(144 + 32 * (16 * h + 8 + t)) as *const __m256i);
+                    let qh = _mm256_loadu_si256(blk.add(1168 + 32 * (8 * h + t)) as *const __m256i);
+                    let v = [
+                        _mm256_or_si256(
+                            _mm256_and_si256(qla, m4),
+                            _mm256_slli_epi16::<4>(_mm256_and_si256(qh, m2)),
+                        ),
+                        _mm256_or_si256(
+                            _mm256_and_si256(qlb, m4),
+                            _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<2>(qh), m2)),
+                        ),
+                        _mm256_or_si256(
+                            _mm256_and_si256(_mm256_srli_epi16::<4>(qla), m4),
+                            _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<4>(qh), m2)),
+                        ),
+                        _mm256_or_si256(
+                            _mm256_and_si256(_mm256_srli_epi16::<4>(qlb), m4),
+                            _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<6>(qh), m2)),
+                        ),
+                    ];
+                    for r in 0..R {
+                        let ap = a.qs.as_ptr().add((rows[r] * nb + b) * QK_K + 128 * h + 4 * t);
+                        for g in 0..4 {
+                            let p = _mm256_maddubs_epi16(v[g], bcast4(ap.add(32 * g)));
+                            isum[r] = _mm256_add_epi32(isum[r], _mm256_madd_epi16(p, sc[g]));
+                        }
+                    }
+                }
+            }
+        }
+        // -32 · Σ_sb sc[sb][row] · bsum[sb], two sub-blocks per madd.
+        let scp: [__m256i; 8] = std::array::from_fn(|p| {
+            let lo = _mm_loadl_epi64(blk.add(16 + 16 * p) as *const __m128i);
+            let hi = _mm_loadl_epi64(blk.add(24 + 16 * p) as *const __m128i);
+            _mm256_cvtepi8_epi16(_mm_unpacklo_epi8(lo, hi))
+        });
+        for r in 0..R {
+            let bs = a.bsums.as_ptr().add((rows[r] * nb + b) * 16);
+            let mut corr = _mm256_setzero_si256();
+            for (p, &v) in scp.iter().enumerate() {
+                let pair = _mm256_set1_epi32((bs.add(2 * p) as *const i32).read_unaligned());
+                corr = _mm256_add_epi32(corr, _mm256_madd_epi16(v, pair));
+            }
+            let s = _mm256_sub_epi32(isum[r], _mm256_slli_epi32::<5>(corr));
+            let da = _mm256_set1_ps(*a.d.get_unchecked(rows[r] * nb + b));
+            acc[r] = _mm256_fmadd_ps(_mm256_mul_ps(dw, da), _mm256_cvtepi32_ps(s), acc[r]);
+        }
+    }
+    for r in 0..R {
+        _mm256_storeu_ps(out[r].as_mut_ptr(), acc[r]);
+    }
+}
