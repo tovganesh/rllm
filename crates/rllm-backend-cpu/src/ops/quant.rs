@@ -487,6 +487,11 @@ pub fn convert_f16(src: &[u8], out: &mut [f32]) {
             *y = f16::from_le_bytes([b[0], b[1]]).to_f32();
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel bounds itself to `n`.
+        return unsafe { super::x86::widen_f16(&src[..2 * n], &mut out[..n]) };
+    }
     #[cfg(not(target_arch = "aarch64"))]
     for (b, y) in src[..2 * n].chunks_exact(2).zip(out[..n].iter_mut()) {
         *y = f16::from_le_bytes([b[0], b[1]]).to_f32();

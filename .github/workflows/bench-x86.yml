@@ -1,0 +1,96 @@
+name: Bench x86
+
+# rllm vs llama.cpp on the CPU of a GitHub-hosted x86_64 runner (shared 4-vCPU VMs:
+# absolute numbers vary between runs and CPU models, so compare the ratio on one run).
+# Also runs the real-model parity tests (perplexity, greedy, embeddings) on x86.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["perf/x86**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  LLAMA_CPP_TAG: b12359
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-release
+      - name: CPU
+        id: cpu
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)|Thread|Flags" | sed 's/Flags:.*\(avx[^ ]*\).*/AVX flags: &/' | cut -c1-200
+          grep -o -w -E "avx2|fma|avx512f|avx512bw|avx512vl|avx512_vnni|avxvnni|f16c" /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          # Same model name can come with different flags (AVX-512 hidden on some VMs).
+          echo "key=$( (grep -m1 'model name' /proc/cpuinfo; grep -m1 '^flags' /proc/cpuinfo) | md5sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+      # llama.cpp is built for the runner's CPU (GGML_NATIVE), so the cache is per CPU model and flags.
+      - uses: actions/cache@v4
+        id: llama
+        with:
+          path: llama.cpp/build/bin
+          key: llama-${{ env.LLAMA_CPP_TAG }}-${{ steps.cpu.outputs.key }}
+      - name: Build llama.cpp
+        if: steps.llama.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp
+          cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF
+          cmake --build llama.cpp/build -j --target llama-bench llama-quantize
+      - uses: actions/cache@v4
+        id: models
+        with:
+          path: models
+          key: models-v1
+      - name: Download models
+        if: steps.models.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          hf=https://huggingface.co
+          curl -sSfL -o models/SmolLM2-135M-Instruct-Q8_0.gguf $hf/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf
+          curl -sSfL -o models/Llama-3.2-1B-Instruct-Q8_0.gguf $hf/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf
+          curl -sSfL -o models/bge-small-en-v1.5-q8_0.gguf $hf/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-q8_0.gguf
+          curl -sSfL -o models/all-MiniLM-L6-v2-Q8_0.gguf $hf/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/main/all-MiniLM-L6-v2-Q8_0.gguf
+      - name: Requantize
+        run: |
+          q=llama.cpp/build/bin/llama-quantize
+          for m in SmolLM2-135M-Instruct Llama-3.2-1B-Instruct; do
+            for t in Q4_0 Q4_K_M; do
+              [ -f models/$m-$t.requant.gguf ] || $q --allow-requantize models/$m-Q8_0.gguf models/$m-$t.requant.gguf $t > /dev/null
+            done
+          done
+          ls -la models
+      - name: Build rllm
+        run: cargo build --release -p rllm-cli
+      - name: Real-model tests
+        run: cargo test --release -p rllm-models -p rllm-rag
+      - name: Benchmark vs llama.cpp
+        run: |
+          export LLAMA_BENCH=$PWD/llama.cpp/build/bin/llama-bench
+          {
+            echo "### CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2), $(nproc) threads"
+            echo
+            python3 scripts/bench_vs_llamacpp.py --device cpu --reps 3 --threads "$(nproc)" \
+              models/SmolLM2-135M-Instruct-Q8_0.gguf models/SmolLM2-135M-Instruct-Q4_K_M.requant.gguf models/SmolLM2-135M-Instruct-Q4_0.requant.gguf \
+              models/Llama-3.2-1B-Instruct-Q8_0.gguf models/Llama-3.2-1B-Instruct-Q4_K_M.requant.gguf models/Llama-3.2-1B-Instruct-Q4_0.requant.gguf
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Where decode time goes (best effort: needs perf for the runner's kernel).
+      - name: Profile decode
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq > /dev/null
+          sudo apt-get install -y -qq "linux-tools-$(uname -r)" > /dev/null || sudo apt-get install -y -qq linux-tools-azure linux-tools-generic > /dev/null
+          PATH="$PATH:$(ls -d /usr/lib/linux-tools/*/ | head -1)"
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          for m in SmolLM2-135M-Instruct-Q8_0.gguf Llama-3.2-1B-Instruct-Q4_0.requant.gguf; do
+            perf record -q -F 2000 -g -o perf.data -- target/release/rllm --threads "$(nproc)" bench \
+              --model models/$m --prompt-tokens 16 --generate-tokens 128 --repetitions 2 > /dev/null
+            echo "#### $m (decode-heavy run)"
+            perf report -i perf.data --stdio --no-children --sort symbol --percent-limit 1.5 2> /dev/null \
+              | grep -E "^ +[0-9]" | cut -c1-140 | head -30
+          done | tee -a "$GITHUB_STEP_SUMMARY"

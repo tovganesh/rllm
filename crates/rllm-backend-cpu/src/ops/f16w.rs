@@ -72,6 +72,11 @@ pub fn dot_f16(w: &[f16], x: &[f32]) -> f32 {
         // SAFETY: lengths checked; NEON is baseline on aarch64.
         return unsafe { neon::dot(w, x) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_f16(w, x) };
+    }
     w.iter().zip(x).map(|(a, b)| a.to_f32() * b).sum()
 }
 
@@ -96,7 +101,7 @@ pub fn dot_f16_rows(w: &[f16], x: &[f32], k: usize, out: &mut [f32]) {
         return;
     }
     for (r, o) in out.iter_mut().enumerate() {
-        *o = w.iter().zip(&x[r * k..(r + 1) * k]).map(|(a, b)| a.to_f32() * b).sum();
+        *o = dot_f16(w, &x[r * k..(r + 1) * k]);
     }
 }
 

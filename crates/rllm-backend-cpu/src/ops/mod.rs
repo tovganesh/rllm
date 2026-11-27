@@ -10,6 +10,8 @@ pub mod quant;
 pub mod repack;
 pub mod rope;
 pub mod softmax;
+#[cfg(target_arch = "x86_64")]
+pub mod x86;
 
 /// Minimum number of elements per parallel task for cheap element-wise work. Below
 /// this, Rayon runs the loop inline on the calling thread (no fork/join overhead).

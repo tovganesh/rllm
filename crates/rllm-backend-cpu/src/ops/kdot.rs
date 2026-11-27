@@ -73,7 +73,7 @@ fn f16_at(b: &[u8], off: usize) -> f32 {
 
 /// Unpacks the eight 6-bit scales and mins of a `Q4_K` super-block.
 #[inline]
-fn q4_k_scales_mins(s: &[u8]) -> ([u8; 8], [u8; 8]) {
+pub(crate) fn q4_k_scales_mins(s: &[u8]) -> ([u8; 8], [u8; 8]) {
     const KMASK1: u32 = 0x3f3f_3f3f;
     const KMASK2: u32 = 0x0f0f_0f0f;
     const KMASK3: u32 = 0x0303_0303;
@@ -105,6 +105,11 @@ pub fn vec_dot_q4_k_q8_k(w: &[u8], a: &Q8KActivations, off: usize, nb: usize) ->
         // SAFETY: dotprod detected at runtime; slice lengths are asserted inside.
         return unsafe { neon::dot_q4_k(w, a, off, nb) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q4_k(w, a, off, nb) };
+    }
     scalar_dot_q4_k_q8_k(w, a, off, nb)
 }
 
@@ -115,6 +120,11 @@ pub fn vec_dot_q6_k_q8_k(w: &[u8], a: &Q8KActivations, off: usize, nb: usize) ->
     if has_dotprod() {
         // SAFETY: as above.
         return unsafe { neon::dot_q6_k(w, a, off, nb) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q6_k(w, a, off, nb) };
     }
     scalar_dot_q6_k_q8_k(w, a, off, nb)
 }
@@ -128,7 +138,12 @@ pub fn dot_q4_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize;
         // SAFETY: dotprod detected at runtime; slice lengths are asserted inside.
         return unsafe { neon::dot_q4_k_rows(w, a, offs, nb) };
     }
-    std::array::from_fn(|r| scalar_dot_q4_k_q8_k(w, a, offs[r], nb))
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q4_k_rows(w, a, offs, nb) };
+    }
+    std::array::from_fn(|r| vec_dot_q4_k_q8_k(w, a, offs[r], nb))
 }
 
 /// Dot products of one `Q6_K` row with `R` activation rows (see [`dot_q4_k_rows`]).
@@ -139,7 +154,12 @@ pub fn dot_q6_k_rows<const R: usize>(w: &[u8], a: &Q8KActivations, offs: [usize;
         // SAFETY: as above.
         return unsafe { neon::dot_q6_k_rows(w, a, offs, nb) };
     }
-    std::array::from_fn(|r| scalar_dot_q6_k_q8_k(w, a, offs[r], nb))
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q6_k_rows(w, a, offs, nb) };
+    }
+    std::array::from_fn(|r| vec_dot_q6_k_q8_k(w, a, offs[r], nb))
 }
 
 /// Portable reference implementation of [`vec_dot_q4_k_q8_k`].

@@ -28,6 +28,13 @@ const DEQUANT_CHUNK_ROWS: usize = 2048;
 /// integer dot products (llama.cpp uses the same cut-over for its BLAS path).
 pub const BATCHED_F32_MIN_ROWS: usize = 32;
 
+/// Whether batches of at least [`BATCHED_F32_MIN_ROWS`] rows dequantize the weight and
+/// use F32 GEMM. Only with a vendor BLAS (Accelerate): the portable GEMM is far slower
+/// than the integer multi-row kernels (on an x86 runner, prompts ran at 1-2% of
+/// llama.cpp's speed), and llama.cpp's own CPU backend keeps quantized weights in
+/// integer arithmetic at every batch size without one.
+const DEQUANT_BATCHES: bool = crate::ops::blas::HAS_VENDOR_BLAS;
+
 /// Whether a batch of `m` rows against a repacked `Q4_0` or a `Q8_0` `[n, k]` weight
 /// should use the i8mm integer GEMM rather than dequantization + F32 GEMM. Measured on
 /// an M4: i8mm is 3-6x faster than per-row SDOT below 32 rows; from 32 to ~192 rows it
@@ -154,8 +161,9 @@ impl Backend for CpuBackend {
         let out_slice = out.as_mut_f32_slice()?;
         let m = x_slice.len() / k;
         let repacked = dtype == DType::Q4_0x4;
-        let integer_path = m < BATCHED_F32_MIN_ROWS || ((repacked || fmt == Some(QFormat::Q8_0)) && use_i8mm(m, n, k));
-        if dtype == DType::F16 && m < BATCHED_F32_MIN_ROWS {
+        let small = m < BATCHED_F32_MIN_ROWS || !DEQUANT_BATCHES;
+        let integer_path = small || ((repacked || fmt == Some(QFormat::Q8_0)) && use_i8mm(m, n, k));
+        if dtype == DType::F16 && small {
             // F16 weights (F16 GGUF files) stay F16: half the bytes of F32 per token.
             if m == 1 {
                 crate::ops::f16w::gemv_f16(w_bytes, x_slice, out_slice, n, k);
@@ -208,7 +216,7 @@ impl Backend for CpuBackend {
         Ok(out)
     }
 
-    /// Repacks `Q4_0` matrices with a multiple of 4 rows into interleaved `Q4_0x4`, and
+    /// Repacks `Q4_0` matrices with a multiple of 4 rows into interleaved `Q4_0x4` (aarch64), and
     /// expands `Q5_0` losslessly to `Q8_0` (the SDOT Q8_0 kernel is ~1.75x faster than
     /// unpacking 5-bit values on an M4, at 34 instead of 22 bytes per block).
     fn pack_weight(&self, w: &Tensor) -> Result<Option<Tensor>> {
@@ -219,7 +227,11 @@ impl Backend for CpuBackend {
         let len = w.dtype().storage_bytes(w.numel());
         let bytes = || -> Result<&[u8]> { Ok(&w.storage().as_cpu()?.as_bytes()[w.offset()..w.offset() + len]) };
         let (dtype, packed) = match w.dtype() {
-            DType::Q4_0 if dims[0].is_multiple_of(4) => (DType::Q4_0x4, repack_q4_0(bytes()?, dims[0], dims[1])),
+            // The interleaved layout has SDOT/SMMLA kernels only; x86 keeps plain Q4_0 rows
+            // (AVX2 dot product).
+            DType::Q4_0 if cfg!(target_arch = "aarch64") && dims[0].is_multiple_of(4) => {
+                (DType::Q4_0x4, repack_q4_0(bytes()?, dims[0], dims[1]))
+            }
             DType::Q5_0 => (DType::Q8_0, q5_0_to_q8_0(bytes()?)),
             _ => return Ok(None),
         };

@@ -79,6 +79,11 @@ pub fn vec_dot_q8_0_q8(w: &[u8], a: &Q8Activations, a_block_offset: usize, nb: u
         // by the debug assertions in the callers and sized by `nb`.
         return unsafe { neon::dot_q8_0_q8(w, a, a_block_offset, nb) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q8_0(w, a, a_block_offset, nb) };
+    }
     scalar_dot_q8_0_q8(w, a, a_block_offset, nb)
 }
 
@@ -89,6 +94,12 @@ pub fn vec_dot_q4_0_q8(w: &[u8], a: &Q8Activations, a_block_offset: usize, nb: u
     if has_dotprod() {
         // SAFETY: as above.
         return unsafe { neon::dot_q4_0_q8(w, a, a_block_offset, nb) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() && !a.sums.is_empty() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds
+        // (including the per-block activation sums it uses for the `-8` offset).
+        return unsafe { super::x86::dot_q4_0(w, a, a_block_offset, nb) };
     }
     scalar_dot_q4_0_q8(w, a, a_block_offset, nb)
 }
@@ -136,7 +147,7 @@ pub fn vec_dot_x4(is_q8: bool, w: [&[u8]; 4], a: &Q8Activations, off: usize, nb:
             }
         };
     }
-    let dot = if is_q8 { scalar_dot_q8_0_q8 } else { scalar_dot_q4_0_q8 };
+    let dot = if is_q8 { vec_dot_q8_0_q8 } else { vec_dot_q4_0_q8 };
     [
         dot(w[0], a, off, nb),
         dot(w[1], a, off, nb),
@@ -154,7 +165,25 @@ pub fn dot_q8_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [usize; 
         // SAFETY: dotprod detected at runtime; bounds are asserted inside.
         return unsafe { neon::dot_q8_0_rows(w, a, offs, nb) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds.
+        return unsafe { super::x86::dot_q8_0_rows(w, a, offs, nb) };
+    }
     std::array::from_fn(|r| scalar_dot_q8_0_q8(w, a, offs[r], nb))
+}
+
+/// Dot products of one `Q4_0` weight row with `R` activation rows (see
+/// [`dot_q8_0_rows`]); a multi-row kernel exists on x86_64 (AVX2).
+#[inline]
+pub fn dot_q4_0_rows<const R: usize>(w: &[u8], a: &Q8Activations, offs: [usize; R], nb: usize) -> [f32; R] {
+    #[cfg(target_arch = "x86_64")]
+    if super::x86::has_avx2() && !a.sums.is_empty() {
+        // SAFETY: AVX2/FMA/F16C detected at run time; the kernel asserts its bounds
+        // (including the per-block activation sums it uses for the `-8` offset).
+        return unsafe { super::x86::dot_q4_0_rows(w, a, offs, nb) };
+    }
+    std::array::from_fn(|r| vec_dot_q4_0_q8(w, a, offs[r], nb))
 }
 
 /// Portable reference implementation of [`vec_dot_q8_0_q8`].
@@ -456,28 +485,30 @@ impl Acts {
         let offs: [usize; R] = std::array::from_fn(|r| (i0 + r) * nb);
         match (self, fmt) {
             (Acts::Q8(a), QFormat::Q8_0) => dot_q8_0_rows(w, a, offs, nb),
+            (Acts::Q8(a), QFormat::Q4_0) => dot_q4_0_rows(w, a, offs, nb),
             (Acts::K(a), QFormat::Q4K) => kdot::dot_q4_k_rows(w, a, offs, nb),
             (Acts::K(a), QFormat::Q6K) => kdot::dot_q6_k_rows(w, a, offs, nb),
             _ => offs.map(|o| self.dot(fmt, w, o, nb)),
         }
     }
 
-    /// `out[i] = dot(w, activation row i)` for every activation row.
-    fn dot_all_rows(&self, fmt: QFormat, w: &[u8], nb: usize, out: &mut [f32]) {
+    /// `out[i] = dot(w, activation row first + i)` for `out.len()` activation rows.
+    fn dot_all_rows(&self, fmt: QFormat, w: &[u8], nb: usize, first: usize, out: &mut [f32]) {
         let mut i = 0;
         while out.len() - i >= MULTI_ROWS {
-            out[i..i + MULTI_ROWS].copy_from_slice(&self.dot_rows::<MULTI_ROWS>(fmt, w, i, nb));
+            out[i..i + MULTI_ROWS].copy_from_slice(&self.dot_rows::<MULTI_ROWS>(fmt, w, first + i, nb));
             i += MULTI_ROWS;
         }
+        let r = first + i;
         match out.len() - i {
             0 => {}
-            1 => out[i] = self.dot(fmt, w, i * nb, nb),
-            2 => out[i..].copy_from_slice(&self.dot_rows::<2>(fmt, w, i, nb)),
-            3 => out[i..].copy_from_slice(&self.dot_rows::<3>(fmt, w, i, nb)),
-            4 => out[i..].copy_from_slice(&self.dot_rows::<4>(fmt, w, i, nb)),
-            5 => out[i..].copy_from_slice(&self.dot_rows::<5>(fmt, w, i, nb)),
-            6 => out[i..].copy_from_slice(&self.dot_rows::<6>(fmt, w, i, nb)),
-            7 => out[i..].copy_from_slice(&self.dot_rows::<7>(fmt, w, i, nb)),
+            1 => out[i] = self.dot(fmt, w, r * nb, nb),
+            2 => out[i..].copy_from_slice(&self.dot_rows::<2>(fmt, w, r, nb)),
+            3 => out[i..].copy_from_slice(&self.dot_rows::<3>(fmt, w, r, nb)),
+            4 => out[i..].copy_from_slice(&self.dot_rows::<4>(fmt, w, r, nb)),
+            5 => out[i..].copy_from_slice(&self.dot_rows::<5>(fmt, w, r, nb)),
+            6 => out[i..].copy_from_slice(&self.dot_rows::<6>(fmt, w, r, nb)),
+            7 => out[i..].copy_from_slice(&self.dot_rows::<7>(fmt, w, r, nb)),
             _ => unreachable!(),
         }
     }
@@ -486,6 +517,9 @@ impl Acts {
 /// Activation rows handled per call of a multi-row kernel.
 const MULTI_ROWS: usize = 8;
 
+/// Batches of at least this many rows block [`linear_quantized`] over activation rows.
+const LARGE_BATCH_ROWS: usize = 32;
+
 /// `out[N] = W[N, K] · x[K]` for a quantized weight in format `fmt`.
 pub fn gemv_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32], n: usize, k: usize) {
     let (bv, bb) = fmt.block();
@@ -493,7 +527,18 @@ pub fn gemv_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32], n
     let row_bytes = nb * bb;
     debug_assert_eq!(weight.len(), n * row_bytes);
     let a = Acts::new(fmt, x);
-    let rows_per_task = super::gemv_rows_per_task(row_bytes).next_multiple_of(4);
+    // ~128 KB of weights per task. On x86 at least two tasks per thread: SmolLM2's
+    // 576-row matrices otherwise split into 3 tasks for 4 threads (20% of a decode
+    // profile on a 4-vCPU runner was workers waiting). On an M4 this was neutral to
+    // 2% slower, so it keeps one task per 128 KB.
+    let min_tasks = if cfg!(target_arch = "x86_64") {
+        2 * crate::threads::decode_threads()
+    } else {
+        1
+    };
+    let rows_per_task = super::gemv_rows_per_task(row_bytes)
+        .min(n.div_ceil(min_tasks))
+        .next_multiple_of(4);
     let row = |j: usize| &weight[j * row_bytes..(j + 1) * row_bytes];
     // Decode path: run on the low-latency spinning pool (see `crate::pool`).
     crate::pool::for_each_chunk_mut(out, rows_per_task, |t, chunk| {
@@ -536,12 +581,35 @@ pub fn linear_quantized(fmt: QFormat, weight: &[u8], x: &[f32], out: &mut [f32],
     let a = Acts::new(fmt, x); // m rows of nb blocks each, contiguous
 
     // Compute [N, M] so each task writes a contiguous slab, then transpose.
-    let rows_per_task = (super::gemv_rows_per_task(row_bytes) / m).max(1);
+    // Small batches: each task's weight rows stay hot while it walks all activation
+    // rows. Large batches (prompts without a vendor BLAS) would re-read every activation
+    // row (1 MB at 512 rows of 2048) from L2/L3 once per weight row, so each task takes
+    // a slab of ~64 KB of weight rows and walks the activations in ~128 KB blocks.
+    let (rows_per_task, act_block) = if m < LARGE_BATCH_ROWS {
+        ((super::gemv_rows_per_task(row_bytes) / m).max(1), m)
+    } else {
+        let tasks_min = 4 * crate::threads::decode_threads();
+        let rows = (64 * 1024 / row_bytes).clamp(1, n.div_ceil(tasks_min).max(1));
+        let act_row_bytes = k + 4 * nb;
+        (
+            rows,
+            (128 * 1024 / act_row_bytes).max(MULTI_ROWS) / MULTI_ROWS * MULTI_ROWS,
+        )
+    };
     let mut out_t = vec![0f32; n * m];
     crate::pool::for_each_chunk_mut(&mut out_t, rows_per_task * m, |t, slab| {
-        for (r, row) in slab.chunks_mut(m).enumerate() {
-            let j = t * rows_per_task + r;
-            a.dot_all_rows(fmt, &weight[j * row_bytes..(j + 1) * row_bytes], nb, row);
+        for i0 in (0..m).step_by(act_block) {
+            let i1 = (i0 + act_block).min(m);
+            for (r, row) in slab.chunks_mut(m).enumerate() {
+                let j = t * rows_per_task + r;
+                a.dot_all_rows(
+                    fmt,
+                    &weight[j * row_bytes..(j + 1) * row_bytes],
+                    nb,
+                    i0,
+                    &mut row[i0..i1],
+                );
+            }
         }
     });
     for j in 0..n {
@@ -680,15 +748,20 @@ mod tests {
     /// weight row count) against per-row matrix-vector products.
     #[test]
     fn multi_row_kernels_match_per_row_gemv() {
-        use crate::ops::quant::{quantize_f32_to_q4_k, quantize_f32_to_q6_k};
+        use crate::ops::quant::{quantize_f32_to_q4_0, quantize_f32_to_q4_k, quantize_f32_to_q6_k};
         let (n, k) = (38, 512);
         let wf = data(n * k, 5);
+        let mut q4_0 = vec![0u8; n * k / QK * Q4_0_BYTES];
+        quantize_f32_to_q4_0(&wf, &mut q4_0);
         for (fmt, w) in [
             (QFormat::Q8_0, q8_0_weights(&wf)),
+            (QFormat::Q4_0, q4_0),
             (QFormat::Q4K, quantize_f32_to_q4_k(&wf)),
             (QFormat::Q6K, quantize_f32_to_q6_k(&wf)),
         ] {
-            for m in 1..=11 {
+            // 40 and 300 rows take the blocked large-batch path (300 spans two blocks of
+            // activation rows at k = 512).
+            for m in (1..=11).chain([40, 300]) {
                 let x = data(m * k, 6 + m);
                 let mut batched = vec![0f32; m * n];
                 linear_quantized(fmt, &w, &x, &mut batched, m, n, k);
