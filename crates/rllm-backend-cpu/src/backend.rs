@@ -147,7 +147,8 @@ impl Backend for CpuBackend {
 
         let dtype = w.dtype();
         let fmt = QFormat::from_dtype(dtype);
-        if fmt.is_none() && !matches!(dtype, DType::Q4_0x4 | DType::Q8_0x8 | DType::Q4_0x8 | DType::F16) {
+        let tiled = matches!(dtype, DType::Q8_0x8 | DType::Q4_0x8 | DType::Q4_Kx8 | DType::Q6_Kx8);
+        if fmt.is_none() && !tiled && !matches!(dtype, DType::Q4_0x4 | DType::F16) {
             return Err(RllmError::UnsupportedOp {
                 op: "linear",
                 dtype: dtype.to_string(),
@@ -173,7 +174,7 @@ impl Backend for CpuBackend {
         let mut out = Tensor::zeros(Shape::new(out_dims), DType::F32, Device::Cpu)?;
         let out_slice = out.as_mut_f32_slice()?;
         let m = x_slice.len() / k;
-        if matches!(dtype, DType::Q8_0x8 | DType::Q4_0x8) {
+        if tiled {
             // Only created on x86_64 with AVX2 (`pack_weight`); every batch size.
             #[cfg(target_arch = "x86_64")]
             {
@@ -242,8 +243,8 @@ impl Backend for CpuBackend {
     /// Repacks `Q4_0` matrices with a multiple of 4 rows into interleaved `Q4_0x4`
     /// (aarch64), expands `Q5_0` losslessly to `Q8_0` (the SDOT Q8_0 kernel is ~1.75x
     /// faster than unpacking 5-bit values on an M4, at 34 instead of 22 bytes per block),
-    /// and on x86_64 with AVX2 repacks `Q8_0` / `Q4_0` matrices with a multiple of 8 rows
-    /// into the 8-row tile layouts (`Q8_0x8` / `Q4_0x8`, see [`crate::ops::tiles`]).
+    /// and on x86_64 with AVX2 repacks `Q8_0` / `Q4_0` / `Q4_K` / `Q6_K` matrices with a
+    /// multiple of 8 rows into the 8-row tile layouts (see [`crate::ops::tiles`]).
     fn pack_weight(&self, w: &Tensor) -> Result<Option<Tensor>> {
         let dims = w.dims();
         if dims.len() != 2 || !dims[1].is_multiple_of(32) {
@@ -257,7 +258,11 @@ impl Backend for CpuBackend {
             DType::Q4_0 if cfg!(target_arch = "aarch64") && dims[0].is_multiple_of(4) => {
                 (DType::Q4_0x4, repack_q4_0(bytes()?, dims[0], dims[1]))
             }
-            DType::Q8_0 | DType::Q4_0 | DType::Q5_0 if x86_tiles() && dims[0].is_multiple_of(tiles::GROUP) => {
+            DType::Q8_0 | DType::Q4_0 | DType::Q5_0 | DType::Q4_K | DType::Q6_K
+                if x86_tiles()
+                    && dims[0].is_multiple_of(tiles::GROUP)
+                    && dims[1].is_multiple_of(w.dtype().block_info().map_or(1, |b| b.0)) =>
+            {
                 let (src_dtype, src) = match w.dtype() {
                     DType::Q5_0 => (DType::Q8_0, q5_0_to_q8_0(bytes()?)),
                     d => (d, bytes()?.to_vec()),
@@ -405,7 +410,7 @@ impl Backend for CpuBackend {
                     dequantize_q4_0x4_row(bytes, hidden_dim, id as usize, dst);
                 }
             }
-            dtype @ (DType::Q8_0x8 | DType::Q4_0x8) => {
+            dtype @ (DType::Q8_0x8 | DType::Q4_0x8 | DType::Q4_Kx8 | DType::Q6_Kx8) => {
                 let bytes = &table.storage().as_cpu()?.as_bytes()[table.offset()..];
                 for (dst, &id) in out_slice.chunks_exact_mut(hidden_dim).zip(ids) {
                     tiles::dequantize_row(dtype, bytes, hidden_dim, id as usize, dst);
