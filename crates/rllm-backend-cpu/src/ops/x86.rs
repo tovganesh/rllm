@@ -523,3 +523,95 @@ unsafe fn hsum_i32(v: __m256i) -> i32 {
         _mm256_extracti128_si256::<1>(v),
     ))
 }
+
+/// One 8-row `Q8_0x8` group (see [`super::tiles`]) against activation rows `rows`
+/// (`nb` blocks each): `out[r][j]` = dot of weight row `j` of the group with activation
+/// row `rows[r]`. Each 32-byte chunk holds four values of all eight rows, so a
+/// broadcast 4-byte activation chunk gives eight row partial sums per instruction.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn tile_q8_0x8<const R: usize>(
+    grp: &[u8],
+    a: &Q8Activations,
+    rows: [usize; R],
+    nb: usize,
+    out: &mut [[f32; 8]; R],
+) {
+    assert!(grp.len() >= nb * 8 * Q8_0_BYTES);
+    for &r in &rows {
+        assert!(a.qs.len() >= (r + 1) * nb * QK && a.d.len() >= (r + 1) * nb);
+    }
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = [_mm256_setzero_ps(); R];
+    for b in 0..nb {
+        let blk = grp.as_ptr().add(b * 8 * Q8_0_BYTES);
+        let dw = _mm256_cvtph_ps(_mm_loadu_si128(blk as *const __m128i));
+        let mut isum = [_mm256_setzero_si256(); R];
+        for c in 0..8 {
+            let w = _mm256_loadu_si256(blk.add(16 + 32 * c) as *const __m256i);
+            let aw = _mm256_sign_epi8(w, w);
+            for r in 0..R {
+                let ap = a.qs.as_ptr().add((rows[r] * nb + b) * QK + 4 * c) as *const i32;
+                let y = _mm256_set1_epi32(ap.read_unaligned());
+                let p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(y, w)), ones);
+                isum[r] = _mm256_add_epi32(isum[r], p);
+            }
+        }
+        for r in 0..R {
+            let d = _mm256_mul_ps(dw, _mm256_set1_ps(*a.d.get_unchecked(rows[r] * nb + b)));
+            acc[r] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(isum[r]), acc[r]);
+        }
+    }
+    for r in 0..R {
+        _mm256_storeu_ps(out[r].as_mut_ptr(), acc[r]);
+    }
+}
+
+/// As [`tile_q8_0x8`] for `Q4_0x8` (four chunks of nibble bytes per block). Nibbles are
+/// used unsigned; `a` must carry per-block sums, and `-8 · Σy` is folded into each
+/// block's integer sum. Eight `maddubs` results (at most 2·15·127 each) fit in 16 bits,
+/// so a block is summed in 16-bit lanes and widened once.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn tile_q4_0x8<const R: usize>(
+    grp: &[u8],
+    a: &Q8Activations,
+    rows: [usize; R],
+    nb: usize,
+    out: &mut [[f32; 8]; R],
+) {
+    assert!(grp.len() >= nb * 8 * Q4_0_BYTES);
+    for &r in &rows {
+        assert!(a.qs.len() >= (r + 1) * nb * QK && a.d.len() >= (r + 1) * nb && a.sums.len() >= (r + 1) * nb);
+    }
+    let ones = _mm256_set1_epi16(1);
+    let m4 = _mm256_set1_epi8(0x0F);
+    let mut acc = [_mm256_setzero_ps(); R];
+    for b in 0..nb {
+        let blk = grp.as_ptr().add(b * 8 * Q4_0_BYTES);
+        let dw = _mm256_cvtph_ps(_mm_loadu_si128(blk as *const __m128i));
+        let mut isum = [_mm256_setzero_si256(); R];
+        for c in 0..4 {
+            let w = _mm256_loadu_si256(blk.add(16 + 32 * c) as *const __m256i);
+            let lo = _mm256_and_si256(w, m4);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(w), m4);
+            for r in 0..R {
+                let ap = a.qs.as_ptr().add((rows[r] * nb + b) * QK + 4 * c);
+                let ylo = _mm256_set1_epi32((ap as *const i32).read_unaligned());
+                let yhi = _mm256_set1_epi32((ap.add(16) as *const i32).read_unaligned());
+                let p = _mm256_add_epi16(_mm256_maddubs_epi16(lo, ylo), _mm256_maddubs_epi16(hi, yhi));
+                isum[r] = _mm256_add_epi16(isum[r], p);
+            }
+        }
+        for r in 0..R {
+            let blk_idx = rows[r] * nb + b;
+            let s = _mm256_sub_epi32(
+                _mm256_madd_epi16(isum[r], ones),
+                _mm256_set1_epi32(8 * *a.sums.get_unchecked(blk_idx)),
+            );
+            let d = _mm256_mul_ps(dw, _mm256_set1_ps(*a.d.get_unchecked(blk_idx)));
+            acc[r] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(s), acc[r]);
+        }
+    }
+    for r in 0..R {
+        _mm256_storeu_ps(out[r].as_mut_ptr(), acc[r]);
+    }
+}

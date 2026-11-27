@@ -9,6 +9,7 @@ use crate::ops::{
     repack::{dequantize_q4_0x4_group, dequantize_q4_0x4_row, gemm_q4_0x4, gemv_q4_0x4, has_i8mm, repack_q4_0},
     rope::rope_f32,
     softmax::softmax_inplace,
+    tiles,
 };
 use rayon::prelude::*;
 use rllm_core::{
@@ -34,6 +35,18 @@ pub const BATCHED_F32_MIN_ROWS: usize = 32;
 /// llama.cpp's speed), and llama.cpp's own CPU backend keeps quantized weights in
 /// integer arithmetic at every batch size without one.
 const DEQUANT_BATCHES: bool = crate::ops::blas::HAS_VENDOR_BLAS;
+
+/// Whether `Q8_0` / `Q4_0` weights are repacked into the x86 8-row tile layouts (AVX2).
+fn x86_tiles() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::ops::x86::has_avx2()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
 
 /// Whether a batch of `m` rows against a repacked `Q4_0` or a `Q8_0` `[n, k]` weight
 /// should use the i8mm integer GEMM rather than dequantization + F32 GEMM. Measured on
@@ -134,7 +147,7 @@ impl Backend for CpuBackend {
 
         let dtype = w.dtype();
         let fmt = QFormat::from_dtype(dtype);
-        if fmt.is_none() && !matches!(dtype, DType::Q4_0x4 | DType::F16) {
+        if fmt.is_none() && !matches!(dtype, DType::Q4_0x4 | DType::Q8_0x8 | DType::Q4_0x8 | DType::F16) {
             return Err(RllmError::UnsupportedOp {
                 op: "linear",
                 dtype: dtype.to_string(),
@@ -160,6 +173,16 @@ impl Backend for CpuBackend {
         let mut out = Tensor::zeros(Shape::new(out_dims), DType::F32, Device::Cpu)?;
         let out_slice = out.as_mut_f32_slice()?;
         let m = x_slice.len() / k;
+        if matches!(dtype, DType::Q8_0x8 | DType::Q4_0x8) {
+            // Only created on x86_64 with AVX2 (`pack_weight`); every batch size.
+            #[cfg(target_arch = "x86_64")]
+            {
+                tiles::linear(dtype, w_bytes, x_slice, out_slice, m, n, k);
+                return Ok(out);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("{dtype} weights are only created on x86_64");
+        }
         let repacked = dtype == DType::Q4_0x4;
         let small = m < BATCHED_F32_MIN_ROWS || !DEQUANT_BATCHES;
         let integer_path = small || ((repacked || fmt == Some(QFormat::Q8_0)) && use_i8mm(m, n, k));
@@ -216,9 +239,11 @@ impl Backend for CpuBackend {
         Ok(out)
     }
 
-    /// Repacks `Q4_0` matrices with a multiple of 4 rows into interleaved `Q4_0x4` (aarch64), and
-    /// expands `Q5_0` losslessly to `Q8_0` (the SDOT Q8_0 kernel is ~1.75x faster than
-    /// unpacking 5-bit values on an M4, at 34 instead of 22 bytes per block).
+    /// Repacks `Q4_0` matrices with a multiple of 4 rows into interleaved `Q4_0x4`
+    /// (aarch64), expands `Q5_0` losslessly to `Q8_0` (the SDOT Q8_0 kernel is ~1.75x
+    /// faster than unpacking 5-bit values on an M4, at 34 instead of 22 bytes per block),
+    /// and on x86_64 with AVX2 repacks `Q8_0` / `Q4_0` matrices with a multiple of 8 rows
+    /// into the 8-row tile layouts (`Q8_0x8` / `Q4_0x8`, see [`crate::ops::tiles`]).
     fn pack_weight(&self, w: &Tensor) -> Result<Option<Tensor>> {
         let dims = w.dims();
         if dims.len() != 2 || !dims[1].is_multiple_of(32) {
@@ -231,6 +256,13 @@ impl Backend for CpuBackend {
             // (AVX2 dot product).
             DType::Q4_0 if cfg!(target_arch = "aarch64") && dims[0].is_multiple_of(4) => {
                 (DType::Q4_0x4, repack_q4_0(bytes()?, dims[0], dims[1]))
+            }
+            DType::Q8_0 | DType::Q4_0 | DType::Q5_0 if x86_tiles() && dims[0].is_multiple_of(tiles::GROUP) => {
+                let (src_dtype, src) = match w.dtype() {
+                    DType::Q5_0 => (DType::Q8_0, q5_0_to_q8_0(bytes()?)),
+                    d => (d, bytes()?.to_vec()),
+                };
+                tiles::pack(src_dtype, &src, dims[0], dims[1])
             }
             DType::Q5_0 => (DType::Q8_0, q5_0_to_q8_0(bytes()?)),
             _ => return Ok(None),
@@ -371,6 +403,12 @@ impl Backend for CpuBackend {
                 let bytes = &table.storage().as_cpu()?.as_bytes()[table.offset()..];
                 for (dst, &id) in out_slice.chunks_exact_mut(hidden_dim).zip(ids) {
                     dequantize_q4_0x4_row(bytes, hidden_dim, id as usize, dst);
+                }
+            }
+            dtype @ (DType::Q8_0x8 | DType::Q4_0x8) => {
+                let bytes = &table.storage().as_cpu()?.as_bytes()[table.offset()..];
+                for (dst, &id) in out_slice.chunks_exact_mut(hidden_dim).zip(ids) {
+                    tiles::dequantize_row(dtype, bytes, hidden_dim, id as usize, dst);
                 }
             }
             dtype if dtype.is_quantized() || matches!(dtype, DType::F16 | DType::BF16) => {
